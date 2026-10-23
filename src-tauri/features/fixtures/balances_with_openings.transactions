@@ -1,0 +1,31 @@
+; Opening balances live on account declarations. They have no date and no
+; postings, so every holdings computation must fold them in explicitly.
+;
+; Also carries a parent account (assets:equity:commsec) with its own postings
+; beside a child (:personal) — both are real holdings and both must appear in
+; the per-commodity breakdown.
+
+account assets:cash:bank:cba AUD
+    opening 50000.00 AUD
+account assets:crypto:binance:btc BTC
+    opening 0.10 BTC
+account assets:crypto:transfer
+    opening 5.00 BTC
+account ignore:spam
+    opening 999.00 AUD
+
+2025-07-15 * "Employer" "Salary" ; txn:bal-o-1
+    assets:cash:bank:cba          500.00 AUD
+    income:salary                -500.00 AUD
+
+2025-08-01 * "Binance" "Buy BTC" ; txn:bal-o-2
+    assets:crypto:binance:btc       0.40 BTC
+    assets:cash:bank:cba       -20000.00 AUD
+
+2025-09-01 * "CommSec" "Buy ABC on the parent account" ; txn:bal-o-3
+    assets:equity:commsec          10.00 ABC
+    assets:cash:bank:cba        -1000.00 AUD
+
+2025-09-02 * "CommSec" "Buy ABC on the child account" ; txn:bal-o-4
+    assets:equity:commsec:personal  5.00 ABC
+    assets:cash:bank:cba         -500.00 AUD

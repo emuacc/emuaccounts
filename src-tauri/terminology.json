@@ -1,0 +1,7 @@
+{
+  "asset": {
+    "singular": "asset",
+    "plural": "assets",
+    "description": "One thing you hold that carries a price — a coin, a share, a currency, a property. Names the holdings in the Balances and Tax Savings reports."
+  }
+}

@@ -1,0 +1,14 @@
+; Two acquisitions in the same second. The file lists txn:ts-b first and its
+; payee carries a ';' — neither decides which lot FIFO consumes first: the
+; txn id does (ts-a before ts-b).
+2025-01-10 10:00:00 * "Orca Aquafarm;Orca Token Swap V2" "Swap in" ; txn:ts-b
+    assets:wallet:orca 10 ORCA {{ 200.00 AUD }}
+    equity:trading:buy -200.00 AUD
+
+2025-01-10 10:00:00 * "Exchange" "Buy ORCA" ; txn:ts-a
+    assets:wallet:orca 10 ORCA {{ 100.00 AUD }}
+    equity:trading:buy -100.00 AUD
+
+2025-03-01 * "Exchange" "Sell ORCA" ; txn:ts-sell
+    assets:wallet:orca -10 ORCA @@ 150.00 AUD
+    equity:trading:sell 150.00 AUD

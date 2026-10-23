@@ -1,0 +1,17 @@
+; USDC -> USDT swap. Both sides are base-like, so the rank-pairing pass leaves
+; the pricing to the final swap price pass. All three legs share one on-chain
+; hash and the USDC sell leg is listed LAST, so a hash-only lookup of its
+; `swap:txn:0xshared` reference lands on the leg itself. The USDC leg must be
+; priced from the USDT leg's value: 100 USDT at 1.50 AUD over 100.5 USDC.
+
+2025-03-01 10:00:00 * "Curve" "Contract interaction" ; txn:0xshared
+    assets:wallet:eth 0 ETH
+    expenses:unknown 0 ETH
+
+2025-03-01 10:00:00 * "Curve" "Receive USDT" ; txn:0xshared
+    assets:wallet:eth 100 USDT
+    equity:trading:buy -100 USDT
+
+2025-03-01 10:00:00 * "Curve" "Swap USDC for USDT" ; txn:0xshared
+    assets:wallet:eth -100.5 USDC
+    equity:trading:sell 100.5 USDC

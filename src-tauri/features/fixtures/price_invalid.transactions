@@ -1,0 +1,3 @@
+2026-01-15 * "Kraken" "Buy BTC" ; txn:price-bad-001
+    assets:crypto:btc 0.5 BTC @ notanumber USD
+    assets:cash:usd -16000.00 USD

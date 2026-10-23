@@ -1,0 +1,17 @@
+; On-chain swap between two tokens that have NO price feed. The DEX call also
+; emits a 0-amount ETH contract-interaction leg under the same hash, listed
+; LAST so it is the final leg indexed for that hash. Both swap legs must stay
+; unpriced: deriving a price from the 0-amount sibling stamps `@ 0 AUD`, which
+; gives the CGT report a zero cost base and zero proceeds.
+
+2025-03-01 10:00:00 * "Uniswap" "Swap ABC for XYZ" ; txn:0xshared
+    assets:wallet:eth -100 ABC
+    equity:trading:sell 100 ABC
+
+2025-03-01 10:00:00 * "Uniswap" "Receive XYZ" ; txn:0xshared
+    assets:wallet:eth 250 XYZ
+    equity:trading:buy -250 XYZ
+
+2025-03-01 10:00:00 * "Uniswap" "Contract interaction" ; txn:0xshared
+    assets:wallet:eth 0 ETH
+    expenses:unknown 0 ETH

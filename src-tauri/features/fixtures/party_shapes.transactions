@@ -1,0 +1,16 @@
+; One merchant, two memo shapes — plus an unrelated payee. Bank card
+; feeds emit different descriptor forms for the same merchant, so a
+; label pattern seeded from one row covers only that row's shape; the
+; party editor must let the user widen the glob to cover both.
+
+2026-03-01 * "ANTHROPIC ANTHROPIC.COM CA US Card xx1 Value Date: 01/03/2026" "subscription" ; txn:party-001
+    assets:cash:bank:cheq   -25.00 USD
+    expenses:ai              25.00 USD
+
+2026-03-02 * "ANTHROPIC HTTPSWWW.ANTH CA US Card xx1 Value Date: 02/03/2026" "subscription" ; txn:party-002
+    assets:cash:bank:cheq   -50.00 USD
+    expenses:ai              50.00 USD
+
+2026-03-03 * "XERO AU INV-1 HAWTHORN AU Card xx1 Value Date: 03/03/2026" "subscription" ; txn:party-003
+    assets:cash:bank:cheq   -70.00 USD
+    expenses:ai              70.00 USD

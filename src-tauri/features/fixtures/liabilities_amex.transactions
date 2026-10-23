@@ -1,0 +1,7 @@
+2025-01-15 * "Woolworths" "Groceries" ; txn:amex-001
+    liabilities:credit-card:amex   -120.00 AUD
+    expenses:groceries              120.00 AUD
+
+2025-01-20 * "CBA" "Card payment" ; txn:amex-002
+    liabilities:credit-card:amex    500.00 AUD
+    assets:transfer:cash           -500.00 AUD

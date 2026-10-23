@@ -1,0 +1,152 @@
+# Shared corpus for the handwritten validators (is_valid_commodity,
+# is_valid_account, parse_amount) and the grammar entry points
+# (commodityInput / accountInput / amountInput in Ledger.g4 and Prices.g4).
+# Every row must get the same verdict from the validator and from every
+# entry point that defines the kind; src/ledger_parser/grammar_parity.rs
+# fails on any disagreement.
+#
+# Columns: kind<TAB>valid|invalid<TAB>input. The input is taken verbatim,
+# or decoded as a JSON string when it starts with a double quote (for inputs
+# that are empty or carry leading or trailing blanks, which editors strip).
+# '#' lines and empty lines are ignored.
+#
+# A name cannot contain a date-shaped piece: wherever the lexer would start
+# a token, YYYY-MM-DD is a DATETIME, which is neither a commodity nor an
+# account piece. Inside a longer alphanumeric or decimal run it is not a
+# token boundary, so a_2026-01-15 and 2026.2026-01-15 are fine.
+
+# --- commodity ---
+commodity	valid	BTC
+commodity	valid	usd
+commodity	valid	E
+commodity	valid	0
+commodity	valid	BRK.B
+commodity	valid	RAY-SOL
+commodity	valid	aEthUSDC
+commodity	valid	BTC_v2
+commodity	valid	_X
+commodity	valid	1INCH
+commodity	valid	1.5
+commodity	valid	A.B.C
+commodity	valid	A-B-C
+commodity	valid	A:B:C
+commodity	valid	A.
+commodity	valid	A-
+commodity	valid	A:
+commodity	valid	A..B
+commodity	valid	xyz:WTIOIL
+commodity	valid	HYPERLIQUID:BTC
+commodity	valid	ASX:ENA
+commodity	valid	比特币
+commodity	valid	UЅDС
+commodity	valid	é
+commodity	valid	١٢٣
+commodity	valid	2024-12
+commodity	valid	2026-1-15
+commodity	valid	12026-01-15
+commodity	valid	2026.2026-01-15
+commodity	valid	a_2026-01-15
+commodity	valid	BTC2026-01-15
+commodity	invalid	""
+commodity	invalid	" ETH"
+commodity	invalid	"ETH "
+commodity	invalid	"ETH\t"
+commodity	invalid	.ETH
+commodity	invalid	:ETH
+commodity	invalid	-ETH
+commodity	invalid	+ETH
+commodity	invalid	BTC USDT
+commodity	invalid	BTC@USD
+commodity	invalid	A,B
+commodity	invalid	A|B
+commodity	invalid	BTC/USDT
+commodity	invalid	A%B
+commodity	invalid	A{B}
+commodity	invalid	A"B
+commodity	invalid	A;B
+commodity	invalid	A*B
+commodity	invalid	A!B
+commodity	invalid	A+B
+commodity	invalid	1,000
+commodity	invalid	2026-01-15
+commodity	invalid	2026-01-15T10:00:00Z
+commodity	invalid	2026-01-15x
+commodity	invalid	BTC-2026-01-15
+commodity	invalid	x:2026-01-15
+commodity	invalid	x.2026-01-15
+
+# --- account ---
+account	valid	assets:cash
+account	valid	a:b
+account	valid	assets:bank:savings
+account	valid	expenses:unknown
+account	valid	ASSETS:Cash
+account	valid	资产:银行:储蓄
+account	valid	assets:café
+account	valid	assets:crypto:wallet:solana:9Abc9Abc9Abc9Abc9Abc9Abc9Abc9Abc9Abc9Abc9Abc
+account	valid	assets:1.5
+account	valid	assets:-x
+account	valid	assets:.hidden
+account	valid	assets:_x
+account	valid	assets:x-
+account	valid	assets:x.
+account	valid	assets:2024-12
+account	valid	assets:12026-01-15
+account	valid	assets:a_2026-01-15
+account	valid	account:opening:name
+account	invalid	""
+account	invalid	assets
+account	invalid	assets:
+account	invalid	:assets
+account	invalid	assets::cash
+account	invalid	assets:cash:
+account	invalid	" assets:cash"
+account	invalid	"assets:cash "
+account	invalid	"assets:cash\t"
+account	invalid	assets:ca sh
+account	invalid	assets:+cash
+account	invalid	assets:1,000
+account	invalid	assets:"cash"
+account	invalid	assets:{cash}
+account	invalid	assets:cash;x
+account	invalid	assets:cash@x
+account	invalid	assets:2026-01-15
+account	invalid	assets:2026-01-15:cash
+account	invalid	assets:2026-01-15T10:00:00Z
+account	invalid	2026-01-15:cash
+account	invalid	assets:x-2026-01-15
+
+# --- amount ---
+amount	valid	0
+amount	valid	5
+amount	valid	01
+amount	valid	1000
+amount	valid	1000.50
+amount	valid	-5
+amount	valid	+5
+amount	valid	1,000
+amount	valid	1,000.50
+amount	valid	12,345,678.9
+amount	valid	-1,000
+amount	valid	0.000001
+amount	invalid	""
+amount	invalid	" 5"
+amount	invalid	"5 "
+amount	invalid	"5\t"
+amount	invalid	1.
+amount	invalid	.5
+amount	invalid	+-5
+amount	invalid	--5
+amount	invalid	1,0000
+amount	invalid	1,00
+amount	invalid	1234,567
+amount	invalid	1,000,00
+amount	invalid	5e3
+amount	invalid	1_000
+amount	invalid	2026-01-15
+amount	invalid	١٢٣
+amount	invalid	１２３
+amount	invalid	5USD
+amount	invalid	$5
+amount	invalid	5-
+amount	invalid	1.5.5

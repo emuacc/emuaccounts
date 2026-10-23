@@ -1,0 +1,3 @@
+2026-01-15 * "Binance" "Buy SOL"
+    assets:exchange:binance:sol 10.000000 SOL
+    assets:cash:usd -230.10 USD

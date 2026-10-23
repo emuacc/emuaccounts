@@ -1,0 +1,14 @@
+[plugin]
+name = "Non-USD Prices"
+version = "0.1.0"
+description = "Daily refresh for the price files that must be quoted in the vault's base currency rather than USD. Conversion to the base currency allows at most one hop, so a non-USD base needs USD quoted in it (the leg every USD-priced commodity crosses) plus any holding whose own quote currency keeps it one hop away (a GBP-quoted London listing converts via GBP). Derives the USD leg by inverting what fiat-prices writes, takes the rest from Yahoo, and only rewrites a recent window so a hand-built history stays intact. The defaults suit an AUD base: set invert to USD=<your base currency>."
+script = "sync.py"
+daily = true
+
+[config]
+invert = { type = "string", default = "USD=AUD", description = "Write <SYMBOL>.txt quoted in <QUOTE> by inverting <QUOTE>.txt, which fiat-prices keeps quoted in <SYMBOL>. Comma-separated SYMBOL=QUOTE pairs." }
+yahoo = { type = "string", default = "GBP=GBPAUD=X,VUKG=VUKG.L", description = "Yahoo tickers as SYMBOL=TICKER (split on the first '='). An FX ticker (XXXYYY=X) is written quoted in YYY; anything else keeps the currency Yahoo reports, with GBp (pence) converted to GBP." }
+forward_fill = { type = "string", default = "USD,GBP", description = "Symbols that carry the last close onto every calendar day, so a weekend or holiday valuation still finds a row. Equities are left on trading days." }
+refresh_days = { type = "integer", default = 7, description = "Rewrite this many recent days each run, so a provisional close captured on the day of a run is corrected once the venue settles. Older rows are never touched." }
+period = { type = "string", default = "max", description = "yfinance history period. 'max' is cheap and makes a first build complete; later runs only need the refresh window." }
+decimals = { type = "integer", default = 4, description = "Decimal places, matching the existing files" }

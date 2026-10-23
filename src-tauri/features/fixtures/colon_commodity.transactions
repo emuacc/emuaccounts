@@ -1,0 +1,3 @@
+2026-03-20 * "Hyperliquid" "Open Long xyz:WTIOIL" ; txn:hl001, src:hyperliquid:fill:001
+    assets:crypto:exchange:hyperliquid:llm-gemini    926.92 xyz:WTIOIL @@ 87216.97 USDC
+    assets:crypto:exchange:hyperliquid:llm-gemini -87216.97 USDC

@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Pre-push: the full gate. Everything pre-commit deliberately skipped runs
+# here, mirroring CI's unit_bdd job plus clippy, complexity lint on every
+# production .ts file in the pushed commits, submodule tests and the coverage
+# ratchet. Rationale: .backlog/decisions/decision-002.
+set -euo pipefail
+export CI=1
+HOOK=pre-push
+# shellcheck source=lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+# Git feeds "<local ref> <local sha> <remote ref> <remote sha>" per ref on
+# stdin. Collect the production .ts files changed in the commits being pushed,
+# and whether any pushed commit touches something other than Backlog.md's
+# bookkeeping under .backlog/.
+zero=0000000000000000000000000000000000000000
+changed_ts=()
+updates=0
+code=0
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  [ "$local_sha" = "$zero" ] && continue # branch deletion
+  updates=$((updates + 1))
+  if [ "$remote_sha" = "$zero" ]; then   # new branch: compare with origin/main when known
+    if git rev-parse -q --verify origin/main >/dev/null 2>&1; then
+      range="origin/main..$local_sha"
+    else
+      range="$local_sha"
+      code=1                             # no baseline to scope against: gate it
+    fi
+  else
+    range="$remote_sha..$local_sha"
+  fi
+  # A remote sha this clone has never fetched cannot be diffed: gate it too.
+  if changed="$(git diff --name-only "$range" -- 2>/dev/null)"; then
+    other="$(printf '%s\n' "$changed" | grep -Ev '^(\.backlog/|$)' || true)"
+    [ -z "$other" ] || code=1
+  else
+    code=1
+  fi
+  while IFS= read -r f; do
+    [ -n "$f" ] && changed_ts+=("$f")
+  done < <(git diff --name-only --diff-filter=d "$range" -- 'src/*.ts' 2>/dev/null | grep -v '\.test\.ts$' || true)
+done
+
+# A push that only deletes refs (e.g. retiring a merged branch) carries no
+# code; there is nothing to gate.
+if [ "$updates" -eq 0 ]; then
+  echo "[$HOOK] Only ref deletions are being pushed; nothing to test."
+  exit 0
+fi
+
+# Backlog.md task files are bookkeeping, pushed straight to main without a PR
+# (decision-004); they are not code, so a push carrying nothing else has
+# nothing to gate either.
+if [ "$code" -eq 0 ]; then
+  echo "[$HOOK] Only Backlog.md bookkeeping (.backlog/) is being pushed; nothing to test."
+  exit 0
+fi
+
+stop_tauri_dev "$HOOK"
+
+echo "[$HOOK] Unit tests (tsc, cargo nextest, Vitest with coverage thresholds)"
+./scripts/run_unit_tests.sh || hook_fail "$HOOK" "Unit tests failed"
+
+echo "[$HOOK] BDD tests (Rust cucumber suite + UI suite dry-run)"
+./scripts/run_feature_tests.sh || hook_fail "$HOOK" "BDD tests failed"
+
+echo "[$HOOK] cargo clippy"
+(cd src-tauri && cargo clippy --quiet) || hook_fail "$HOOK" "cargo clippy failed"
+
+lint_ts_files "$HOOK" ${changed_ts[@]+"${changed_ts[@]}"}
+
+run_rust_tests "$HOOK" .covid
+run_py_tests "$HOOK" .covid/core
+
+# E2E only when Playwright is configured (it is not: the Tauri WebDriver
+# suite is local-only via `npm run e2e`).
+if [ -x scripts/run_e2e_tests.sh ] && [ -f playwright.config.ts ] \
+  && node -e "require.resolve('@playwright/test')" >/dev/null 2>&1; then
+  ./scripts/run_e2e_tests.sh || hook_fail "$HOOK" "E2E tests failed"
+else
+  echo "[$HOOK] Skipping E2E (Playwright not configured)"
+fi
+
+echo "[$HOOK] Coverage ratchet (check only; raise the floor with scripts/check_coverage_ratchet.sh --update)"
+./scripts/check_coverage_ratchet.sh || hook_fail "$HOOK" "Coverage ratchet rejected this push"
+
+echo "[$HOOK] OK"

@@ -1,0 +1,146 @@
+[package]
+name = "emuacc-covid"
+version = "0.1.1"
+edition = "2021"
+rust-version = "1.98"
+default-run = "emuacc-covid"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+regex = "1"
+thiserror = "1"
+rhai = "1"
+csv = "1"
+sha2 = "0.10"
+hex = "0.4"
+ureq = { version = "2", features = ["json"] }
+automerge = "0.7"
+autosurgeon = "0.10"
+walkdir = "2"
+machine-uid = "0.5"
+hostname = "0.4"
+tiny_http = "0.12"
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+notify = "7"
+tera = "1"
+chrono = "0.4"
+toml = "0.8"
+parking_lot = "0.12"
+tauri-plugin-webdriver-automation = { version = "0.1", optional = true }
+pdf-extract = "0.12.0"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+webdriver = ["tauri-plugin-webdriver-automation"]
+
+[dev-dependencies]
+cucumber = "=0.21.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+csv = "1"
+tempfile = "3"
+# The parser generated from Ledger.g4 is used only by the grammar parity tests
+# (src/ledger_parser/grammar_parity.rs); release builds neither compile nor
+# link it. See .backlog/decisions/decision-003.
+antlr4rust = "=0.5.2"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+
+# Faster dev/test compile + link by emitting only line-table debug info.
+# Trade-off: less detail when stepping in a debugger; line numbers in
+# panic backtraces still work.
+[profile.dev]
+debug = "line-tables-only"
+
+# Bins are thin CLI wrappers with no in-bin #[test] items. Their tested
+# logic lives in the library and integration tests. Skip their test
+# executables so cargo test doesn't compile + run them (several open the
+# production Automerge metadata store at startup, which hangs).
+[[bin]]
+name = "ledger-parse"
+path = "src/bin/ledger_parse.rs"
+test = false
+
+[[bin]]
+name = "emuacc-relay"
+path = "src/bin/relay.rs"
+test = false
+
+[[bin]]
+name = "emuacc-web"
+path = "src/bin/emuacc_web.rs"
+test = false
+
+[[bin]]
+name = "emuacc-import"
+path = "src/bin/emuacc_import.rs"
+test = false
+
+[[bin]]
+name = "emuacc-regenerate"
+path = "src/bin/emuacc_regenerate.rs"
+test = false
+
+[[bin]]
+name = "emuacc-gaps"
+path = "src/bin/emuacc_gaps.rs"
+test = false
+
+[[bin]]
+name = "emuacc-query"
+path = "src/bin/emuacc_query.rs"
+test = false
+
+[[bin]]
+name = "emuacc-issues"
+path = "src/bin/emuacc_issues.rs"
+test = false
+
+[[bin]]
+name = "emuacc-classify"
+path = "src/bin/emuacc_classify.rs"
+test = false
+
+[[bin]]
+name = "emuacc-reports"
+path = "src/bin/emuacc_reports.rs"
+test = false
+
+[[bin]]
+name = "emuacc-repair-trade-links"
+path = "src/bin/emuacc_repair_trade_links.rs"
+test = false
+
+[[bin]]
+name = "emuacc-migrate-rules"
+path = "src/bin/emuacc_migrate_rules.rs"
+test = false
+
+[[bin]]
+name = "emuacc-dedupe"
+path = "src/bin/emuacc_dedupe.rs"
+test = false
+
+[[bin]]
+name = "emuacc-update"
+path = "src/bin/emuacc_update.rs"
+test = false
+
+[[bin]]
+name = "emuacc-ai-import"
+path = "src/bin/emuacc_ai_import.rs"
+test = false
+
+[[test]]
+name = "bdd"
+harness = false

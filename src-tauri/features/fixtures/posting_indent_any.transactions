@@ -1,0 +1,7 @@
+account assets:cash:bank AUD
+	opening 1,000.00
+
+2026-01-15 * "Bank" "Deposit" ; txn:indent-any
+	assets:cash:bank 100.00 AUD
+  income:salary -60.00 AUD
+        income:bonus -40.00 AUD
