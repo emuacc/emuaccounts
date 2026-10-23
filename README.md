@@ -10,10 +10,9 @@ Download the latest release from the [Releases](../../releases) tab and follow t
 
 One continuous take of the three main flows, re-recorded for every release: choose a data folder, add an account, import a CSV, add a transaction, see the ledger file.
 
-<video controls muted loop playsinline width="720" poster="docs/demos/getting-started-poster.png">
-  <source src="docs/demos/getting-started.mp4" type="video/mp4" />
-  <source src="docs/demos/getting-started.webm" type="video/webm" />
-</video>
+<a href="docs/demos/getting-started.mp4"><img src="docs/demos/getting-started-poster.png" width="720" alt="Getting started: choose a data folder, add an account, import a CSV, add a transaction, see the ledger file"></a>
+
+[Watch the getting-started video](docs/demos/getting-started.mp4) (MP4, or [WebM](docs/demos/getting-started.webm)).
 
 ## Principles
 

@@ -22,7 +22,7 @@ Getting started, in one take — choose a data folder and add an account, import
 a CSV, add a manual transaction, then open the ledger text file the pipeline
 wrote from all of it:
 [watch the recording](https://github.com/emuacc/emuaccounts/blob/v0.1.1/docs/demos/getting-started.mp4)
-(re-recorded for every release; the README embeds it).
+(re-recorded for every release; the README links it from its poster).
 
 ### New
 

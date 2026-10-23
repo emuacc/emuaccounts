@@ -67,17 +67,15 @@ chmod +x emuacc-covid_*_amd64.AppImage
 
 ### Import a CSV
 
-<video controls muted loop playsinline width="720" poster="docs/demos/import-csv-poster.png">
-  <source src="docs/demos/import-csv.mp4" type="video/mp4" />
-  <source src="docs/demos/import-csv.webm" type="video/webm" />
-</video>
+<a href="docs/demos/import-csv.mp4"><img src="docs/demos/import-csv-poster.png" width="720" alt="Import a CSV: choose the file, map its columns in the Rhai transform, see the imported transactions"></a>
+
+[Watch the import video](docs/demos/import-csv.mp4) (MP4, or [WebM](docs/demos/import-csv.webm)).
 
 ### Add a manual transaction
 
-<video controls muted loop playsinline width="720" poster="docs/demos/manual-txn-poster.png">
-  <source src="docs/demos/manual-txn.mp4" type="video/mp4" />
-  <source src="docs/demos/manual-txn.webm" type="video/webm" />
-</video>
+<a href="docs/demos/manual-txn.mp4"><img src="docs/demos/manual-txn-poster.png" width="720" alt="Add a manual transaction: enter the payee, notes and amount, pick the category account, save and see it in the list"></a>
+
+[Watch the manual transaction video](docs/demos/manual-txn.mp4) (MP4, or [WebM](docs/demos/manual-txn.webm)).
 
 ### Terminology
 
