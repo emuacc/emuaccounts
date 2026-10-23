@@ -1,0 +1,3 @@
+2026-01-15 * ; txn:status-only
+    assets:cash:usd 10.00 USD
+    income:misc -10.00 USD

@@ -1,0 +1,196 @@
+name: Build Release
+
+# What a push builds is set by the repository variable RELEASE_TRIGGER:
+#   tag (or unset)  Only a pushed v* tag builds and releases. Branch pushes
+#                   still start a run, but every job is skipped, so they cost
+#                   nothing; platform breakage shows up when you cut a release.
+#   push            Every push builds all three platforms (macOS bills 10x,
+#                   Windows 2x: ~320 billed minutes a push). main releases
+#                   v{package.json version} unless that tag exists; any other
+#                   branch publishes a {branch}-{short sha} pre-release.
+# A pushed v* tag releases under its own name in either mode.
+# A full release's body is its section of CHANGELOG.md (scripts/release_notes.py);
+# a branch pre-release keeps GitHub's generated notes.
+# Switch with: gh variable set RELEASE_TRIGGER --body push   (or tag)
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+
+jobs:
+  build:
+    if: github.ref_type == 'tag' || vars.RELEASE_TRIGGER == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-22.04
+            target: linux
+          - platform: macos-latest
+            target: macos
+          - platform: windows-latest
+            target: windows
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Rust 1.98.0
+        uses: dtolnay/rust-toolchain@1.98.0
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Linux dependencies
+        if: matrix.target == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        run: npx tauri build --verbose
+
+      - name: Build relay server
+        run: cd src-tauri && cargo build --release --bin emuacc-relay
+
+      - name: Upload relay binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: emuacc-relay-${{ matrix.target }}
+          path: |
+            src-tauri/target/release/emuacc-relay
+            src-tauri/target/release/emuacc-relay.exe
+          if-no-files-found: warn
+
+      - name: Upload Linux artifacts
+        if: matrix.target == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: emuacc-covid-linux
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+
+      - name: Upload macOS artifacts
+        if: matrix.target == 'macos'
+        uses: actions/upload-artifact@v4
+        with:
+          name: emuacc-covid-macos
+          path: |
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/macos/*.app
+          if-no-files-found: error
+
+      - name: Upload Windows artifacts
+        if: matrix.target == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: emuacc-covid-windows
+          path: |
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          # Flatten artifacts into release-assets with platform prefixes
+          find artifacts/emuacc-covid-linux -type f \( -name "*.deb" -o -name "*.AppImage" \) -exec cp {} release-assets/ \; 2>/dev/null || true
+          find artifacts/emuacc-covid-macos -type f \( -name "*.dmg" \) -exec cp {} release-assets/ \; 2>/dev/null || true
+          # Zip the .app bundle for macOS
+          if [ -d "artifacts/emuacc-covid-macos" ]; then
+            find artifacts/emuacc-covid-macos -type d -name "*.app" -exec sh -c 'cd "$(dirname "{}")" && zip -r "../../../release-assets/$(basename "{}").zip" "$(basename "{}")"' \; 2>/dev/null || true
+          fi
+          find artifacts/emuacc-covid-windows -type f \( -name "*.msi" -o -name "*.exe" \) -exec cp {} release-assets/ \; 2>/dev/null || true
+          # Copy relay binaries with platform suffix
+          cp artifacts/emuacc-relay-linux/emuacc-relay release-assets/emuacc-relay-linux 2>/dev/null || true
+          cp artifacts/emuacc-relay-macos/emuacc-relay release-assets/emuacc-relay-macos 2>/dev/null || true
+          cp artifacts/emuacc-relay-windows/emuacc-relay.exe release-assets/emuacc-relay-windows.exe 2>/dev/null || true
+          ls -la release-assets/
+
+      - name: Choose release tag
+        id: release-info
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$REF_TYPE" = tag ]; then
+            tag="$REF_NAME"
+            prerelease=false
+          elif [ "$REF_NAME" = main ]; then
+            tag="v$(node -p "require('./package.json').version")"
+            prerelease=false
+            # --exit-code: 0 = tag exists, 2 = no such tag, anything else = ls-remote failed
+            git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null && status=0 || status=$?
+            if [ "$status" = 0 ]; then
+              echo "::warning::$tag already exists. Bump the version in package.json to create a new release."
+              exit 0
+            elif [ "$status" != 2 ]; then
+              exit "$status"
+            fi
+          else
+            tag="${REF_NAME//[^a-zA-Z0-9._-]/-}-${GITHUB_SHA::7}"
+            prerelease=true
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+      - name: Release notes from CHANGELOG.md
+        # The body of a full release is the tag's section of CHANGELOG.md; no
+        # section, no release (scripts/release_ready.py catches this before
+        # the tag is pushed). A branch pre-release has no section and skips
+        # this step, so no file is written for it.
+        if: steps.release-info.outputs.tag != '' && steps.release-info.outputs.prerelease == 'false'
+        env:
+          TAG: ${{ steps.release-info.outputs.tag }}
+        run: python3 scripts/release_notes.py "${TAG#v}" --out release-notes.md
+
+      - name: Create release
+        if: steps.release-info.outputs.tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release-info.outputs.tag }}
+          name: ${{ steps.release-info.outputs.tag }}
+          prerelease: ${{ steps.release-info.outputs.prerelease }}
+          # A tag the action creates goes on the default branch's head unless
+          # told otherwise; pin it to the commit that was built.
+          target_commitish: ${{ github.sha }}
+          # release-notes.md is the CHANGELOG.md section written above. A
+          # pre-release has none: the action falls back to GitHub's generated
+          # notes when body_path cannot be read, and only a pre-release asks
+          # for them (a body given together with generate_release_notes is
+          # prepended to the generated text, not used instead of it).
+          body_path: release-notes.md
+          generate_release_notes: ${{ steps.release-info.outputs.prerelease }}
+          files: release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

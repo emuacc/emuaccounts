@@ -1,0 +1,3 @@
+2026-01-15 * "Binance" "Buy SOL" ; txn:cost-unclosed
+    assets:exchange:binance:sol 10.000000 SOL {{ 230.00 USD
+    assets:cash:usd -230.00 USD

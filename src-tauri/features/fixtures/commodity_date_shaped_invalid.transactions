@@ -1,0 +1,3 @@
+2026-01-15 * "Weird" "Date-shaped commodity" ; txn:date-commodity
+    assets:misc 1.00 2026-01-15
+    equity:opening -1.00 2026-01-15

@@ -1,0 +1,22 @@
+; A BTC -> ETH fill and an ETH -> BTC fill at the same second on one
+; exchange (Kraken books both at one block time), as four plain
+; equity:trading legs under one narration. Ranked by raw amount across
+; commodities the sells are [BTC 0.5, ETH 2] and the buys [BTC 0.1, ETH 10],
+; which used to link BTC with BTC and ETH with ETH. Legs of one commodity are
+; never a swap: BTC links with ETH in each direction.
+
+2016-01-20 02:34:27 * "Kraken" "trade" ; txn:btc-sell
+    assets:exchange:kraken -0.5 BTC
+    equity:trading 0.5 BTC
+
+2016-01-20 02:34:27 * "Kraken" "trade" ; txn:eth-buy
+    assets:exchange:kraken 10 ETH
+    equity:trading -10 ETH
+
+2016-01-20 02:34:27 * "Kraken" "trade" ; txn:eth-sell
+    assets:exchange:kraken -2 ETH
+    equity:trading 2 ETH
+
+2016-01-20 02:34:27 * "Kraken" "trade" ; txn:btc-buy
+    assets:exchange:kraken 0.1 BTC
+    equity:trading -0.1 BTC

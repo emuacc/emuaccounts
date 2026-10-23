@@ -1,0 +1,13 @@
+; FY2025 (2024-07-01 to 2025-06-30): an acquisition with no cost basis and a
+; disposal of more than held. FY2026: a disposal that consumes the FY2025 lot.
+2025-01-10 * "Airdrop" "XYZ airdrop" ; txn:warn-acq-01
+    assets:wallet:xyz 100 XYZ
+    income:airdrop -100 XYZ
+
+2025-02-01 * "Exchange" "Sell ABC" ; txn:warn-sell-01
+    assets:exchange:abc -5 ABC @@ 50.00 AUD
+    equity:trading:sell 50.00 AUD
+
+2025-09-01 * "Exchange" "Sell XYZ" ; txn:warn-sell-02
+    assets:wallet:xyz -40 XYZ @@ 80.00 AUD
+    equity:trading:sell 80.00 AUD

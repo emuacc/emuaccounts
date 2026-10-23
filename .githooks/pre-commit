@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Pre-commit: test only what the staged files can affect, so commits stay
+# fast. The full suite (Rust BDD, Vitest coverage thresholds, coverage
+# ratchet, submodules, lint on every changed file) runs in pre-push and in
+# CI's unit_bdd job. Rationale: .backlog/decisions/decision-002.
+set -euo pipefail
+export CI=1
+HOOK=pre-commit
+# shellcheck source=lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+staged="$(git diff --cached --name-only --diff-filter=d)"
+if [ -z "$staged" ]; then
+  echo "[$HOOK] Nothing staged; skipping."
+  exit 0
+fi
+
+# Map staged paths to test areas.
+ts=0 rust=0 features=0 covid=0 tooling=0
+while IFS= read -r f; do
+  case "$f" in
+    src/*|index.html|package.json|package-lock.json|tsconfig*.json|vite.config.*|vitest.config.*|eslint.config.*) ts=1 ;;
+    src-tauri/*|rust-toolchain.toml|*.g4) rust=1 ;;
+    features/*) features=1 ;;
+    .covid) covid=1 ;;
+    .githooks/*|scripts/*) tooling=1 ;;
+  esac
+done <<< "$staged"
+# Changing the hooks or the helper scripts can affect every gate: run them all,
+# plus the worktree guard's own self-test.
+if [ "$tooling" = 1 ]; then
+  ts=1 rust=1 features=1
+  if [ -x scripts/hooks/test_worktree_guard.sh ]; then
+    echo "[$HOOK] worktree guard self-test"
+    scripts/hooks/test_worktree_guard.sh || hook_fail "$HOOK" "worktree guard self-test failed"
+  fi
+  if [ -x scripts/hooks/test_pre_push.sh ]; then
+    echo "[$HOOK] pre-push scoping self-test"
+    scripts/hooks/test_pre_push.sh || hook_fail "$HOOK" "pre-push scoping self-test failed"
+  fi
+  if [ -x scripts/hooks/test_coverage_ratchet.sh ]; then
+    echo "[$HOOK] coverage ratchet self-test"
+    scripts/hooks/test_coverage_ratchet.sh || hook_fail "$HOOK" "coverage ratchet self-test failed"
+  fi
+  if [ -x scripts/hooks/test_stop_tauri_dev.sh ]; then
+    echo "[$HOOK] stop_tauri_dev self-test"
+    scripts/hooks/test_stop_tauri_dev.sh || hook_fail "$HOOK" "stop_tauri_dev self-test failed"
+  fi
+  if [ -x scripts/hooks/test_worktree_create.sh ]; then
+    echo "[$HOOK] worktree create hook self-test"
+    scripts/hooks/test_worktree_create.sh || hook_fail "$HOOK" "worktree create hook self-test failed"
+  fi
+  if [ -x scripts/hooks/test_run_debug.sh ]; then
+    echo "[$HOOK] run_debug launcher self-test"
+    scripts/hooks/test_run_debug.sh || hook_fail "$HOOK" "run_debug launcher self-test failed"
+  fi
+  if [ -x scripts/hooks/test_release_ready.sh ]; then
+    echo "[$HOOK] release readiness self-test"
+    scripts/hooks/test_release_ready.sh || hook_fail "$HOOK" "release readiness self-test failed"
+  fi
+  if [ -x scripts/hooks/test_release_notes.sh ]; then
+    echo "[$HOOK] release notes self-test"
+    scripts/hooks/test_release_notes.sh || hook_fail "$HOOK" "release notes self-test failed"
+  fi
+fi
+
+echo "[$HOOK] Staged areas: ts=$ts rust=$rust features=$features covid=$covid"
+if [ "$ts$rust$features$covid" = "0000" ]; then
+  echo "[$HOOK] No testable area staged (docs / backlog only); nothing to run."
+  exit 0
+fi
+
+if [ "$ts" = 1 ]; then
+  echo "[$HOOK] tsc --noEmit"
+  npx tsc --noEmit || hook_fail "$HOOK" "TypeScript type-check failed"
+  echo "[$HOOK] Vitest: tests affected by the uncommitted changes"
+  npx vitest run --changed HEAD --passWithNoTests --reporter=dot \
+    || hook_fail "$HOOK" "Affected Vitest tests failed"
+fi
+
+if [ "$rust" = 1 ]; then
+  stop_tauri_dev "$HOOK"
+  if command -v cargo-nextest >/dev/null 2>&1; then
+    echo "[$HOOK] cargo nextest (lib + integration tests; BDD runs on push)"
+    cargo nextest run --manifest-path src-tauri/Cargo.toml --no-fail-fast \
+      -E 'not binary(bdd)' || hook_fail "$HOOK" "Rust tests failed"
+  else
+    echo "[$HOOK] cargo test --lib (cargo-nextest not installed; integration + BDD run on push)"
+    cargo test --manifest-path src-tauri/Cargo.toml --lib \
+      || hook_fail "$HOOK" "Rust tests failed"
+  fi
+  echo "[$HOOK] cargo clippy"
+  (cd src-tauri && cargo clippy --quiet) || hook_fail "$HOOK" "cargo clippy failed"
+fi
+
+if [ "$features" = 1 ]; then
+  echo "[$HOOK] UI cucumber suite dry-run (undefined steps)"
+  FEATURE_TESTS_DRY_RUN_ONLY=1 ./scripts/run_feature_tests.sh \
+    || hook_fail "$HOOK" "UI cucumber dry-run failed"
+fi
+
+# Complexity lint on the staged production .ts files.
+staged_ts=()
+while IFS= read -r f; do
+  [ -n "$f" ] && staged_ts+=("$f")
+done < <(printf '%s\n' "$staged" | grep -E '^src/.*\.ts$' | grep -v '\.test\.ts$' || true)
+lint_ts_files "$HOOK" ${staged_ts[@]+"${staged_ts[@]}"}
+
+if [ "$covid" = 1 ]; then
+  run_rust_tests "$HOOK" .covid
+  run_py_tests "$HOOK" .covid/core
+fi
+
+echo "[$HOOK] OK"

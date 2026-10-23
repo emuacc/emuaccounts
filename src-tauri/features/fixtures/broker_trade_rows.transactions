@@ -1,0 +1,33 @@
+; Broker fills as the IBKR / CommSec transforms write them: ONE balanced
+; multi-commodity transaction per fill — the shares leg on the broker account,
+; the cash leg on its :cash sub-account, the commission on
+; expenses:fees:brokerage. With the broker account selected, both asset legs
+; are in scope and the commission is the only other posting, so the
+; transaction list used to label every fill by its fee account. A row whose
+; asset legs move one commodity in and a different one out is a trade.
+;
+; The interest row has a single commodity and keeps its contra account.
+;
+; The fills carry their own `@@` price in USD, so with an AUD base the Value
+; column shows that price converted at the day's USD rate (44474.59 /
+; 44695.98 AUD at 1.4330 / 1.4316) rather than the share count x the NET
+; close. The position transfer has no price and values at 10 x the NET close
+; x the USD rate on its day (4998.54 AUD at 347.70 x 1.4376).
+
+2026-10-15 * "Interactive Brokers" "Sell -100.0 NET @ 310.36 USD" ; txn:demo-sell-net-01
+    assets:equity:broker:demo -100.0 NET @@ 31036.0 USD
+    assets:equity:broker:demo:cash 31035.36 USD
+    expenses:fees:brokerage 0.64 USD
+
+2026-10-14 * "Interactive Brokers" "Buy 100.0 NET @ 312.21 USD" ; txn:demo-buy-net-01
+    assets:equity:broker:demo 100.0 NET @@ 31221.0 USD
+    assets:equity:broker:demo:cash -31221.64 USD
+    expenses:fees:brokerage 0.64 USD
+
+2026-10-13 * "Interactive Brokers" "Position transfer in 10.0 NET" ; txn:demo-xfer-net-01
+    assets:equity:broker:demo 10.0 NET
+    assets:transfer:shares -10.0 NET
+
+2026-10-01 * "Interactive Brokers" "Credit interest" ; txn:demo-interest-01
+    assets:equity:broker:demo:cash 12.50 USD
+    income:interest:broker -12.50 USD
