@@ -68,6 +68,13 @@ echo "[$HOOK] BDD tests (Rust cucumber suite + UI suite dry-run)"
 echo "[$HOOK] cargo clippy"
 (cd src-tauri && cargo clippy --quiet) || hook_fail "$HOOK" "cargo clippy failed"
 
+# Sync is compiled only with the `sync` feature (docs/SYNC.md), so nothing
+# above builds it. Type-check it — the code and its tests — so a core change
+# cannot silently break it; scripts/run_sync_tests.sh runs its tests.
+echo "[$HOOK] Sync build type-check (clippy + test targets, --features sync)"
+(cd src-tauri && cargo clippy --quiet --features sync && cargo check --quiet --tests --features sync) \
+  || hook_fail "$HOOK" "The sync build (--features sync) no longer compiles"
+
 lint_ts_files "$HOOK" ${changed_ts[@]+"${changed_ts[@]}"}
 
 run_rust_tests "$HOOK" .covid

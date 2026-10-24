@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::automerge_store::MetadataStore;
-use crate::content_store::ContentStore;
+use super::content_store::ContentStore;
+use super::metadata::MetadataStore;
+use super::state::RELAY_CONFIG_FILE;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayConfig {
@@ -242,7 +243,7 @@ pub fn sync_with_relay(
 
 /// Save relay config to a JSON file in sources_dir.
 pub fn save_relay_config(sources_dir: &Path, config: &RelayConfig) -> Result<(), String> {
-    let path = sources_dir.join(crate::sync_state::RELAY_CONFIG_FILE);
+    let path = sources_dir.join(RELAY_CONFIG_FILE);
     let json = crate::to_sorted_json_pretty(config)
         .map_err(|e| format!("Serialize config failed: {}", e))?;
     std::fs::write(&path, json).map_err(|e| format!("Write config failed: {}", e))?;
@@ -251,7 +252,7 @@ pub fn save_relay_config(sources_dir: &Path, config: &RelayConfig) -> Result<(),
 
 /// Load relay config from sources_dir. Returns None if file doesn't exist.
 pub fn load_relay_config(sources_dir: &Path) -> Result<Option<RelayConfig>, String> {
-    let path = sources_dir.join(crate::sync_state::RELAY_CONFIG_FILE);
+    let path = sources_dir.join(RELAY_CONFIG_FILE);
     if !path.exists() {
         return Ok(None);
     }

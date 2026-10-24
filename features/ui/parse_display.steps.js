@@ -51,10 +51,8 @@ function resolveAppBinaryPath(backend) {
       : path.join(repoRoot, "src-tauri", "target", "debug");
 
   const platformExt = process.platform === "win32" ? ".exe" : "";
-  for (const name of ["emuacc-covid", "emuacc_covid", "tauri-app", "app"]) {
-    const candidate = path.join(targetDir, `${name}${platformExt}`);
-    if (fs.existsSync(candidate)) return candidate;
-  }
+  const binary = path.join(targetDir, `emuaccounts${platformExt}`);
+  if (fs.existsSync(binary)) return binary;
 
   // macOS may output an .app even with --no-bundle, depending on Tauri version/config.
   const bundleDir = path.join(targetDir, "bundle", "macos");
@@ -68,7 +66,7 @@ function resolveAppBinaryPath(backend) {
 
   const hint =
     backend === "tauri-wd"
-      ? 'Build with: npm run build && CARGO_TARGET_DIR=~/.cache/emuacc-target-mcp cargo build --manifest-path src-tauri/Cargo.toml --bin emuacc-covid --features "webdriver tauri/custom-protocol"'
+      ? 'Build with: npm run build && CARGO_TARGET_DIR=~/.cache/emuacc-target-mcp cargo build --manifest-path src-tauri/Cargo.toml --bin emuaccounts --features "webdriver tauri/custom-protocol"'
       : "Run: npx tauri build --debug --no-bundle";
   throw new Error(`Unable to locate built Tauri binary under ${targetDir}. ${hint}`);
 }
@@ -113,7 +111,7 @@ function buildApp(backend) {
         "--manifest-path",
         "src-tauri/Cargo.toml",
         "--bin",
-        "emuacc-covid",
+        "emuaccounts",
         // Comma-separated (not space) so it survives as ONE shell word under
         // spawnSync's shell:true, which would otherwise split it into a stray arg.
         "--features",
@@ -151,9 +149,10 @@ function startDriverServer(backend) {
     // tauri-wd ignores capabilities' `tauri:options.env`; the launched app
     // inherits THIS process's env, so the vault overrides go here. BOTH dirs
     // must be overridden: with only EMUACC_GENERATED_DIR set, sources resolve
-    // to the configured real vault (env > config > fallback) and .setup()
-    // cold-transforms the whole vault into the empty temp dir — a debug-build
-    // pipeline run that blocks the window past every wait in this suite.
+    // to the configured real vault (env > config > fallback) and the launch
+    // rebuild cold-transforms the whole vault into the empty temp dir — a
+    // debug-build pipeline run that holds the window on the "Rebuilding cache"
+    // screen past every wait in this suite.
     driverServer = spawn(tauriWdPath, ["--port", "4444"], {
       stdio: [null, process.stdout, process.stderr],
       env: { ...process.env, EMUACC_GENERATED_DIR: generatedDir, EMUACC_SOURCES_DIR: sourcesDir },
@@ -194,8 +193,8 @@ async function startWebdriverSession() {
 
   buildApp(backend);
 
-  generatedDir = mkTempDir("emuacc-covid-e2e-generated");
-  sourcesDir = mkTempDir("emuacc-covid-e2e-sources");
+  generatedDir = mkTempDir("emuaccounts-e2e-generated");
+  sourcesDir = mkTempDir("emuaccounts-e2e-sources");
   // A vault with no base currency is gated behind the first-run setup screen
   // (base_currency_setup.feature covers that). Every other scenario expects
   // the main page, so seed the vault config the way a set-up vault has it.

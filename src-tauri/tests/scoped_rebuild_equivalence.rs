@@ -14,7 +14,7 @@
 //! identical for both runs): baseline-build → mutate one set's folder → SCOPED
 //! rebuild + snapshot → FORCED-FULL rebuild + snapshot → assert equal.
 
-use emuacc_covid::processing_pipeline::{run_pipeline, PipelineConfig};
+use emuaccounts::processing_pipeline::{run_pipeline, PipelineConfig};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -35,7 +35,7 @@ fn config(sources: &Path, generated: &Path, force: bool, hint: Option<Vec<String
         generated_dir: generated.to_path_buf(),
         now_yyyymm: "202502".to_string(),
         force,
-        default_expense_account: emuacc_covid::FALLBACK_EXPENSE_ACCOUNT.to_string(),
+        default_expense_account: emuaccounts::FALLBACK_EXPENSE_ACCOUNT.to_string(),
         changed_folder_hint: hint,
     }
 }

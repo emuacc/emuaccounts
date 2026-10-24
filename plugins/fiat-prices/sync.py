@@ -16,6 +16,9 @@ Uses yfinance tickers of the form '{FROM}{TO}=X' (e.g. 'AUDUSD=X',
 Output format matches the rest of the emuacc pricing pipeline:
     P <YYYY-MM-DD> <CURRENCY> <PRICE> USD
 
+A file that already holds rows quoted in anything but USD (GBP.txt kept in
+the base currency by non-usd-prices) is left untouched and reported.
+
 Dependencies are declared in PEP 723 inline metadata above; the runner
 will use `uv run` to provision an ephemeral venv automatically.
 """
@@ -26,6 +29,14 @@ import re
 import sys
 
 import yfinance as yf
+
+# The runner passes only .data/config.json, so these are what runs without one.
+# They MUST match the [config] defaults in plugin.toml, which the Plugins view
+# shows (test_script_defaults_are_the_manifest_defaults).
+DEFAULTS = {"currencies": "AUD,EUR,GBP", "period": "max"}
+
+# Every rate is written quoted in this currency.
+QUOTE = "USD"
 
 
 # --- price-file names --------------------------------------------------------
@@ -50,6 +61,29 @@ def commodity_from_price_stem(stem):
     """Inverse of price_file_stem, for deriving a commodity from a file name.
     Unambiguous because '%' is outside the commodity grammar."""
     return re.sub(r"%([0-9A-Fa-f]{2})", lambda m: chr(int(m.group(1), 16)), stem)
+
+
+# --- one quote currency per file ---------------------------------------------
+# A price plugin reads a file back by date and rewrites every line under the one
+# quote currency it writes. A row already quoted in another currency would be
+# relabelled (GBP 1.9053 AUD becomes GBP 1.9053 USD), a silent revaluation, so a
+# file holding any is left untouched and the conflict is reported instead.
+#
+# This MUST stay identical in every price plugin: like price_file_stem it is
+# copied, not shared, because plugins are installed into vaults standalone.
+def quote_conflict(path, quote):
+    """A warning when a P row in `path` is quoted in anything but `quote`, else None."""
+    others = set()
+    if os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                p = line.split()
+                if len(p) >= 5 and p[0] == "P" and p[4] != quote:
+                    others.add(p[4])
+    if not others:
+        return None
+    return (f"_prices/{os.path.basename(path)} left untouched: it holds prices quoted in "
+            f"{', '.join(sorted(others))} and this plugin writes {quote}")
 
 
 def parse_csv_list(raw):
@@ -106,17 +140,17 @@ def write_prices(filepath, currency, prices, existing):
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, "w") as f:
         for date_str in sorted(merged.keys()):
-            f.write(f"P {date_str} {currency} {merged[date_str]} USD\n")
+            f.write(f"P {date_str} {currency} {merged[date_str]} {QUOTE}\n")
     return new_count
 
 
 def main():
     ctx = json.load(sys.stdin)
-    config = ctx.get("config", {})
+    config = {**DEFAULTS, **ctx.get("config", {})}
     sources_dir = ctx["sources_dir"]
 
-    currencies = parse_csv_list(config.get("currencies", "AUD,EUR,GBP"))
-    period = config.get("period", "max")
+    currencies = parse_csv_list(config["currencies"])
+    period = config["period"]
 
     files_written = []
     total_fetched = 0
@@ -125,8 +159,8 @@ def main():
     prices_dir = os.path.join(sources_dir, "_prices")
 
     for currency in currencies:
-        if currency == "USD":
-            continue  # USD is the quote currency
+        if currency == QUOTE:
+            continue
         try:
             print(f"Fetching {currency}USD=X...", file=sys.stderr)
             prices = fetch_fx_close(currency, period)
@@ -136,6 +170,10 @@ def main():
 
         stem = price_file_stem(currency)
         filepath = os.path.join(prices_dir, f"{stem}.txt")
+        conflict = quote_conflict(filepath, QUOTE)
+        if conflict:
+            warnings.append(f"{currency}: {conflict}")
+            continue
         existing = load_existing_prices(filepath)
         new_count = write_prices(filepath, currency, prices, existing)
         total_fetched += len(prices)

@@ -5,8 +5,8 @@
 //! `report_templates`. These tests exercise those functions directly with a
 //! temp directory so no Tauri AppHandle is needed.
 
-use emuacc_covid::report_templates::{load_tax_config, persist_tax_config};
-use emuacc_covid::reports::TaxConfig;
+use emuaccounts::report_templates::{load_tax_config, persist_tax_config};
+use emuaccounts::reports::TaxConfig;
 use tempfile::TempDir;
 
 fn tmp() -> TempDir {

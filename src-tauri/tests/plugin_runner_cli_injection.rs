@@ -4,7 +4,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use emuacc_covid::plugins;
+use emuaccounts::plugins;
 
 // Parallel tests can share a pid AND a nanosecond timestamp (the clock is
 // coarse on macOS); the counter makes temp dirs unique per call.

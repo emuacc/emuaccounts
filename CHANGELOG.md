@@ -12,6 +12,39 @@ built (`.github/workflows/build.yml`), and `scripts/release_ready.py` refuses
 to hand out the tag command while the section is missing. Use absolute links
 inside a section: it is read on the release page as well as in this file.
 
+## 0.1.2 - unreleased
+
+This release removes obvious errors: a window that froze while a large data
+folder rebuilt, label edits that could wipe a folder's labels, and price files
+that mixed quote currencies. The app is now called EmuAcc in every name it
+shows, and multi-device sync leaves the released app. The app and its
+installers are version 0.1.2, and `generated/generator.json` records 0.1.2 as
+the version that wrote a data folder. (TASK-130)
+
+Getting started, in one take recorded from this release — choose a data
+folder and add an account, import a CSV, add a manual transaction, then open
+the ledger text file the pipeline wrote from all of it:
+[watch the recording](https://github.com/emuacc/emuaccounts/blob/v0.1.2/docs/demos/getting-started.mp4)
+(the README plays it as a looping GIF). (TASK-132)
+
+### New
+
+- The tagline under the EmuAcc name at the top of the sidebar reads "Understand your finances", the same words as the README headline (it said "Understand your accounts"). (TASK-127)
+- The demo recordings play by themselves, as looping GIFs: the getting-started take in the README, and the CSV import and manual transaction in the user guide, re-recorded to show the app as it is now. Before, each was a still image to click through to the video. The full-resolution MP4 and WebM are linked under each one. (TASK-129)
+- Trade links are kept in `sources/_trade_links.json`: plain JSON, one entry per link sorted by id, so in a vault under git a new or removed link shows as a small diff. The first launch copies the links from `sources/emuacc-metadata.automerge` into it and leaves that file as it was; commit the new file. Keep `_trade_links.json` once it exists: while the old file is still there, deleting it copies the links again, and any you removed since come back. (TASK-133)
+
+### Fixed
+
+- The window no longer freezes ("Not Responding") while a large data folder rebuilds, at launch or after you choose another folder: a "Rebuilding cache" screen shows until the rebuild ends, then the app opens as before. Other slow work, such as gathering the issues list, no longer freezes the window either. (TASK-125)
+- Saving, editing or deleting a payee label no longer rewrites a folder's `_labels.json` when that file cannot be read or parsed (a trailing comma from a hand edit, conflict markers left by a sync). The app reports the broken file and leaves it untouched; before, saving replaced the file with the one new label, so every other payee and commodity label in the folder was lost, and editing or deleting said the label was not found. (TASK-111)
+- `emuacc-query`, `emuacc-reports`, `emuacc-regenerate`, `emuacc-issues`, `emuacc-dedupe`, `emuacc-migrate-rules`, `emuacc-repair-trade-links` and `emuacc-web` read the app settings from the folder `EMUACC_APP_DATA_DIR` names, as `emuacc-update` and `emuacc-ai-import` already did; before, they always read the default settings folder. (TASK-128)
+- The bundled price plugins no longer mix quote currencies in one price file. With their default settings, Fiat Price Sync wrote `_prices/GBP.txt` quoted in USD and Non-USD Prices wrote the same file quoted in AUD, so its rows switched currency from date to date. Each price plugin now leaves a file that already holds prices in another quote currency untouched and reports it, and Non-USD Prices by default writes only `USD.txt`: list the legs your own holdings need under its `yahoo` setting. A plugin already added to a vault keeps its installed copy, since the app adds plugins but does not update them. (TASK-115)
+
+### Breaking changes
+
+- The app is called EmuAcc everywhere: the window title, the installed app and the installer files no longer say "COVID" (`EmuAcc.app`, `EmuAcc_<version>_amd64.deb`). Its bundle identifier is now `com.emusoftware.emuaccounts`, so the system sees a new app: remove the old "EmuAcc COVID" from Applications after installing. The app also keeps its settings in a new folder named after that identifier (see [Data file locations](https://github.com/emuacc/emuaccounts/blob/main/USER_GUIDE.md#data-file-locations)), so on its first launch it asks for your data folder again; choose the same folder, nothing in it changes. To keep your other settings (the AI assistant, the default expense account), move `config.json` from the old `com.cog32.emuacccovid` folder into the new one before launching. (TASK-128)
+- Multi-device sync is no longer part of the app. It was unfinished: the sidebar's Sync section (Pair Device, Sync Now, View Sync Log) is gone, and releases no longer include the `emuacc-relay` server. It is now an opt-in developer build ([docs/SYNC.md](https://github.com/emuacc/emuaccounts/blob/v0.1.2/docs/SYNC.md)). Trade links are unaffected. (TASK-126)
+
 ## 0.1.1 - 2026-10-23
 
 The initial release: plain-text, local-first accounting for every account you

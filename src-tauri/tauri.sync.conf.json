@@ -1,0 +1,7 @@
+{
+  "build": {
+    "features": ["sync"],
+    "beforeDevCommand": "npm run dev:sync",
+    "beforeBuildCommand": "npm run build:sync"
+  }
+}

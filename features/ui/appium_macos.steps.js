@@ -48,7 +48,7 @@ function readTauriConfig() {
 
 function resolveMacAppBundlePath() {
   const cfg = readTauriConfig();
-  const productName = cfg.package.productName;
+  const productName = cfg.productName;
   const candidates = [
     path.join(repoRoot, "src-tauri", "target", "debug", "bundle", "macos", `${productName}.app`),
     path.join(repoRoot, "src-tauri", "target", "release", "bundle", "macos", `${productName}.app`),
@@ -94,7 +94,7 @@ async function startAppium() {
 
 async function startSessionWithImportedFile(relativePath) {
   const cfg = readTauriConfig();
-  const bundleId = cfg.tauri?.bundle?.identifier ?? "com.cog32.emuacccovid";
+  const bundleId = cfg.identifier;
   const appPath = resolveMacAppBundlePath();
 
   const importPath = path.resolve(repoRoot, relativePath);
@@ -109,7 +109,7 @@ async function startSessionWithImportedFile(relativePath) {
   capabilities.set("appium:bundleId", bundleId);
   capabilities.set("appium:appPath", appPath);
   capabilities.set("appium:noReset", false);
-  generatedDir = fs.mkdtempSync(path.join(os.tmpdir(), "emuacc-covid-appium-generated-"));
+  generatedDir = fs.mkdtempSync(path.join(os.tmpdir(), "emuaccounts-appium-generated-"));
   capabilities.set("appium:environment", {
     EMUACC_E2E_IMPORT_PATHS: importPath,
     EMUACC_E2E_NOW_YYYYMM: nowYyyymm,

@@ -15,16 +15,16 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use emuacc_covid::ai_client::AiClient;
-use emuacc_covid::ai_import::{
+use emuaccounts::ai_client::AiClient;
+use emuaccounts::ai_import::{
     self, DocumentImportContext, DocumentImportExtraction, DocumentImportResponse,
 };
-use emuacc_covid::display_config::vault_base_currency;
-use emuacc_covid::processing_pipeline::{
+use emuaccounts::display_config::vault_base_currency;
+use emuaccounts::processing_pipeline::{
     folder_to_account_name, process_imports, validate_folder_name, PipelineConfig,
 };
-use emuacc_covid::report_templates::{generate_all_reports, ALL_FORMATS};
-use emuacc_covid::root_config::{self, platform_app_data_dir, RootConfig};
+use emuaccounts::report_templates::{generate_all_reports, ALL_FORMATS};
+use emuaccounts::root_config::{self, platform_app_data_dir, RootConfig};
 
 const NAME: &str = "emuacc-ai-import";
 

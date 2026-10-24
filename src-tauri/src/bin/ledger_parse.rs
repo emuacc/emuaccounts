@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use emuacc_covid::ledger_parser::parse_transactions;
+use emuaccounts::ledger_parser::parse_transactions;
 
 fn main() {
     let mut args = std::env::args().skip(1);

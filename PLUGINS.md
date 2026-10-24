@@ -107,7 +107,7 @@ on startup"** batch. When that checkbox (in the Plugins view) is enabled, the
 app runs every `daily` plugin shortly after launch, then rebuilds the pipeline
 once. The setting is off by default and persists in the app config.
 
-Two rules make this safe to run on every launch:
+Three rules make this safe to run on every launch:
 
 - **Once per day:** a plugin that already succeeded today (per its
   `.data/last_run.json`) is skipped without running, so repeated launches on the
@@ -117,6 +117,12 @@ Two rules make this safe to run on every launch:
   forward, merge) and treat "nothing new" as a clean no-op — never a wholesale
   re-download or an error. This is what lets a single startup run backfill any
   gap, whether the app was closed for a day or a month.
+- **One quote currency per file:** merging by date and rewriting the file in
+  the plugin's own quote currency would relabel any row quoted in another
+  (`GBP 1.9053 AUD` becoming `GBP 1.9053 USD`). A plugin about to write a file
+  that holds such a row **must** leave it untouched and report the conflict as
+  a warning; each shipped price plugin carries the same `quote_conflict` for
+  this.
 
 The price plugins shipped in this repo (`crypto-spot-prices`, `fiat-prices`,
 `stock-prices`, `non-usd-prices`) are all marked `daily`.
@@ -198,7 +204,10 @@ below and the example. They all work against public APIs with no account or
 API key (CoinGecko's free demo key is optional), and none carries personal
 data. Each manifest's `[config]` block documents its options. The four price
 plugins are marked `daily` and are incremental: they merge new dates into the
-existing `sources/_prices/{SYMBOL}.txt` files rather than rewriting history.
+existing `sources/_prices/{SYMBOL}.txt` files rather than rewriting history,
+and they leave a file holding prices in another quote currency untouched and
+report it. The `fiat-prices` and `non-usd-prices` defaults write different
+files.
 
 ### Crypto Spot Prices (`crypto-spot-prices`)
 
@@ -235,8 +244,20 @@ USD-priced commodity crosses — plus any holding whose own quote currency keeps
 it one hop away (a GBP-quoted London listing converts via GBP, not via USD).
 The USD leg is derived by inverting what `fiat-prices` writes, the rest come
 from Yahoo, and only a recent window is ever rewritten, so a hand-built
-history stays byte-identical. The defaults suit an AUD base; set `invert` to
-`USD=<your base>`.
+history stays byte-identical.
+
+**Config:**
+- `invert` — `SYMBOL=QUOTE` pairs, each writing `SYMBOL.txt` quoted in `QUOTE`
+  by inverting the `QUOTE.txt` that `fiat-prices` writes (default `USD=AUD`, an
+  AUD base; set it to `USD=<your base>`)
+- `yahoo` — `SYMBOL=TICKER` pairs for the legs your own holdings need (default
+  none). A GBP-quoted London listing needs `GBP=GBPAUD=X`; take `GBP` out of
+  `fiat-prices`' `currencies` first, since that writes `GBP.txt` quoted in USD
+  and the two would otherwise target one file
+- `forward_fill` — symbols carried onto every calendar day (default `USD`); add
+  the FX legs you list under `yahoo`
+- `refresh_days`, `period`, `decimals` — the rewrite window (default 7 days),
+  yfinance period (default `max`) and decimal places (default 4)
 
 ### Hello World (`hello-world`)
 

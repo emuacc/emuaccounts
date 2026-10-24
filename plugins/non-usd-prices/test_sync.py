@@ -5,8 +5,13 @@ import io
 import json
 import os
 import sys
+import tomllib
+
+import pytest
 
 import sync
+
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def _prices(tmp_path, files):
@@ -176,3 +181,60 @@ def test_price_file_stem_matches_the_rust_encoder():
     assert sync.price_file_stem("xyz:WTIOIL") == "xyz%3AWTIOIL"
     for name in ["USD", "GBP", "VUKG", "BRK.B"]:
         assert sync.price_file_stem(name) == name
+
+
+# --- one quote currency per file ---------------------------------------------
+def test_a_file_already_holding_another_quote_is_left_untouched(tmp_path, monkeypatch, capsys):
+    """fiat-prices writes GBP.txt quoted in USD. Filling AUD rows into it gives
+    a file whose rows switch currency by date, so a single row in another
+    currency is enough to refuse the file and report it."""
+    today = datetime.date.today().isoformat()
+    body = "P 2026-01-15 GBP 1.2700 USD\nP 2026-01-17 GBP 1.9000 AUD\n"
+    _prices(tmp_path, {"GBP.txt": body})
+    monkeypatch.setattr(sync, "fetch_yahoo", lambda t, p: ({today: 1.9053}, "AUD"))
+
+    with pytest.raises(SystemExit) as exc:  # nothing written + a warning
+        _run(tmp_path, {"invert": "", "yahoo": "GBP=GBPAUD=X", "forward_fill": ""}, monkeypatch, capsys)
+    assert exc.value.code == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["files_written"] == []
+    assert (tmp_path / "sources" / "_prices" / "GBP.txt").read_text() == body
+    [warning] = out["warnings"]
+    assert "GBP.txt" in warning and "USD" in warning and "AUD" in warning
+
+
+# --- defaults ----------------------------------------------------------------
+def _manifest_defaults(plugin_dir):
+    with open(os.path.join(plugin_dir, "plugin.toml"), "rb") as f:
+        return {k: v["default"] for k, v in tomllib.load(f)["config"].items()}
+
+
+def _default_targets():
+    """The symbols (= price files) the defaults write."""
+    return {sym for key in ("invert", "yahoo") for sym, _ in sync.parse_pairs(sync.DEFAULTS[key])}
+
+
+def test_script_defaults_are_the_manifest_defaults():
+    """The runner passes only .data/config.json, so without one the script's
+    DEFAULTS are what runs, while the Plugins view shows plugin.toml's."""
+    assert sync.DEFAULTS == _manifest_defaults(HERE)
+
+
+def test_defaults_write_only_the_base_currency_usd_leg():
+    """A holding (a London listing, a cash currency) is the user's to add: a
+    default that names one writes that file into every vault that installs it."""
+    assert _default_targets() == {"USD"}
+    assert sync.DEFAULTS["forward_fill"] == "USD"
+
+
+def test_defaults_never_target_a_file_fiat_prices_writes_by_default():
+    """Both plugins merge by date into _prices/<SYMBOL>.txt, fiat-prices quoting
+    in USD and this one in the base currency, so a shared default target is a
+    file that would hold both. The default inversion still reads a file
+    fiat-prices writes by default, so the pair works out of the box."""
+    fiat_dir = os.path.join(HERE, "..", "fiat-prices")
+    if not os.path.isdir(fiat_dir):
+        pytest.skip("fiat-prices is not alongside (an installed copy)")
+    fiat = {c.strip().upper() for c in _manifest_defaults(fiat_dir)["currencies"].split(",")} - {"USD"}
+    assert not _default_targets() & fiat
+    assert {quote for _, quote in sync.parse_pairs(sync.DEFAULTS["invert"])} <= fiat

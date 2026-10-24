@@ -11,9 +11,9 @@
 
 use std::path::PathBuf;
 
-use emuacc_covid::plugins;
-use emuacc_covid::processing_pipeline::{run_pipeline, PipelineConfig};
-use emuacc_covid::root_config::{self, platform_app_data_dir};
+use emuaccounts::plugins;
+use emuaccounts::processing_pipeline::{run_pipeline, PipelineConfig};
+use emuaccounts::root_config::{self, platform_app_data_dir};
 
 fn resolve_sources_dir() -> PathBuf {
     let env_override = std::env::var("EMUACC_SOURCES_DIR").ok();
@@ -173,11 +173,11 @@ fn main() {
                 let mut account_sets: Vec<String> =
                     result.owner_accounts.keys().cloned().collect();
                 account_sets.sort();
-                match emuacc_covid::report_templates::generate_all_reports(
+                match emuaccounts::report_templates::generate_all_reports(
                     &config.sources_dir,
                     &config.generated_dir,
                     &account_sets,
-                    emuacc_covid::report_templates::ALL_FORMATS,
+                    emuaccounts::report_templates::ALL_FORMATS,
                     &root_cfg.extra_primary_account_prefixes,
                 ) {
                     Ok(()) => println!("reports: regenerated"),

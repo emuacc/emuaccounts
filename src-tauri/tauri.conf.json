@@ -1,7 +1,7 @@
 {
-  "productName": "EmuAcc COVID",
-  "version": "0.1.1",
-  "identifier": "com.cog32.emuacccovid",
+  "productName": "EmuAcc",
+  "version": "0.1.2",
+  "identifier": "com.emusoftware.emuaccounts",
   "build": {
     "beforeBuildCommand": "npm run build",
     "beforeDevCommand": "npm run dev",
@@ -11,7 +11,7 @@
   "app": {
     "windows": [
       {
-        "title": "EmuAcc COVID",
+        "title": "EmuAcc",
         "width": 900,
         "height": 600
       }

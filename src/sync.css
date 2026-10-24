@@ -1,0 +1,125 @@
+/* Multi-device sync UI (src/sync.ts) — only in the sync build (VITE_SYNC=1, docs/SYNC.md). */
+/* Sync accordion */
+.syncAccordion {
+  margin: 0;
+}
+.syncAccordion__toggle {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: rgba(229, 231, 235, 0.7);
+  cursor: pointer;
+  list-style: none;
+  padding: 4px 0;
+  font-weight: 600;
+}
+.syncAccordion__toggle::-webkit-details-marker {
+  display: none;
+}
+.syncAccordion__toggle::before {
+  content: "▸ ";
+  display: inline;
+  font-size: 10px;
+}
+.syncAccordion[open] > .syncAccordion__toggle::before {
+  content: "▾ ";
+}
+.syncAccordion__body {
+  padding-top: 6px;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+.syncDevices {
+  margin-top: 8px;
+}
+.syncDevices__title {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: #9ca3af;
+  margin-bottom: 4px;
+}
+.syncDevices__item {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: #d1d5db;
+  padding: 2px 0;
+}
+.syncDevices__id {
+  color: #6b7280;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+}
+/* Sync log modal */
+.syncLogDevices {
+  font-size: 13px;
+  color: #6b7280;
+  margin-bottom: 12px;
+}
+.syncLogDevice {
+  margin-left: 4px;
+}
+.syncLogTable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+.syncLogTable th {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 2px solid #e5e7eb;
+  font-weight: 600;
+  color: #374151;
+}
+.syncLogTable td {
+  padding: 5px 8px;
+  border-bottom: 1px solid #f3f4f6;
+  color: #4b5563;
+}
+.syncLogEvent__type {
+  background: #e0e7ff;
+  color: #4338ca;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.syncLogEmpty {
+  color: #9ca3af;
+  padding: 24px 0;
+  text-align: center;
+}
+/* Relay */
+.relayStatus {
+  margin-top: 8px;
+}
+.relayStatus__label {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: #9ca3af;
+  margin-bottom: 2px;
+}
+.relayStatus__url {
+  font-size: 11px;
+  color: #d1d5db;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  word-break: break-all;
+  margin-bottom: 6px;
+}
+.pairingCode {
+  text-align: center;
+  padding: 16px 0;
+}
+.pairingCode__label {
+  font-size: 13px;
+  color: #6b7280;
+  margin-bottom: 8px;
+}
+.pairingCode__value {
+  font-size: 36px;
+  font-weight: 900;
+  letter-spacing: 0.15em;
+  color: #111827;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}

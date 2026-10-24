@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use emuacc_covid::processing_pipeline::detect_account_gaps;
+use emuaccounts::processing_pipeline::detect_account_gaps;
 
 fn resolve_generated_dir() -> PathBuf {
     if let Ok(custom) = std::env::var("EMUACC_GENERATED_DIR") {

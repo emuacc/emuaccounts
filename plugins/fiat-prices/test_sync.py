@@ -4,8 +4,13 @@ import io
 import json
 import os
 import sys
+import tomllib
+
+import pytest
 
 import sync
+
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 # --- price-file name encoder (must mirror ledger_parser::price_file_stem) ----
@@ -58,3 +63,35 @@ def test_main_builds_file_names_with_the_shared_encoder(tmp_path, monkeypatch, c
         "P 2026-01-16 AUD 0.660000 USD",
     ]
     assert (sources / "_prices" / "XYZ%3AWTIOIL.txt").read_text() == "P 2026-01-16 XYZ:WTIOIL 0.660000 USD\n"
+
+
+# --- one quote currency per file ---------------------------------------------
+def test_a_file_quoted_in_another_currency_is_left_untouched(tmp_path, monkeypatch, capsys):
+    """non-usd-prices can keep GBP.txt quoted in AUD. Merging USD closes into it
+    by date and rewriting every line with USD would relabel each AUD rate as a
+    USD one, so the file is refused and the other currencies still run."""
+    sources = tmp_path / "sources"
+    os.makedirs(sources / "_prices")
+    gbp = "P 2026-01-15 GBP 1.9000 AUD\n"
+    (sources / "_prices" / "GBP.txt").write_text(gbp)
+    monkeypatch.setattr(sync, "fetch_fx_close", lambda currency, period: [("2026-01-16", 0.66)])
+    ctx = {"config": {"currencies": "AUD,GBP"}, "sources_dir": str(sources)}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(ctx)))
+
+    with pytest.raises(SystemExit) as exc:  # partial: AUD written, GBP refused
+        sync.main()
+    assert exc.value.code == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["files_written"] == ["_prices/AUD.txt"]
+    assert (sources / "_prices" / "GBP.txt").read_text() == gbp
+    [warning] = out["warnings"]
+    assert "GBP.txt" in warning and "AUD" in warning and "USD" in warning
+
+
+# --- defaults -----------------------------------------------------------------
+def test_script_defaults_are_the_manifest_defaults():
+    """The runner passes only .data/config.json, so without one the script's
+    DEFAULTS are what runs, while the Plugins view shows plugin.toml's."""
+    with open(os.path.join(HERE, "plugin.toml"), "rb") as f:
+        manifest = {k: v["default"] for k, v in tomllib.load(f)["config"].items()}
+    assert sync.DEFAULTS == manifest

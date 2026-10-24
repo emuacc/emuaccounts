@@ -3,7 +3,7 @@
 # so the suggest flow regenerates them on next import.
 set -euo pipefail
 
-APP_ID="com.cog32.emuacccovid"
+APP_ID="com.emusoftware.emuaccounts"
 
 case "$(uname -s)" in
   Darwin) SOURCES_DIR="$HOME/Library/Application Support/$APP_ID/sources" ;;

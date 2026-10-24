@@ -3,34 +3,8 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use emuacc_covid::issues::{self, Category, CollectFilter, IssueGroup, IssueSeverity};
-use emuacc_covid::root_config;
-
-fn platform_app_data_dir() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join("Library/Application Support/com.cog32.emuacccovid");
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(data) = std::env::var("XDG_DATA_HOME").ok().or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| format!("{h}/.local/share"))
-        }) {
-            return PathBuf::from(data).join("com.cog32.emuacccovid");
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            return PathBuf::from(appdata).join("com.cog32.emuacccovid");
-        }
-    }
-    PathBuf::from(".")
-}
+use emuaccounts::issues::{self, Category, CollectFilter, IssueGroup, IssueSeverity};
+use emuaccounts::root_config::{self, platform_app_data_dir};
 
 fn resolve_dirs() -> (PathBuf, PathBuf) {
     let env_sources = std::env::var("EMUACC_SOURCES_DIR").ok();

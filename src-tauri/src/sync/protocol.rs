@@ -1,5 +1,5 @@
-use crate::automerge_store::MetadataStore;
-use crate::content_store::ContentStore;
+use super::content_store::ContentStore;
+use super::metadata::MetadataStore;
 use std::path::Path;
 
 /// Result of a two-phase sync operation.
@@ -115,8 +115,6 @@ pub fn full_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::automerge_store::MetadataStore;
-    use crate::content_store::ContentStore;
     use std::fs;
 
     fn temp_dir(prefix: &str) -> std::path::PathBuf {

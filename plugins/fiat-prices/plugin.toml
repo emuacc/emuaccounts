@@ -1,6 +1,6 @@
 [plugin]
 name = "Fiat Price Sync"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fetch daily fiat/USD historical exchange rates via yfinance (Yahoo Finance) — AUD, EUR, GBP, etc."
 script = "sync.py"
 daily = true

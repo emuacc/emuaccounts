@@ -418,3 +418,31 @@ def test_ticker_override_wins_over_option_parsing(tmp_path, monkeypatch, capsys)
     assert captured == {"SOMETHING": None}
     # An override is taken verbatim: no contract multiplier applied.
     assert (sources_dir / "_prices" / "QQQ270319P00635000.txt").read_text().endswith(" 1776.0000 USD\n")
+
+
+# --- one quote currency per file ---------------------------------------------
+def test_a_file_quoted_in_another_currency_is_left_untouched(tmp_path, monkeypatch, capsys):
+    """A London listing held at IBKR (VUKG) is discovered under the USD market,
+    while its price file is quoted in GBP. Merging USD closes into it and
+    rewriting every line with USD would relabel each GBP close as a USD one."""
+    payload = {"transactions": [{"postings": [
+        {"account": "assets:equity:broker:ibkr:personal", "commodity": "VUKG"},
+        {"account": "assets:equity:broker:ibkr:personal", "commodity": "AMZN"},
+    ]}]}
+    query_bin = _fake_query_bin(tmp_path, payload)
+    sources_dir = tmp_path / "sources"
+    os.makedirs(sources_dir / "_prices")
+    vukg = "P 2026-06-29T00:00:00.000000Z VUKG 57.4000 GBP\n"
+    (sources_dir / "_prices" / "VUKG.txt").write_text(vukg)
+    monkeypatch.setattr(sync, "fetch_close", lambda ticker, period, start=None: [("2026-06-30", 72.0)])
+    ctx = {"sources_dir": str(sources_dir), "config": {}, "bin": {"emuacc_query": query_bin}}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(ctx)))
+
+    with pytest.raises(SystemExit) as exc:  # partial: AMZN written, VUKG refused
+        sync.main()
+    assert exc.value.code == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["files_written"] == ["_prices/AMZN.txt"]
+    assert (sources_dir / "_prices" / "VUKG.txt").read_text() == vukg
+    [warning] = out["warnings"]
+    assert "VUKG.txt" in warning and "GBP" in warning and "USD" in warning

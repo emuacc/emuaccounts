@@ -13,34 +13,8 @@
 
 use std::path::{Path, PathBuf};
 
-use emuacc_covid::root_config;
-use emuacc_covid::rules::RulesFile;
-
-fn platform_app_data_dir() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join("Library/Application Support/com.cog32.emuacccovid");
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(data) = std::env::var("XDG_DATA_HOME").ok().or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| format!("{h}/.local/share"))
-        }) {
-            return PathBuf::from(data).join("com.cog32.emuacccovid");
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            return PathBuf::from(appdata).join("com.cog32.emuacccovid");
-        }
-    }
-    PathBuf::from(".")
-}
+use emuaccounts::root_config::{self, platform_app_data_dir};
+use emuaccounts::rules::RulesFile;
 
 fn resolve_sources_dir() -> PathBuf {
     let env_override = std::env::var("EMUACC_SOURCES_DIR").ok();

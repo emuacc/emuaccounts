@@ -497,25 +497,29 @@ pub struct LabelsFile {
 }
 
 impl LabelsFile {
-    pub fn load(folder: &Path) -> Self {
+    /// Load a folder's `_labels.json`. An absent file is an empty labels
+    /// file; a file that exists but cannot be read or parsed is an error
+    /// naming the file. Every writer that loads, mutates and saves must use
+    /// this, so a broken file is never replaced by one holding only the
+    /// new label.
+    pub fn try_load(folder: &Path) -> Result<Self, String> {
         let path = folder.join(LABELS_FILENAME);
         if !path.exists() {
-            return Self::default();
+            return Ok(Self::default());
         }
-        let contents = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("warning: failed to read {}: {e}", path.display());
-                return Self::default();
-            }
-        };
-        match serde_json::from_str(&contents) {
-            Ok(labels) => labels,
-            Err(e) => {
-                eprintln!("warning: failed to parse {}: {e}", path.display());
-                Self::default()
-            }
-        }
+        let contents = fs::read_to_string(&path)
+            .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+        serde_json::from_str(&contents).map_err(|e| format!("Cannot parse {}: {e}", path.display()))
+    }
+
+    /// Read-only load for the pipeline and the label list: a file that
+    /// cannot be read or parsed is reported on stderr and treated as empty
+    /// so the run continues. Never follow this with `save`; use `try_load`.
+    pub fn load(folder: &Path) -> Self {
+        Self::try_load(folder).unwrap_or_else(|e| {
+            eprintln!("warning: {e}");
+            Self::default()
+        })
     }
 
     pub fn save(&self, folder: &Path) -> Result<(), String> {
@@ -575,6 +579,86 @@ impl LabelsFile {
                 && rule_amount_matches(r, fields)
         })
     }
+}
+
+/// Save a label to the `_labels.json` of `folder_rel` (relative to
+/// `sources_dir`, "" = root). A label with the same pattern and match field
+/// gets the new payee and commodity; otherwise the label is appended.
+pub fn apply_label_upsert(
+    sources_dir: &Path,
+    folder_rel: &str,
+    pattern: String,
+    match_field: Option<String>,
+    payee: Option<String>,
+    commodity: Option<String>,
+) -> Result<(), String> {
+    let folder = sources_dir.join(folder_rel);
+    let mut labels = LabelsFile::try_load(&folder)?;
+    let existing = labels
+        .labels
+        .iter_mut()
+        .find(|r| r.pattern == pattern && r.match_field == match_field);
+    if let Some(existing) = existing {
+        existing.payee = payee;
+        existing.commodity = commodity;
+    } else {
+        labels.labels.push(Rule {
+            id: generate_rule_id(&pattern),
+            pattern,
+            match_field,
+            payee,
+            commodity,
+            comment: None,
+            amount_condition: None,
+            fee_condition: None,
+            payee_condition: None,
+            narration_condition: None,
+            commodity_condition: None,
+            meta_condition: None,
+            amount_account: None,
+            fee_account: None,
+            postings: vec![],
+        });
+    }
+    labels.save(&folder)
+}
+
+/// Edit a label in place in the folder that owns it, replacing only the
+/// editor-owned fields so anything else on the entry survives.
+pub fn apply_label_edit(
+    sources_dir: &Path,
+    folder_rel: &str,
+    label_id: &str,
+    pattern: String,
+    match_field: Option<String>,
+    payee: String,
+) -> Result<(), String> {
+    let folder = sources_dir.join(folder_rel);
+    let mut labels = LabelsFile::try_load(&folder)?;
+    let existing = labels
+        .labels
+        .iter_mut()
+        .find(|l| l.id == label_id)
+        .ok_or_else(|| format!("Label '{label_id}' not found in '{folder_rel}'"))?;
+    existing.pattern = pattern;
+    existing.match_field = match_field;
+    existing.payee = Some(payee);
+    labels.save(&folder)
+}
+
+pub fn apply_label_delete(
+    sources_dir: &Path,
+    folder_rel: &str,
+    label_id: &str,
+) -> Result<(), String> {
+    let folder = sources_dir.join(folder_rel);
+    let mut labels = LabelsFile::try_load(&folder)?;
+    let before = labels.labels.len();
+    labels.labels.retain(|l| l.id != label_id);
+    if labels.labels.len() == before {
+        return Err(format!("Label '{label_id}' not found in '{folder_rel}'"));
+    }
+    labels.save(&folder)
 }
 
 /// A rule is a no-op if its only effect is assigning the default expense account.
@@ -1986,6 +2070,206 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let rules = RulesFile::try_load(dir.path()).expect("an absent file is not an error");
         assert!(rules.rules.is_empty());
+    }
+
+    /// Same contract as `RulesFile::try_load` for `_labels.json` (TASK-111).
+    #[test]
+    fn labels_try_load_rejects_an_unparseable_file_but_load_falls_back_to_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(LABELS_FILENAME), "{\"labels\": [,]}").expect("write");
+        let err = LabelsFile::try_load(dir.path()).expect_err("unparseable file must be an error");
+        assert!(
+            err.contains(LABELS_FILENAME),
+            "error should name the file: {err}"
+        );
+        assert!(LabelsFile::load(dir.path()).labels.is_empty());
+    }
+
+    #[test]
+    fn labels_try_load_rejects_an_unreadable_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join(LABELS_FILENAME)).expect("mkdir");
+        let err = LabelsFile::try_load(dir.path()).expect_err("unreadable file must be an error");
+        assert!(
+            err.contains(LABELS_FILENAME),
+            "error should name the file: {err}"
+        );
+    }
+
+    #[test]
+    fn labels_try_load_of_a_missing_file_is_an_empty_labels_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let labels = LabelsFile::try_load(dir.path()).expect("an absent file is not an error");
+        assert!(labels.labels.is_empty());
+    }
+
+    fn payee_label(id: &str, pattern: &str, payee: &str) -> Rule {
+        Rule {
+            id: id.to_string(),
+            pattern: pattern.to_string(),
+            match_field: None,
+            payee: Some(payee.to_string()),
+            commodity: None,
+            comment: None,
+            amount_condition: None,
+            fee_condition: None,
+            payee_condition: None,
+            narration_condition: None,
+            commodity_condition: None,
+            meta_condition: None,
+            amount_account: None,
+            fee_account: None,
+            postings: vec![],
+        }
+    }
+
+    #[test]
+    fn apply_label_upsert_appends_then_updates_the_label_with_the_same_pattern_and_field() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sources = tmp.path();
+        let folder = sources.join("cash");
+
+        apply_label_upsert(
+            sources,
+            "cash",
+            "*coffee*".to_string(),
+            Some("payee".to_string()),
+            Some("Cafe".to_string()),
+            None,
+        )
+        .expect("a missing labels file is created");
+        apply_label_upsert(
+            sources,
+            "cash",
+            "*coffee*".to_string(),
+            None,
+            Some("Any".to_string()),
+            None,
+        )
+        .expect("same pattern on another field is a new label");
+        apply_label_upsert(
+            sources,
+            "cash",
+            "*coffee*".to_string(),
+            Some("payee".to_string()),
+            Some("Coffee Shop".to_string()),
+            None,
+        )
+        .expect("same pattern and field updates in place");
+
+        let labels = LabelsFile::try_load(&folder).expect("load").labels;
+        let payees: Vec<_> = labels.iter().map(|l| l.payee.as_deref()).collect();
+        assert_eq!(payees, [Some("Coffee Shop"), Some("Any")]);
+    }
+
+    #[test]
+    fn apply_label_edit_edits_in_place_and_preserves_other_fields() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sources = tmp.path();
+        let folder = sources.join("cash");
+        let mut label = payee_label("label-1", "*old*", "Old Name");
+        label.comment = Some("keep me".to_string());
+        LabelsFile {
+            labels: vec![label],
+        }
+        .save(&folder)
+        .unwrap();
+
+        apply_label_edit(
+            sources,
+            "cash",
+            "label-1",
+            "*new*".to_string(),
+            Some("payee".to_string()),
+            "New Name".to_string(),
+        )
+        .unwrap();
+
+        let reloaded = LabelsFile::load(&folder);
+        let l = &reloaded.labels[0];
+        assert_eq!(l.pattern, "*new*");
+        assert_eq!(l.match_field.as_deref(), Some("payee"));
+        assert_eq!(l.payee.as_deref(), Some("New Name"));
+        assert_eq!(l.comment.as_deref(), Some("keep me"));
+    }
+
+    #[test]
+    fn apply_label_edit_errors_when_label_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sources = tmp.path();
+        std::fs::create_dir_all(sources.join("cash")).unwrap();
+        let err = apply_label_edit(
+            sources,
+            "cash",
+            "nope",
+            "*p*".to_string(),
+            None,
+            "X".to_string(),
+        )
+        .unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn apply_label_delete_removes_only_the_target() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sources = tmp.path();
+        let folder = sources.join("cash");
+        LabelsFile {
+            labels: vec![
+                payee_label("label-1", "*a*", "A"),
+                payee_label("label-2", "*b*", "B"),
+            ],
+        }
+        .save(&folder)
+        .unwrap();
+
+        apply_label_delete(sources, "cash", "label-1").unwrap();
+        let reloaded = LabelsFile::load(&folder);
+        assert_eq!(reloaded.labels.len(), 1);
+        assert_eq!(reloaded.labels[0].id, "label-2");
+
+        let err = apply_label_delete(sources, "cash", "label-1").unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    /// Every `_labels.json` writer loads, changes and saves. A file that is
+    /// there but does not parse must fail the write and stay as it was,
+    /// never be replaced by one holding only the change (TASK-111).
+    #[test]
+    fn label_writers_leave_an_unparseable_labels_file_untouched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sources = tmp.path();
+        let path = sources.join("cash").join(LABELS_FILENAME);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let broken = r#"{"labels": [{"id": "label-1", "pattern": "*a*", "payee": "A"},]}"#;
+        std::fs::write(&path, broken).unwrap();
+
+        let assert_refused = |result: Result<(), String>| {
+            let err = result.expect_err("a write over an unparseable labels file must fail");
+            assert!(
+                err.contains(LABELS_FILENAME),
+                "error should name the file: {err}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        };
+        assert_refused(apply_label_upsert(
+            sources,
+            "cash",
+            "*b*".to_string(),
+            None,
+            Some("B".to_string()),
+            None,
+        ));
+        assert_refused(apply_label_edit(
+            sources,
+            "cash",
+            "label-1",
+            "*a*".to_string(),
+            None,
+            "A2".to_string(),
+        ));
+        assert_refused(apply_label_delete(sources, "cash", "label-1"));
     }
 
     /// New conditions actually constrain matching: a rule with

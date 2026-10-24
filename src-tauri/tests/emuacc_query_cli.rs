@@ -359,7 +359,7 @@ fn no_balances_flag_yields_original_json_shape() {
 /// Write `_prices/<commodity>.txt` containing one P directive `<price> USD`
 /// dated 2026-01-01 (latest-wins for `convert_to_base_latest`).
 fn write_price_usd(sources: &Path, commodity: &str, price: f64) {
-    let stem = emuacc_covid::ledger_parser::price_file_stem(commodity);
+    let stem = emuaccounts::ledger_parser::price_file_stem(commodity);
     write(
         &sources.join("_prices").join(format!("{stem}.txt")),
         &format!("P 2026-01-01 {commodity} {price} USD\n"),

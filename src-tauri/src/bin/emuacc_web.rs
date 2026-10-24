@@ -4,17 +4,11 @@
 //! can run in a phone browser (PWA). Data and compute stay on this machine; the
 //! phone is a thin client. Reach it over Tailscale or your LAN.
 
-use emuacc_covid::web::context::WebCtx;
-use emuacc_covid::web::server::{WebServer, WebServerConfig};
+use emuaccounts::root_config::platform_app_data_dir;
+use emuaccounts::web::context::WebCtx;
+use emuaccounts::web::server::{WebServer, WebServerConfig};
 use std::io::Read;
 use std::path::PathBuf;
-
-/// macOS app-data dir for the desktop app — holds the same config.json
-/// (current_root / known_roots) the web server reads to find the active vault.
-fn default_app_data_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join("Library/Application Support/com.cog32.emuacccovid")
-}
 
 fn is_loopback(bind: &str) -> bool {
     bind.starts_with("127.")
@@ -56,7 +50,7 @@ fn main() {
     let mut bind = "127.0.0.1:8787".to_string();
     let mut dist = PathBuf::from("dist");
     let mut token: Option<String> = None;
-    let mut app_data_dir = default_app_data_dir();
+    let mut app_data_dir = platform_app_data_dir();
 
     let mut i = 1;
     while i < args.len() {

@@ -12,7 +12,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::automerge_store::{suggest_trade_links, MetadataStore, TradeSuggestion};
+use crate::trade_links::{self, suggest_trade_links, TradeSuggestion};
 use crate::generated_store::load_active_ledger;
 use crate::ledger_parser::{AccountBalance, Diagnostic, ParseResult, PriceGraph, Transaction};
 use crate::processing_pipeline::{
@@ -582,10 +582,10 @@ pub fn collect_all(
         None
     };
 
-    // Trade suggestions need the MetadataStore — open once.
-    let metadata_store = if filter.wants(Category::TradeSuggestions) {
-        let path = sources_dir.join(crate::sync_state::METADATA_FILE);
-        Some(MetadataStore::new(path)?)
+    // Trade suggestions skip the pairs already linked. Read once, and only
+    // read: the read-only web server collects issues too.
+    let existing_links = if filter.wants(Category::TradeSuggestions) {
+        Some(trade_links::read(sources_dir)?)
     } else {
         None
     };
@@ -629,12 +629,11 @@ pub fn collect_all(
         {
             push(&mut groups, collect_unpriced(&parse.transactions, graph, base));
         }
-        if let Some(store) = metadata_store.as_ref() {
-            let existing = store.get_trade_links()?;
+        if let Some(existing) = existing_links.as_deref() {
             let price_graph_for_trades = PriceGraph::load(sources_dir);
             let suggestions = suggest_trade_links(
                 &parse.transactions,
-                &existing,
+                existing,
                 base.as_ref().map(|_| &price_graph_for_trades),
                 base.as_deref(),
             );

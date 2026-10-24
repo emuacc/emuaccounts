@@ -10,26 +10,17 @@ together is in [ARCHITECTURE.md](ARCHITECTURE.md); toolchain versions are in
 - Desktop (Tauri): `npm run tauri:dev` (frontend changes hot-reload; restart
   the command after Rust changes)
 
-## Run the relay server locally
+## Multi-device sync
 
-From the `src-tauri` directory:
-
-```sh
-cargo run --bin emuacc-relay
-```
-
-With options:
-
-```sh
-cargo run --bin emuacc-relay -- --bind 127.0.0.1:8384 --data-dir /tmp/emuacc-relay
-```
-
-`cargo run` builds in debug mode by default. Add `--release` for an optimised build.
+Sync is unfinished, so it is compiled only into an opt-in build:
+`npx tauri dev --config src-tauri/tauri.sync.conf.json`. Building it, the relay
+server, where its code lives and how to test it: [docs/SYNC.md](docs/SYNC.md).
 
 ## Tests
 
 - Unit tests (tsc, cargo nextest, Vitest with coverage): `scripts/run_unit_tests.sh`
 - Rust BDD (cucumber-rs, scenarios under [`src-tauri/features/`](./src-tauri/features/)): `npm run test:bdd`
+- Sync build (`--features sync`; Rust tests + `src-tauri/features/sync/`): `scripts/run_sync_tests.sh`
 - UI E2E (Tauri WebDriver + Cucumber): a `selenium-webdriver` DOM suite. `npm run e2e`
   auto-selects the WebDriver server for your OS and skips (with a hint) if it isn't installed.
   - **Linux/Windows** — `tauri-driver`: `cargo install tauri-driver --locked`
@@ -51,7 +42,7 @@ cargo run --bin emuacc-relay -- --bind 127.0.0.1:8384 --data-dir /tmp/emuacc-rel
   ```sh
   npm run build && \
     cargo build --manifest-path src-tauri/Cargo.toml \
-      --bin emuacc-covid --features "webdriver tauri/custom-protocol"
+      --bin emuaccounts --features "webdriver tauri/custom-protocol"
   ```
 
   Without `tauri/custom-protocol` the binary looks for a Vite dev server instead of the embedded `dist/`, and shows a blank screen.

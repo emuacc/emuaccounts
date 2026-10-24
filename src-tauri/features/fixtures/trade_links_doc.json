@@ -1,0 +1,18 @@
+{
+  "trade_links": [
+    {
+      "created_at": 1760000300,
+      "device_origin": "device-aaaa1111",
+      "id": "372924585e97",
+      "txn_id_a": "txn:sell-eth",
+      "txn_id_b": "txn:buy-usdc"
+    },
+    {
+      "created_at": 1760000100,
+      "device_origin": "device-aaaa1111",
+      "id": "5b092dbe6f68",
+      "txn_id_a": "txn:sell-btc",
+      "txn_id_b": "txn:buy-aud"
+    }
+  ]
+}

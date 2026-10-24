@@ -24,7 +24,7 @@ if [ -z "$TOKEN" ] && [[ "$BIND" != 127.* && "$BIND" != localhost* && "$BIND" !=
 fi
 
 # Warn if no vault is configured (the desktop app sets this on first launch).
-APP_DATA="$HOME/Library/Application Support/com.cog32.emuacccovid"
+APP_DATA="$HOME/Library/Application Support/com.emusoftware.emuaccounts"
 CONFIG_FILE="$APP_DATA/config.json"
 ROOT=""
 if [ -f "$CONFIG_FILE" ]; then

@@ -11,7 +11,7 @@ changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 ### macOS
 
 1. Download the `.dmg` file
-2. Open the disk image and drag **EmuAcc COVID** to Applications
+2. Open the disk image and drag **EmuAcc** to Applications
 3. On first launch, macOS may block the app. Go to **System Settings > Privacy & Security** and click **Open Anyway**
 
 Alternatively, download the `.app.zip`, unzip it, and move the `.app` to Applications.
@@ -28,7 +28,7 @@ Run the installer and follow the prompts.
 ### Linux (Debian / Ubuntu)
 
 ```sh
-sudo dpkg -i emuacc-covid_*_amd64.deb
+sudo dpkg -i EmuAcc_*_amd64.deb
 ```
 
 ### Linux (Arch)
@@ -36,8 +36,9 @@ sudo dpkg -i emuacc-covid_*_amd64.deb
 Use the `.AppImage` (below), or convert the `.deb` with [`debtap`](https://aur.archlinux.org/packages/debtap):
 
 ```sh
-debtap emuacc-covid_*_amd64.deb
-sudo pacman -U emuacc-covid-*.pkg.tar.zst
+debtap EmuAcc_*_amd64.deb
+# debtap writes a .pkg.tar.zst next to the .deb; install that:
+sudo pacman -U ./*.pkg.tar.zst
 ```
 
 ### Linux (other)
@@ -45,8 +46,8 @@ sudo pacman -U emuacc-covid-*.pkg.tar.zst
 The `.AppImage` runs on any distribution with FUSE support:
 
 ```sh
-chmod +x emuacc-covid_*_amd64.AppImage
-./emuacc-covid_*_amd64.AppImage
+chmod +x EmuAcc_*_amd64.AppImage
+./EmuAcc_*_amd64.AppImage
 ```
 
 ## Using the app
@@ -54,7 +55,7 @@ chmod +x emuacc-covid_*_amd64.AppImage
 - **Every account in one ledger** — bank, broker, exchange and wallet exports (CSV, OFX, or a PDF statement read by the AI assistant) compiled into one double-entry ledger.
 - **Reports for tax time** — capital gains with FIFO lot matching and discount rules, income, balances, performance and a loss-harvesting view, every figure traceable to the lines that produced it. The defaults are Australian; the tax year and the CGT discount are configurable.
 - **Data that keeps itself current** — [plugins](PLUGINS.md) fetch daily prices, and a transaction source for a wallet, exchange, broker or bank is a short script against the same contract.
-- **Sync between devices** through a relay you host yourself ([Multi-device sync](#multi-device-sync)), and a read-only [phone view](docs/PWA.md).
+- **A read-only [phone view](docs/PWA.md)** of the ledger, served from your own machine.
 - **A command line for everything the app does** — see [Command line](#command-line).
 
 ### The main window
@@ -67,15 +68,15 @@ chmod +x emuacc-covid_*_amd64.AppImage
 
 ### Import a CSV
 
-<a href="docs/demos/import-csv.mp4"><img src="docs/demos/import-csv-poster.png" width="720" alt="Import a CSV: choose the file, map its columns in the Rhai transform, see the imported transactions"></a>
+![Import a CSV: choose the file, map its columns in the Rhai transform, see the imported transactions](docs/demos/import-csv.gif)
 
-[Watch the import video](docs/demos/import-csv.mp4) (MP4, or [WebM](docs/demos/import-csv.webm)).
+The same recording as a full-resolution video: [MP4](docs/demos/import-csv.mp4) or [WebM](docs/demos/import-csv.webm).
 
 ### Add a manual transaction
 
-<a href="docs/demos/manual-txn.mp4"><img src="docs/demos/manual-txn-poster.png" width="720" alt="Add a manual transaction: enter the payee, notes and amount, pick the category account, save and see it in the list"></a>
+![Add a manual transaction: enter the payee, notes and amount, pick the category account, save and see it in the list](docs/demos/manual-txn.gif)
 
-[Watch the manual transaction video](docs/demos/manual-txn.mp4) (MP4, or [WebM](docs/demos/manual-txn.webm)).
+The same recording as a full-resolution video: [MP4](docs/demos/manual-txn.mp4) or [WebM](docs/demos/manual-txn.webm).
 
 ### Terminology
 
@@ -106,40 +107,7 @@ reasoning effort, your name). For LM Studio use `http://localhost:1234/v1` with 
 > per‑request once LM Studio bridges the parameter — retest after LM Studio updates by watching
 > for that WARN line to disappear.
 
-## Multi-device sync
-
-EmuAcc uses a self-hosted relay server (`emuacc-relay`) to sync between devices.
-
-The app is **local-first** — all changes are saved immediately to your local Automerge document and content store, regardless of whether the relay server is running. The relay is purely optional and only used when you click **Sync Now**. If the relay is unavailable, you'll see an error but no data is lost. When the relay comes back online, the next sync performs a full reconciliation and all offline changes from every device are merged automatically.
-
-### Run the relay server
-
-The relay binary is included in each release. Download it for your platform from the [Releases](../../releases) tab, then run:
-
-```sh
-emuacc-relay
-```
-
-By default it listens on `0.0.0.0:8384` and stores data in `/tmp/emuacc-relay`.
-
-**Options:**
-
-```
---bind <ADDR>      Bind address (default: 0.0.0.0:8384)
---data-dir <PATH>  Data directory (default: /tmp/emuacc-relay)
-```
-
-Example with a persistent data directory:
-
-```sh
-emuacc-relay --bind 0.0.0.0:8384 --data-dir /var/lib/emuacc-relay
-```
-
-### Pair devices
-
-1. On one device, click **Pair Device** in the sidebar and choose **Create** — note the 6-digit code.
-2. On the other device, click **Pair Device**, choose **Join**, and enter the code.
-3. Click **Sync Now** on either device to exchange data.
+## Data files
 
 ### Data file locations
 
@@ -147,19 +115,24 @@ All app data lives under the platform app-data directory:
 
 | Platform | Path |
 |----------|------|
-| macOS    | `~/Library/Application Support/com.cog32.emuacccovid/sources/` |
-| Linux    | `~/.local/share/com.cog32.emuacccovid/sources/` |
-| Windows  | `%APPDATA%\com.cog32.emuacccovid\sources\` |
+| macOS    | `~/Library/Application Support/com.emusoftware.emuaccounts/sources/` |
+| Linux    | `~/.local/share/com.emusoftware.emuaccounts/sources/` |
+| Windows  | `%APPDATA%\com.emusoftware.emuaccounts\sources\` |
 
-Key files:
+### Files the app keeps in sources/
 
-- `emuacc-metadata.automerge` — CRDT sync metadata (delete to reset sync state)
-- `relay-config.json` — paired relay URL and group ID (delete to unpair)
-- `cas/` — the relay blob store
+Besides your source files the app keeps one file of its own at the top of
+`sources/`: `_trade_links.json`, which holds your trade links. It is plain
+JSON, one entry per link sorted by id, so a new or removed link shows as a
+small diff. It is not pipeline input — changing it neither triggers a rebuild
+nor defeats the pipeline's early exit — but it is the only record of the
+links, so do not delete it, and keep it under version control if the vault is
+a git repository.
 
-These three are each device's relay sync state, not pipeline input: changing
-them neither triggers a rebuild nor defeats the pipeline's early exit. If the
-vault is a git repository, ignore them there; the relay keeps devices in step.
+Earlier versions kept the links in `emuacc-metadata.automerge`. The first time
+this version reads the links of a vault without `_trade_links.json`, it copies
+them from that file into `_trade_links.json` and leaves
+`emuacc-metadata.automerge` as it was.
 
 ## Command line
 
@@ -167,8 +140,7 @@ The app is a thin client over the same library as the `emuacc-*` command-line
 tools, so each of these does what the app does, without a window open:
 `emuacc-regenerate` builds the ledger the app builds, `emuacc-query` answers
 the searches the app's search box answers, `emuacc-reports` produces the
-reports the app shows, `emuacc-web` serves the read-only [phone client](docs/PWA.md),
-and `emuacc-relay` is the [sync relay](#run-the-relay-server).
+reports the app shows, and `emuacc-web` serves the read-only [phone client](docs/PWA.md).
 
 ### Keeping data fresh from cron
 
@@ -195,8 +167,8 @@ Example crontab entry (weekdays at 07:30, log to a file):
 ```
 
 Example launchd agent (macOS) — save as
-`~/Library/LaunchAgents/com.cog32.emuacc-update.plist` and load with
-`launchctl load ~/Library/LaunchAgents/com.cog32.emuacc-update.plist`:
+`~/Library/LaunchAgents/com.emusoftware.emuaccounts.update.plist` and load with
+`launchctl load ~/Library/LaunchAgents/com.emusoftware.emuaccounts.update.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -204,7 +176,7 @@ Example launchd agent (macOS) — save as
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.cog32.emuacc-update</string>
+  <key>Label</key><string>com.emusoftware.emuaccounts.update</string>
   <key>ProgramArguments</key>
   <array><string>/Users/you/.local/bin/emuacc-update</string></array>
   <key>StartCalendarInterval</key>

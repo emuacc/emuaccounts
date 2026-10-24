@@ -3,37 +3,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use emuacc_covid::generated_store::{load_openings, scoped_query, ScopedQueryOptions};
-use emuacc_covid::ledger_parser::{CommodityAmount, PriceGraph};
-use emuacc_covid::processing_pipeline::folder_to_account_name;
-use emuacc_covid::query::{self, MinValueFilter, SortField, SortOrder};
-use emuacc_covid::root_config;
-
-fn platform_app_data_dir() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join("Library/Application Support/com.cog32.emuacccovid");
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(data) = std::env::var("XDG_DATA_HOME").ok().or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| format!("{h}/.local/share"))
-        }) {
-            return PathBuf::from(data).join("com.cog32.emuacccovid");
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            return PathBuf::from(appdata).join("com.cog32.emuacccovid");
-        }
-    }
-    PathBuf::from(".")
-}
+use emuaccounts::generated_store::{load_openings, scoped_query, ScopedQueryOptions};
+use emuaccounts::ledger_parser::{CommodityAmount, PriceGraph};
+use emuaccounts::processing_pipeline::folder_to_account_name;
+use emuaccounts::query::{self, MinValueFilter, SortField, SortOrder};
+use emuaccounts::root_config::{self, platform_app_data_dir};
 
 fn resolve_generated_dir() -> PathBuf {
     let env_override = std::env::var("EMUACC_GENERATED_DIR").ok();

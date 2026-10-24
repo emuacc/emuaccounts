@@ -1,6 +1,6 @@
 {
-  "name": "emuacc-covid",
-  "version": "0.1.1",
+  "name": "emuaccounts",
+  "version": "0.1.2",
   "private": true,
   "devDependencies": {
     "@cucumber/cucumber": "^11.0.0",
@@ -23,8 +23,10 @@
   "scripts": {
     "dev": "vite --port 1420 --strictPort",
     "build": "vite build",
+    "dev:sync": "VITE_SYNC=1 vite --port 1420 --strictPort",
+    "build:sync": "VITE_SYNC=1 vite build",
     "tauri": "tauri",
-    "tauri:dev": "cargo build --manifest-path src-tauri/Cargo.toml --bin emuacc-covid --no-default-features && tauri dev --no-watch",
+    "tauri:dev": "cargo build --manifest-path src-tauri/Cargo.toml --bin emuaccounts --no-default-features && tauri dev --no-watch",
     "tauri:build": "tauri build",
     "parse": "cargo run --manifest-path src-tauri/Cargo.toml --bin ledger-parse --",
     "test:bdd": "npm run test:bdd:parser",

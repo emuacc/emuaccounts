@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Launch EmuAcc with a fresh, empty profile — no vault selected, so the app
 # starts on the vault picker. HOME is pointed at a throwaway temp dir so the
-# real profile (~/Library/Application Support/com.cog32.emuacccovid) is
+# real profile (~/Library/Application Support/com.emusoftware.emuaccounts) is
 # untouched, and any existing instance keeps running.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-BIN=src-tauri/target/debug/emuacc-covid
+BIN=src-tauri/target/debug/emuaccounts
 needs_build=0
 if [ ! -x "$BIN" ]; then
   needs_build=1
@@ -20,7 +20,7 @@ fi
 if [ "$needs_build" = 1 ]; then
   echo "Building app (frontend + debug binary)..."
   npm run build
-  cargo build --manifest-path src-tauri/Cargo.toml --bin emuacc-covid \
+  cargo build --manifest-path src-tauri/Cargo.toml --bin emuaccounts \
     --features tauri/custom-protocol
 fi
 

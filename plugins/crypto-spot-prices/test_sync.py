@@ -7,6 +7,8 @@ import json
 import os
 import sys
 
+import pytest
+
 import sync
 
 # The names the ledger grammar accepts that the old `[A-Za-z][A-Za-z0-9_]*`
@@ -285,3 +287,37 @@ def test_coingecko_throttle_covers_the_over_range_retry(monkeypatch):
     sync.fetch_coingecko("mango-markets", "2017-01-01", "demo-key")
     assert len(calls) == 2
     assert len(slept) == 1 and 0 < slept[0] <= sync.CG_MIN_INTERVAL_KEY
+
+
+# --- one quote currency per file ---------------------------------------------
+def test_a_file_quoted_in_another_currency_is_left_untouched(tmp_path, monkeypatch, capsys):
+    """A price set by hand in AUD sits in the commodity's file beside nothing
+    else. Merging USD closes into it and rewriting every line with USD would
+    relabel the AUD price as a USD one. The commodity is not marked backfilled
+    either, so its full history is fetched once the file is sorted out."""
+    sources = tmp_path / "sources"
+    data = tmp_path / ".data"
+    os.makedirs(sources / "_prices")
+    os.makedirs(data)
+    (data / "commodities.txt").write_text(
+        "commodity BTC\n  binance BTCUSDT\n"
+        "commodity ETH\n  binance ETHUSDT\n"
+    )
+    btc = "P 2026-01-15 BTC 150000.00 AUD\n"
+    (sources / "_prices" / "BTC.txt").write_text(btc)
+    today = datetime.date.today().isoformat()
+    monkeypatch.setattr(sync, "fetch_source", lambda src, val, start, key: [(today, 94.09)])
+    monkeypatch.setattr(sync.time, "sleep", lambda s: None)
+    ctx = {"config": {"discover": False}, "secrets": {},
+           "sources_dir": str(sources), "data_dir": str(data)}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(ctx)))
+
+    with pytest.raises(SystemExit) as exc:  # partial: ETH written, BTC refused
+        sync.main()
+    assert exc.value.code == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["files_written"] == ["ETH<-backfill (+1)"]
+    assert (sources / "_prices" / "BTC.txt").read_text() == btc
+    [warning] = out["warnings"]
+    assert "BTC.txt" in warning and "AUD" in warning and "USD" in warning
+    assert json.loads((data / "coverage.json").read_text())["backfilled"] == ["ETH"]

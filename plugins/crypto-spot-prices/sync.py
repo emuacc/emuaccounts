@@ -24,6 +24,10 @@ history from `start_date`; afterwards only the last `refresh_days` are refreshed
 (state in `.data/coverage.json`). The core pipeline never reads any of this — it
 only consumes the `sources/_prices/*.txt` files this plugin writes.
 
+Prices are written quoted in USD. A file that already holds rows quoted in
+another currency (a price set by hand in the base currency) is left untouched
+and reported, and the commodity is not marked backfilled.
+
 Input (stdin JSON): {config, secrets, sources_dir, data_dir}
 Output: JSON {files_written, backfilled, discovered, warnings}.
 """
@@ -39,6 +43,8 @@ import urllib.parse
 from urllib.error import HTTPError, URLError
 
 DAY_MS = 86_400_000
+# Every price is written quoted in this currency (a USDT pair counts as USD).
+QUOTE = "USD"
 # The ledger commodity grammar, mirroring COMMODITY_RE in
 # src-tauri/src/ledger_parser.rs (`^[\p{L}\p{N}_][\p{L}\p{N}_.\-:]*$`; Python's
 # `\w` is exactly [\p{L}\p{N}_]): bare tickers (BTC, BRK.B, RAY-SOL, ATOM.S)
@@ -107,6 +113,29 @@ def commodity_from_price_stem(stem):
     """Inverse of price_file_stem, for deriving a commodity from a file name.
     Unambiguous because '%' is outside the commodity grammar."""
     return re.sub(r"%([0-9A-Fa-f]{2})", lambda m: chr(int(m.group(1), 16)), stem)
+
+
+# --- one quote currency per file ---------------------------------------------
+# A price plugin reads a file back by date and rewrites every line under the one
+# quote currency it writes. A row already quoted in another currency would be
+# relabelled (GBP 1.9053 AUD becomes GBP 1.9053 USD), a silent revaluation, so a
+# file holding any is left untouched and the conflict is reported instead.
+#
+# This MUST stay identical in every price plugin: like price_file_stem it is
+# copied, not shared, because plugins are installed into vaults standalone.
+def quote_conflict(path, quote):
+    """A warning when a P row in `path` is quoted in anything but `quote`, else None."""
+    others = set()
+    if os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                p = line.split()
+                if len(p) >= 5 and p[0] == "P" and p[4] != quote:
+                    others.add(p[4])
+    if not others:
+        return None
+    return (f"_prices/{os.path.basename(path)} left untouched: it holds prices quoted in "
+            f"{', '.join(sorted(others))} and this plugin writes {quote}")
 
 
 # --- commodities file (the source of truth) ----------------------------------
@@ -386,7 +415,7 @@ def write_file(path, sym, prices, existing):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         for d in sorted(merged):
-            f.write(f"P {d} {sym} {merged[d]} USD\n")
+            f.write(f"P {d} {sym} {merged[d]} {QUOTE}\n")
     return n
 
 
@@ -446,15 +475,17 @@ def main():
                     break
             except Exception as e:
                 tried.append(f"{source}:{value}={str(e)[:40]}")
-        if prices:
+        if not prices:
+            warnings.append(f"{sym}: {'; '.join(tried)}")
+        elif conflict := quote_conflict(path, QUOTE):
+            warnings.append(f"{sym}: {conflict}")
+        else:
             n = write_file(path, sym, prices, load_existing(path))
             backfilled.add(sym)
             if is_backfill:
                 did_backfill.append(sym)
             if n > 0:
                 written.append(f"{sym}<-{'backfill' if is_backfill else used} (+{n})")
-        else:
-            warnings.append(f"{sym}: {'; '.join(tried)}")
         time.sleep(0.1)
 
     try:

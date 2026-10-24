@@ -410,12 +410,12 @@ pub fn dir_fingerprint(dir: &Path) -> Result<String, String> {
     fingerprint_where(dir, |_| true)
 }
 
-/// [`dir_fingerprint`] of a `sources/` directory without the relay sync state
-/// ([`crate::sync_state`]): a sync rewrites those files but changes no
-/// pipeline input, so it must not defeat the global early exit.
+/// [`dir_fingerprint`] of a `sources/` directory without the app's own state
+/// ([`crate::sources_state`]): saving a trade link rewrites those files but
+/// changes no pipeline input, so it must not defeat the global early exit.
 pub fn sources_fingerprint(sources_dir: &Path) -> Result<String, String> {
     fingerprint_where(sources_dir, |relative| {
-        !crate::sync_state::is_sync_state(relative)
+        !crate::sources_state::is_app_state(relative)
     })
 }
 

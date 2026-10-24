@@ -72,7 +72,11 @@ impl Default for RootConfig {
     }
 }
 
-/// Platform app-data directory (`~/Library/Application Support/com.cog32.emuacccovid`
+/// The bundle identifier (`identifier` in `tauri.conf.json`); it names the
+/// platform app-data folder that holds `config.json`.
+const APP_IDENTIFIER: &str = "com.emusoftware.emuaccounts";
+
+/// Platform app-data directory (`~/Library/Application Support/<APP_IDENTIFIER>`
 /// on macOS). Canonical copy for non-Tauri callers (CLI bins, AI client);
 /// the Tauri app itself resolves this via its path resolver.
 /// `EMUACC_APP_DATA_DIR` overrides it so a CLI can run against a sandboxed
@@ -84,7 +88,9 @@ pub fn platform_app_data_dir() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join("Library/Application Support/com.cog32.emuacccovid");
+            return PathBuf::from(home)
+                .join("Library/Application Support")
+                .join(APP_IDENTIFIER);
         }
     }
     #[cfg(target_os = "linux")]
@@ -94,13 +100,13 @@ pub fn platform_app_data_dir() -> PathBuf {
                 .ok()
                 .map(|h| format!("{h}/.local/share"))
         }) {
-            return PathBuf::from(data).join("com.cog32.emuacccovid");
+            return PathBuf::from(data).join(APP_IDENTIFIER);
         }
     }
     #[cfg(target_os = "windows")]
     {
         if let Ok(appdata) = std::env::var("APPDATA") {
-            return PathBuf::from(appdata).join("com.cog32.emuacccovid");
+            return PathBuf::from(appdata).join(APP_IDENTIFIER);
         }
     }
     PathBuf::from(".")

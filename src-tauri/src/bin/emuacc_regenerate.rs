@@ -2,8 +2,8 @@
 
 use std::path::PathBuf;
 
-use emuacc_covid::processing_pipeline::{run_pipeline, PipelineConfig};
-use emuacc_covid::root_config;
+use emuaccounts::processing_pipeline::{run_pipeline, PipelineConfig};
+use emuaccounts::root_config::{self, platform_app_data_dir};
 
 fn now_yyyymm() -> String {
     let secs = std::time::SystemTime::now()
@@ -17,32 +17,6 @@ fn now_yyyymm() -> String {
             + ((year - 1970) as i64 / 400));
     let month = (remaining / 30).clamp(0, 11) as u32 + 1;
     format!("{year}{month:02}")
-}
-
-fn platform_app_data_dir() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join("Library/Application Support/com.cog32.emuacccovid");
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(data) = std::env::var("XDG_DATA_HOME").ok().or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| format!("{h}/.local/share"))
-        }) {
-            return PathBuf::from(data).join("com.cog32.emuacccovid");
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            return PathBuf::from(appdata).join("com.cog32.emuacccovid");
-        }
-    }
-    PathBuf::from(".")
 }
 
 fn resolve_sources_dir() -> PathBuf {
@@ -147,11 +121,11 @@ fn main() {
             if result.output_files_written > 0 {
                 let mut account_sets: Vec<String> = result.owner_accounts.keys().cloned().collect();
                 account_sets.sort();
-                if let Err(e) = emuacc_covid::report_templates::generate_all_reports(
+                if let Err(e) = emuaccounts::report_templates::generate_all_reports(
                     &config.sources_dir,
                     &config.generated_dir,
                     &account_sets,
-                    emuacc_covid::report_templates::ALL_FORMATS,
+                    emuaccounts::report_templates::ALL_FORMATS,
                     &root_cfg.extra_primary_account_prefixes,
                 ) {
                     eprintln!("Report generation error: {e}");
