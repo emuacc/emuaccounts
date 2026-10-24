@@ -85,13 +85,11 @@ pub fn dispatch(ctx: &WebCtx, command: &str, args: &Value) -> Result<Value, Stri
         "get_pipeline_warnings" => Ok(json!([])),
 
         // ── Desktop-only in read mode (degrade to empty, don't error) ─
-        // Trade links live in the in-memory Automerge store, which the web
-        // server doesn't initialize. The plugins view is desktop-only.
+        // The trade-link and plugin views are desktop-only.
         "get_trade_links" | "suggest_trade_links_cmd" | "list_plugins"
         | "list_available_plugins" => Ok(json!([])),
         // No-op acknowledgements so frontend startup doesn't hard-fail.
-        "init_metadata"
-        | "set_show_hidden"
+        "set_show_hidden"
         | "set_update_prices_on_startup"
         | "set_extra_primary_account_prefixes" => Ok(Value::Null),
 

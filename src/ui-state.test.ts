@@ -135,10 +135,6 @@ describe("resetVaultScopedState", () => {
       categoryBaseTotals: new Map(),
       transactionValues: new Map(),
       accountTotalValue: { total: 1, currency: "AUD", bycommodity: [] },
-      metadataReady: true,
-      devices: [{}],
-      syncLog: [{}],
-      relayConfig: {},
       tradeLinks: [{}],
       tradeSuggestions: [{}],
       tradeLinkSelection: "t1",
@@ -202,12 +198,8 @@ describe("resetVaultScopedState", () => {
     expect(state.categoryBaseTotals).toBeUndefined();
     expect(state.transactionValues).toBeUndefined();
     expect(state.accountTotalValue).toBeUndefined();
-    expect(state.metadataReady).toBeUndefined();
     expect(state.pluginReadmeOpen).toBeUndefined();
     expect(state.pluginReadmes).toBeUndefined();
-    expect(state.devices).toBeUndefined();
-    expect(state.syncLog).toBeUndefined();
-    expect(state.relayConfig).toBeUndefined();
     expect(state.tradeLinks).toEqual([]);
     expect(state.tradeSuggestions).toEqual([]);
     expect(state.tradeLinkSelection).toBeUndefined();

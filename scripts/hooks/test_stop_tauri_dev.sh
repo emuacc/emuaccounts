@@ -23,8 +23,8 @@ foreign="$(cd "$foreign" && pwd -P)"
 mkdir -p "$foreign/src-tauri/target/debug" "$tree/src-tauri/target/debug"
 # This tree's fake keeps the real binary name as a prefix so the path matches
 # exactly what the hook looks for, without touching a real build output.
-ours_bin="$tree/src-tauri/target/debug/emuacc-covid.stoptest"
-foreign_bin="$foreign/src-tauri/target/debug/emuacc-covid"
+ours_bin="$tree/src-tauri/target/debug/emuaccounts.stoptest"
+foreign_bin="$foreign/src-tauri/target/debug/emuaccounts"
 fake_app() { # <path>  — a script whose process shows its own path in argv[0]
   printf '#!/bin/bash\nexec -a "$0" /bin/sleep "$1"\n' > "$1"
   chmod +x "$1"

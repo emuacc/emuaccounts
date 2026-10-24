@@ -4,13 +4,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use emuacc_covid::ai_client::{AiClient, ChatMessage};
-use emuacc_covid::ai_suggest::{self, AiRuleSuggestion};
-use emuacc_covid::generated_store::load_active_ledger;
-use emuacc_covid::ledger_parser::Transaction;
-use emuacc_covid::processing_pipeline::PipelineMetadata;
-use emuacc_covid::root_config::{self, platform_app_data_dir};
-use emuacc_covid::rules::{ai_rule_id, RulesFile};
+use emuaccounts::ai_client::{AiClient, ChatMessage};
+use emuaccounts::ai_suggest::{self, AiRuleSuggestion};
+use emuaccounts::generated_store::load_active_ledger;
+use emuaccounts::ledger_parser::Transaction;
+use emuaccounts::processing_pipeline::PipelineMetadata;
+use emuaccounts::root_config::{self, platform_app_data_dir};
+use emuaccounts::rules::{ai_rule_id, RulesFile};
 
 fn resolve_generated_dir() -> PathBuf {
     let env_override = std::env::var("EMUACC_GENERATED_DIR").ok();
@@ -440,7 +440,7 @@ fn main() {
                     eprintln!("  [skip] pattern already exists: {}", s.pattern);
                     continue;
                 }
-                let mut rule = emuacc_covid::rules::Rule {
+                let mut rule = emuaccounts::rules::Rule {
                     id: String::new(),
                     pattern: s.pattern.clone(),
                     match_field: s.match_field.clone(),

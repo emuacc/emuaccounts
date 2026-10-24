@@ -179,17 +179,7 @@ export function resetVaultScopedState(state: Record<string, unknown>): void {
   state.categoryBaseTotals = undefined;
   state.transactionValues = undefined;
   state.accountTotalValue = undefined;
-  // Metadata-backed state
-  state.metadataReady = undefined;
-  state.devices = undefined;
-  state.syncLog = undefined;
-  state.syncLogOpen = undefined;
-  state.relayConfig = undefined;
-  state.relayPairingOpen = undefined;
-  state.relayPairingMode = undefined;
-  state.relayPairingCode = undefined;
-  state.relayPairingError = undefined;
-  state.pendingRelayConfig = undefined;
+  // Trade links
   state.tradeLinks = [];
   state.tradeSuggestions = [];
   state.tradeLinkSelection = undefined;

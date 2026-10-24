@@ -514,7 +514,7 @@ pub struct LossHarvestReport {
     pub warnings: Vec<String>,
 }
 
-/// Trade link with two transaction IDs (from MetadataStore).
+/// Trade link with two transaction IDs (a [`crate::trade_links::TradeLink`]).
 #[derive(Debug, Default, Clone)]
 pub struct TradeLinkRef {
     pub id: String,

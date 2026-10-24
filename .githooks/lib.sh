@@ -23,7 +23,7 @@ stop_tauri_dev() { # <hook>
   [ "${SKIP_KILL_DEV:-0}" = "1" ] && return 0
   local tree pid cwd pids=""
   tree="$(pwd -P)"
-  for pid in $(pgrep -f "$tree/src-tauri/target/debug/emuacc-covid" 2>/dev/null || true); do
+  for pid in $(pgrep -f "$tree/src-tauri/target/debug/emuaccounts" 2>/dev/null || true); do
     pids="$pids $pid"
   done
   if command -v lsof >/dev/null 2>&1; then

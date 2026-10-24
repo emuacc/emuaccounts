@@ -1,43 +1,21 @@
 #![deny(warnings)]
-//! One-off migration: backfill missing _rules.json entries for existing
-//! trade links in the metadata store. The bulk of the logic lives in
-//! `emuacc_covid::trade_link_repair` so it can be unit-tested.
+//! One-off migration: backfill missing _rules.json entries for the vault's
+//! existing trade links. The bulk of the logic lives in
+//! `emuaccounts::trade_link_repair` so it can be unit-tested.
 //!
 //! Usage:
 //!   emuacc-repair-trade-links            # dry-run; reports what would change
 //!   emuacc-repair-trade-links --write    # apply the changes
+//!
+//! The dry run writes nothing: in a vault whose links are still only in the
+//! pre-TASK-133 metadata document it reads them from there. `--write` first
+//! migrates them to the trade-link file, as the app does.
 
 use std::path::PathBuf;
 
-use emuacc_covid::automerge_store::MetadataStore;
-use emuacc_covid::root_config;
-use emuacc_covid::trade_link_repair::{load_per_folder_ledgers, repair_links};
-
-fn platform_app_data_dir() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join("Library/Application Support/com.cog32.emuacccovid");
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(data) = std::env::var("XDG_DATA_HOME").ok().or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| format!("{h}/.local/share"))
-        }) {
-            return PathBuf::from(data).join("com.cog32.emuacccovid");
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            return PathBuf::from(appdata).join("com.cog32.emuacccovid");
-        }
-    }
-    PathBuf::from(".")
-}
+use emuaccounts::root_config::{self, platform_app_data_dir};
+use emuaccounts::trade_link_repair::{load_per_folder_ledgers, repair_links};
+use emuaccounts::trade_links::{self, METADATA_FILE, TRADE_LINKS_FILE};
 
 fn resolve_dirs() -> (PathBuf, PathBuf) {
     let sources_override = std::env::var("EMUACC_SOURCES_DIR").ok();
@@ -58,16 +36,17 @@ fn main() -> Result<(), String> {
     println!("mode:      {}", if write { "WRITE" } else { "dry-run" });
     println!();
 
-    let metadata_path = sources_dir.join(emuacc_covid::sync_state::METADATA_FILE);
-    if !metadata_path.exists() {
-        return Err(format!(
-            "metadata store not found at {}",
-            metadata_path.display()
-        ));
-    }
-    let store = MetadataStore::new(metadata_path)?;
-    let links = store.get_trade_links()?;
-    println!("loaded {} trade link(s) from metadata store", links.len());
+    let from = if sources_dir.join(TRADE_LINKS_FILE).exists() || write {
+        TRADE_LINKS_FILE
+    } else {
+        METADATA_FILE
+    };
+    let links = if write {
+        trade_links::load(&sources_dir)?
+    } else {
+        trade_links::read(&sources_dir)?
+    };
+    println!("loaded {} trade link(s) from {from}", links.len());
 
     let by_folder = load_per_folder_ledgers(&generated_dir, &sources_dir);
     println!("scanned {} folder ledger(s)\n", by_folder.len());

@@ -14,9 +14,9 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
-use crate::automerge_store::TradeLink;
 use crate::ledger_parser::{parse_transactions, Transaction};
 use crate::rules::{build_trade_link_rules, Rule, RulesFile};
+use crate::trade_links::TradeLink;
 
 fn extract_meta_anchor(meta: &Option<String>, prefix: &str) -> Option<String> {
     meta.as_ref().and_then(|m| {

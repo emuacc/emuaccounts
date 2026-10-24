@@ -1,9 +1,9 @@
 [package]
-name = "emuacc-covid"
-version = "0.1.1"
+name = "emuaccounts"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.98"
-default-run = "emuacc-covid"
+default-run = "emuaccounts"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -20,11 +20,16 @@ csv = "1"
 sha2 = "0.10"
 hex = "0.4"
 ureq = { version = "2", features = ["json"] }
-automerge = "0.7"
-autosurgeon = "0.10"
+# The sync build's metadata document (docs/SYNC.md); a default build reads the
+# pre-TASK-133 trade links out of it without them (src/trade_links/automerge_doc.rs).
+automerge = { version = "0.7", optional = true }
+autosurgeon = { version = "0.10", optional = true }
+# Already in the graph (png, lopdf, ureq); named here to inflate the metadata
+# document's deflated columns.
+flate2 = "1"
 walkdir = "2"
 machine-uid = "0.5"
-hostname = "0.4"
+hostname = { version = "0.4", optional = true }
 tiny_http = "0.12"
 uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
@@ -33,12 +38,18 @@ tera = "1"
 chrono = "0.4"
 toml = "0.8"
 parking_lot = "0.12"
+# Already in the graph through tauri (which enables "sync"); named here for
+# tokio::sync::watch, which tauri::async_runtime does not re-export.
+tokio = { version = "1", features = ["sync"] }
 tauri-plugin-webdriver-automation = { version = "0.1", optional = true }
 pdf-extract = "0.12.0"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
 webdriver = ["tauri-plugin-webdriver-automation"]
+# Multi-device sync (relay, pairing, blob store) is half-baked: only a build
+# with this feature compiles it. See docs/SYNC.md.
+sync = ["dep:hostname", "dep:automerge", "dep:autosurgeon"]
 
 [dev-dependencies]
 cucumber = "=0.21.1"
@@ -65,7 +76,7 @@ debug = "line-tables-only"
 # Bins are thin CLI wrappers with no in-bin #[test] items. Their tested
 # logic lives in the library and integration tests. Skip their test
 # executables so cargo test doesn't compile + run them (several open the
-# production Automerge metadata store at startup, which hangs).
+# configured vault at startup).
 [[bin]]
 name = "ledger-parse"
 path = "src/bin/ledger_parse.rs"
@@ -73,8 +84,9 @@ test = false
 
 [[bin]]
 name = "emuacc-relay"
-path = "src/bin/relay.rs"
+path = "src/sync/relay_main.rs"
 test = false
+required-features = ["sync"]
 
 [[bin]]
 name = "emuacc-web"

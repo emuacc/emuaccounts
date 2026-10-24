@@ -2,24 +2,20 @@
 #![deny(warnings)]
 
 use serde::Serialize;
-use emuacc_covid::automerge_store::{
-    suggest_trade_links, DeviceInfo, MetadataStore, SyncEvent, TradeLink, TradeSuggestion,
-};
-use emuacc_covid::ai_client::AiClient;
-use emuacc_covid::ai_import;
-use emuacc_covid::ai_suggest;
-use emuacc_covid::content_store::ContentStore;
-use emuacc_covid::display_config;
-use emuacc_covid::generated_store::{
+use emuaccounts::ai_client::AiClient;
+use emuaccounts::ai_import;
+use emuaccounts::ai_suggest;
+use emuaccounts::display_config;
+use emuaccounts::generated_store::{
     filter_hidden_accounts, load_active_ledger, load_hidden_accounts, ManualTransactionInput,
 };
-use emuacc_covid::ledger_parser::{
+use emuaccounts::ledger_parser::{
     is_valid_commodity,
     parse_transactions, AccountBalance, AccountProperties, Diagnostic, ParseResult, PriceGraph,
     Transaction,
 };
-use emuacc_covid::plugins;
-use emuacc_covid::processing_pipeline::{
+use emuaccounts::plugins;
+use emuaccounts::processing_pipeline::{
     append_account_and_rebuild, append_hide_rule, append_manual_and_rebuild,
     auto_link_equity_swaps,
     delete_account_folder_and_rebuild, delete_manual_transaction_and_rebuild, detect_account_gaps,
@@ -29,25 +25,28 @@ use emuacc_covid::processing_pipeline::{
     update_opening_balance, AccountGap, ImportResult, PipelineConfig, PipelineMetadata,
     PipelineResult,
 };
-use emuacc_covid::query::QueryResult;
-use emuacc_covid::relay_client;
-use emuacc_covid::sync_state;
-use emuacc_covid::reports::{
+use emuaccounts::query::QueryResult;
+use emuaccounts::reports::{
     self, BalancesReport, CgtReport, IncomeTaxReport, LossHarvestReport, PerformanceReport,
     TaxConfig,
 };
-use emuacc_covid::root_config::{self, RootConfig};
-use emuacc_covid::terminology;
-use emuacc_covid::rules::{
-    generate_rule_id, remove_trade_link_rules, AccountConfig, LabelsFile,
-    Rule,
-    RulesFile,
+use emuaccounts::root_config::{self, RootConfig};
+use emuaccounts::terminology;
+use emuaccounts::rules::{
+    apply_label_delete, apply_label_edit, apply_label_upsert, generate_rule_id,
+    remove_trade_link_rules, AccountConfig, LabelsFile, Rule, RulesFile,
 };
-use emuacc_covid::sync::full_sync;
-use emuacc_covid::trade_link_repair::{load_per_folder_ledgers, plan_trade_link_rules};
+use emuaccounts::sources_state;
+use emuaccounts::trade_link_repair::{load_per_folder_ledgers, plan_trade_link_rules};
+use emuaccounts::trade_links::{self, suggest_trade_links, trade_link_id, TradeLink, TradeSuggestion};
 use std::env;
 use std::path::PathBuf;
 use tauri::{Emitter, Manager};
+
+/// The sync build's commands (docs/SYNC.md); a default build compiles none.
+#[cfg(feature = "sync")]
+#[path = "sync/commands.rs"]
+mod sync_commands;
 
 /// Placeholder yyyymm value for commands that don't need time-based rotation.
 const YYYYMM_UNUSED: &str = "000000";
@@ -211,7 +210,7 @@ async fn load_account_tree(
 ) -> Result<Vec<AccountBalance>, String> {
     let generated_dir = resolve_generated_dir(&app)?;
     let set_dir = resolve_set_dir(&generated_dir, &account_set);
-    let mut balances = emuacc_covid::generated_store::load_account_tree(&set_dir)?;
+    let mut balances = emuaccounts::generated_store::load_account_tree(&set_dir)?;
     // Filter hidden accounts
     let prefixes = load_hidden_accounts(&set_dir);
     if !app.state::<ShowHiddenState>().0.load(Ordering::Relaxed) && !prefixes.is_empty() {
@@ -237,9 +236,9 @@ async fn query_search(
     let generated_dir = resolve_generated_dir(&app)?;
     let set_dir = resolve_set_dir(&generated_dir, &account_set);
     let show_hidden = app.state::<ShowHiddenState>().0.load(Ordering::Relaxed);
-    emuacc_covid::generated_store::scoped_query(
+    emuaccounts::generated_store::scoped_query(
         &set_dir,
-        emuacc_covid::generated_store::ScopedQueryOptions {
+        emuaccounts::generated_store::ScopedQueryOptions {
             search: &search,
             show_hidden,
             sort_field: sort_field.as_deref(),
@@ -255,7 +254,7 @@ async fn query_search(
 /// set instead of folder-pruning. Used by the Categories page to view
 /// non-folder-backed accounts (income/expenses/equity/liabilities and `assets`
 /// contras), which `query_search` returns zero rows for.
-#[tauri::command]
+#[tauri::command(async)]
 fn query_global(
     app: tauri::AppHandle,
     account_set: String,
@@ -268,7 +267,7 @@ fn query_global(
     let generated_dir = resolve_generated_dir(&app)?;
     let set_dir = resolve_set_dir(&generated_dir, &account_set);
     let show_hidden = app.state::<ShowHiddenState>().0.load(Ordering::Relaxed);
-    emuacc_covid::generated_store::global_query(
+    emuaccounts::generated_store::global_query(
         &set_dir,
         &search,
         show_hidden,
@@ -279,7 +278,7 @@ fn query_global(
     )
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn load_pipeline_metadata(app: tauri::AppHandle) -> Result<PipelineMetadata, String> {
     let generated_dir = resolve_generated_dir(&app)?;
     let mut meta = PipelineMetadata::load(&generated_dir)
@@ -289,7 +288,7 @@ fn load_pipeline_metadata(app: tauri::AppHandle) -> Result<PipelineMetadata, Str
     if meta.accounts_with_opening.is_empty() {
         if let Ok(sources_dir) = resolve_sources_dir(&app) {
             meta.accounts_with_opening =
-                emuacc_covid::processing_pipeline::accounts_with_opening_from_sources(&sources_dir);
+                emuaccounts::processing_pipeline::accounts_with_opening_from_sources(&sources_dir);
         }
     }
     Ok(meta)
@@ -297,6 +296,12 @@ fn load_pipeline_metadata(app: tauri::AppHandle) -> Result<PipelineMetadata, Str
 
 /// Frontend debug-log bridge: WebView console output is invisible in the
 /// `tauri dev` terminal, so pushDebug forwards every entry here.
+///
+/// The one command dispatched on the main thread: the frontend fires these
+/// without awaiting, and only the main thread's in-order dispatch keeps the
+/// terminal log in the order the UI wrote it. Every other command is `async`
+/// or `#[tauri::command(async)]`, so it cannot stall the window
+/// (`features/architecture/main_thread.feature`).
 #[tauri::command]
 fn frontend_log(level: String, message: String) {
     eprintln!("[ui:{level}] {message}");
@@ -449,7 +454,7 @@ async fn import_csv_files_to_account(
 /// file) for an account. Fails fast on unconfigured AI or unreadable
 /// documents; the extraction itself streams `ai-import-step` events and
 /// finishes with `ai-import-result`.
-#[tauri::command]
+#[tauri::command(async)]
 fn ai_import_document(
     app: tauri::AppHandle,
     account_folder: String,
@@ -533,7 +538,7 @@ async fn confirm_ai_import(
     config.changed_folder_hint = Some(vec![account_folder.clone()]);
     app.state::<LastCommandRebuild>().mark();
 
-    let staged = emuacc_covid::ai_import::stage_ai_import(
+    let staged = emuaccounts::ai_import::stage_ai_import(
         &config.sources_dir,
         &account_folder,
         &csv_filename,
@@ -542,7 +547,7 @@ async fn confirm_ai_import(
         std::path::Path::new(&original_path),
     )?;
 
-    let suggestion = emuacc_covid::processing_pipeline::suggest_transform_for_import(
+    let suggestion = emuaccounts::processing_pipeline::suggest_transform_for_import(
         &config,
         &staged.csv_path,
         &account_folder,
@@ -664,7 +669,7 @@ struct SuggestTransformResponse {
     headers: Vec<String>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn suggest_transform(
     app: tauri::AppHandle,
     source_path: String,
@@ -699,7 +704,7 @@ fn suggest_transform(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn read_transform(app: tauri::AppHandle, account_folder: String) -> Result<Option<String>, String> {
     let config = make_pipeline_config(&app, YYYYMM_UNUSED)?;
     let transform_path = config
@@ -715,7 +720,7 @@ fn read_transform(app: tauri::AppHandle, account_folder: String) -> Result<Optio
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn save_transform(
     app: tauri::AppHandle,
     account_folder: String,
@@ -868,39 +873,15 @@ async fn save_label(
     }
     validate_rename_target(commodity.as_deref())?;
     let config = make_pipeline_config(&app, &now_yyyymm)?;
-    let folder = config.sources_dir.join(&account_folder);
-
-    let mut labels = LabelsFile::load(&folder);
-
-    // Dedup: match on pattern + match_field
-    let existing = labels
-        .labels
-        .iter_mut()
-        .find(|r| r.pattern == pattern && r.match_field == match_field);
-    if let Some(existing) = existing {
-        existing.payee = payee;
-        existing.commodity = commodity;
-    } else {
-        let label = Rule {
-            id: generate_rule_id(&pattern),
-            pattern,
-            match_field,
-            payee,
-            commodity,
-            comment: None,
-            amount_condition: None,
-            fee_condition: None,
-            payee_condition: None,
-            narration_condition: None,
-            commodity_condition: None,
-            meta_condition: None,            amount_account: None,
-            fee_account: None,
-            postings: vec![],
-        };
-        labels.labels.push(label);
-    }
     let _suppress = app.state::<WatcherSuppressFlag>().suppress();
-    labels.save(&folder)?;
+    apply_label_upsert(
+        &config.sources_dir,
+        &account_folder,
+        pattern,
+        match_field,
+        payee,
+        commodity,
+    )?;
 
     let result = run_pipeline(&config)?;
     spawn_report_generation(&app, &config, &result);
@@ -911,7 +892,7 @@ async fn save_label(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn ai_suggest_categorisation(
     app: tauri::AppHandle,
     account_name: String,
@@ -984,7 +965,7 @@ fn ai_suggest_categorisation(
 // AI-assisted transform generation
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn ai_suggest_transform(
     app: tauri::AppHandle,
     account_folder: String,
@@ -1039,7 +1020,7 @@ fn ai_suggest_transform(
         Vec<(String, std::path::PathBuf, Vec<Vec<String>>)>,
     > = std::collections::HashMap::new();
     for csv_path in &csv_paths {
-        match emuacc_covid::transform_suggest::read_csv_sample(csv_path, 3) {
+        match emuaccounts::transform_suggest::read_csv_sample(csv_path, 3) {
             Ok((headers, rows)) => {
                 let filename = csv_path
                     .file_name()
@@ -1172,7 +1153,7 @@ fn find_rule_folder(
     None
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_rules(app: tauri::AppHandle, account_folder: String) -> Result<Vec<Rule>, String> {
     let sources_dir = resolve_sources_dir(&app)?;
     let folder = sources_dir.join(&account_folder);
@@ -1329,45 +1310,7 @@ fn collect_labels(sources_dir: &std::path::Path, account_folder: &str) -> Vec<La
     all
 }
 
-/// Edit a label in place in the folder that owns it, replacing only the
-/// editor-owned fields so anything else on the entry survives.
-fn apply_label_edit(
-    sources_dir: &std::path::Path,
-    folder_rel: &str,
-    label_id: &str,
-    pattern: String,
-    match_field: Option<String>,
-    payee: String,
-) -> Result<(), String> {
-    let folder = sources_dir.join(folder_rel);
-    let mut labels = LabelsFile::load(&folder);
-    let existing = labels
-        .labels
-        .iter_mut()
-        .find(|l| l.id == label_id)
-        .ok_or_else(|| format!("Label '{label_id}' not found in '{folder_rel}'"))?;
-    existing.pattern = pattern;
-    existing.match_field = match_field;
-    existing.payee = Some(payee);
-    labels.save(&folder)
-}
-
-fn apply_label_delete(
-    sources_dir: &std::path::Path,
-    folder_rel: &str,
-    label_id: &str,
-) -> Result<(), String> {
-    let folder = sources_dir.join(folder_rel);
-    let mut labels = LabelsFile::load(&folder);
-    let before = labels.labels.len();
-    labels.labels.retain(|l| l.id != label_id);
-    if labels.labels.len() == before {
-        return Err(format!("Label '{label_id}' not found in '{folder_rel}'"));
-    }
-    labels.save(&folder)
-}
-
-#[tauri::command]
+#[tauri::command(async)]
 fn get_labels(app: tauri::AppHandle, account_folder: String) -> Result<Vec<LabelInfo>, String> {
     let sources_dir = resolve_sources_dir(&app)?;
     Ok(collect_labels(&sources_dir, &account_folder))
@@ -1537,7 +1480,7 @@ async fn set_price(
     set_price_directive(&sources_dir, &commodity, &datetime, &price_amount, &quote_currency)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn parse_transactions_file(path: String) -> Result<ParseResponse, String> {
     let contents =
         std::fs::read_to_string(&path).map_err(|e| format!("failed to read file: {e}"))?;
@@ -1630,11 +1573,11 @@ fn spawn_report_generation(
         .clone();
 
     std::thread::spawn(move || {
-        if let Err(e) = emuacc_covid::report_templates::generate_all_reports(
+        if let Err(e) = emuaccounts::report_templates::generate_all_reports(
             &sources_dir,
             &generated_dir,
             &account_sets,
-            emuacc_covid::report_templates::ALL_FORMATS,
+            emuaccounts::report_templates::ALL_FORMATS,
             &extra_prefixes,
         ) {
             eprintln!("Report generation error: {e}");
@@ -1647,178 +1590,28 @@ fn spawn_report_generation(
     });
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_pipeline_warnings(state: tauri::State<StartupWarnings>) -> Vec<String> {
     state.0.lock().clone()
 }
 
 // WatcherStopHandle is defined near start_file_watcher()
 
-struct MetadataState {
-    store: Mutex<Option<MetadataStore>>,
-}
-
-#[tauri::command]
-fn init_metadata(app: tauri::AppHandle, state: tauri::State<MetadataState>) -> Result<(), String> {
-    let sources_dir = resolve_sources_dir(&app)?;
-    let metadata_path = sources_dir.join(sync_state::METADATA_FILE);
-    let already_exists = metadata_path.exists();
-    let mut store = MetadataStore::new(metadata_path)?;
-    if !already_exists {
-        store.build_from_sources(&sources_dir)?;
-        store.save()?;
-    }
-    *state.store.lock() = Some(store);
-    Ok(())
-}
-
-#[tauri::command]
-fn get_sync_log(state: tauri::State<MetadataState>) -> Result<Vec<SyncEvent>, String> {
-    let lock = state.store.lock();
-    let store = lock.as_ref().ok_or("Metadata not initialized")?;
-    let meta = store.get_metadata()?;
-    Ok(meta.sync_log)
-}
-
-#[tauri::command]
-fn merge_metadata(remote_path: String, state: tauri::State<MetadataState>) -> Result<(), String> {
-    let mut lock = state.store.lock();
-    let store = lock.as_mut().ok_or("Metadata not initialized")?;
-    store.merge_from_file(std::path::Path::new(&remote_path))?;
-    store.save()?;
-    Ok(())
-}
-
-#[tauri::command]
-fn list_devices(state: tauri::State<MetadataState>) -> Result<Vec<DeviceInfo>, String> {
-    let lock = state.store.lock();
-    let store = lock.as_ref().ok_or("Metadata not initialized")?;
-    let meta = store.get_metadata()?;
-    Ok(meta.devices.values().cloned().collect())
-}
-
-#[derive(Debug, Serialize)]
-struct SyncResponse {
-    files_transferred: usize,
-    metadata_merged: bool,
-}
-
-#[tauri::command]
-fn sync_with_remote(
-    app: tauri::AppHandle,
-    remote_metadata_path: String,
-    remote_cas_path: String,
-    state: tauri::State<MetadataState>,
-) -> Result<SyncResponse, String> {
-    let mut lock = state.store.lock();
-    let store = lock.as_mut().ok_or("Metadata not initialized")?;
-
-    let sources_dir = resolve_sources_dir(&app)?;
-    let local_cas = ContentStore::new(sources_dir.join(sync_state::CAS_DIR));
-    let remote_cas = ContentStore::new(PathBuf::from(&remote_cas_path));
-
-    let result = full_sync(
-        store,
-        &local_cas,
-        std::path::Path::new(&remote_metadata_path),
-        &remote_cas,
-    )?;
-
-    store.save()?;
-
-    Ok(SyncResponse {
-        files_transferred: result.files_transferred,
-        metadata_merged: result.metadata_merged,
-    })
-}
-
-#[derive(Debug, Serialize)]
-struct PairInitiateResult {
-    group_id: String,
-    pairing_code: String,
-    expires_in: u64,
-}
-
-#[tauri::command]
-fn pair_initiate(relay_url: String) -> Result<PairInitiateResult, String> {
-    let result = relay_client::pair_initiate(&relay_url)?;
-    Ok(PairInitiateResult {
-        group_id: result.group_id,
-        pairing_code: result.pairing_code,
-        expires_in: result.expires_in,
-    })
-}
-
-#[tauri::command]
-fn pair_join(relay_url: String, pairing_code: String) -> Result<String, String> {
-    relay_client::pair_join(&relay_url, &pairing_code)
-}
-
-#[derive(Debug, Serialize)]
-struct RelaySyncResponse {
-    metadata_merged: bool,
-    blobs_uploaded: usize,
-    blobs_downloaded: usize,
-}
-
-#[tauri::command]
-fn sync_with_relay_cmd(
-    app: tauri::AppHandle,
-    state: tauri::State<MetadataState>,
-) -> Result<RelaySyncResponse, String> {
-    let mut lock = state.store.lock();
-    let store = lock.as_mut().ok_or("Metadata not initialized")?;
-
-    let sources_dir = resolve_sources_dir(&app)?;
-    let local_cas = ContentStore::new(sources_dir.join(sync_state::CAS_DIR));
-
-    let config = relay_client::load_relay_config(&sources_dir)?
-        .ok_or("Relay not configured. Set relay URL and pair first.")?;
-
-    let result = relay_client::sync_with_relay(store, &local_cas, &config)?;
-
-    Ok(RelaySyncResponse {
-        metadata_merged: result.metadata_merged,
-        blobs_uploaded: result.blobs_uploaded,
-        blobs_downloaded: result.blobs_downloaded,
-    })
-}
-
-#[tauri::command]
-fn save_relay_config(
-    app: tauri::AppHandle,
-    relay_url: String,
-    group_id: String,
-) -> Result<(), String> {
-    let sources_dir = resolve_sources_dir(&app)?;
-    let config = relay_client::RelayConfig {
-        relay_url,
-        group_id,
-    };
-    relay_client::save_relay_config(&sources_dir, &config)
-}
-
-#[tauri::command]
-fn get_relay_config(app: tauri::AppHandle) -> Result<Option<relay_client::RelayConfig>, String> {
-    let sources_dir = resolve_sources_dir(&app)?;
-    relay_client::load_relay_config(&sources_dir)
-}
-
-#[tauri::command]
+#[tauri::command(async)]
 fn get_account_gaps(app: tauri::AppHandle) -> Result<Vec<AccountGap>, String> {
     let generated_dir = resolve_generated_dir(&app)?;
     detect_account_gaps(&generated_dir)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn collect_issues_cmd(
     app: tauri::AppHandle,
     account: Option<String>,
-) -> Result<emuacc_covid::issues::CollectedIssues, String> {
+) -> Result<emuaccounts::issues::CollectedIssues, String> {
     let sources_dir = resolve_sources_dir(&app)?;
     let generated_dir = resolve_generated_dir(&app)?;
-    let filter = emuacc_covid::issues::CollectFilter {
-        categories: emuacc_covid::issues::Category::ALL.iter().copied().collect(),
+    let filter = emuaccounts::issues::CollectFilter {
+        categories: emuaccounts::issues::Category::ALL.iter().copied().collect(),
         account,
     };
     // The full scan (account=None — the startup/issues-panel refresh, ~9.5s on
@@ -1828,19 +1621,19 @@ fn collect_issues_cmd(
     if filter.account.is_none() {
         let key = format!(
             "v{}:{}",
-            emuacc_covid::issues::COLLECT_VERSION,
-            emuacc_covid::build_cache::dir_fingerprint(&sources_dir)?
+            emuaccounts::issues::COLLECT_VERSION,
+            emuaccounts::build_cache::dir_fingerprint(&sources_dir)?
         );
-        return emuacc_covid::derived_cache::get_or_compute(
+        return emuaccounts::derived_cache::get_or_compute(
             &generated_dir.join(".cache").join("issues.json"),
             &key,
-            || emuacc_covid::issues::collect_all(&sources_dir, &generated_dir, &filter),
+            || emuaccounts::issues::collect_all(&sources_dir, &generated_dir, &filter),
         );
     }
-    emuacc_covid::issues::collect_all(&sources_dir, &generated_dir, &filter)
+    emuaccounts::issues::collect_all(&sources_dir, &generated_dir, &filter)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn reveal_in_finder(path: String) -> Result<(), String> {
     let p = std::path::Path::new(&path);
     if !p.exists() {
@@ -1872,7 +1665,7 @@ fn reveal_in_finder(path: String) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_source_folder_path(app: tauri::AppHandle, folder_name: String) -> Result<String, String> {
     let sources_dir = resolve_sources_dir(&app)?;
     let folder_path = sources_dir.join(&folder_name);
@@ -1883,7 +1676,7 @@ fn get_source_folder_path(app: tauri::AppHandle, folder_name: String) -> Result<
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_account_sets(app: tauri::AppHandle) -> Result<Vec<String>, String> {
     let sources_dir = resolve_sources_dir(&app)?;
     if !sources_dir.exists() {
@@ -1927,7 +1720,7 @@ async fn update_account_properties(
     build_pipeline_response(&app, result, &set_dir, &account_set)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_display_config(
     app: tauri::AppHandle,
     account_set: String,
@@ -1941,7 +1734,7 @@ fn get_display_config(
         let set_dir = resolve_set_dir(&generated_dir, &account_set);
         std::fs::create_dir_all(&set_dir)
             .map_err(|e| format!("failed to create config dir: {e}"))?;
-        let pretty = emuacc_covid::to_sorted_json_pretty(&display_config::default_set_config())
+        let pretty = emuaccounts::to_sorted_json_pretty(&display_config::default_set_config())
             .map_err(|e| format!("failed to serialize config: {e}"))?;
         std::fs::write(&set_config_path, &pretty)
             .map_err(|e| format!("failed to write config.json: {e}"))?;
@@ -1950,26 +1743,26 @@ fn get_display_config(
 }
 
 /// The vault-level default base currency; `None` until setup has run.
-#[tauri::command]
+#[tauri::command(async)]
 fn get_vault_base_currency(app: tauri::AppHandle) -> Result<Option<String>, String> {
     let generated_dir = resolve_generated_dir(&app)?;
     display_config::vault_base_currency(&generated_dir)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_vault_base_currency(app: tauri::AppHandle, currency: String) -> Result<(), String> {
     let generated_dir = resolve_generated_dir(&app)?;
     display_config::set_vault_base_currency(&generated_dir, &currency)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_base_currency_candidates(app: tauri::AppHandle) -> Result<Vec<String>, String> {
     let generated_dir = resolve_generated_dir(&app)?;
     let sources_dir = resolve_sources_dir(&app)?;
     Ok(display_config::base_currency_candidates(&sources_dir, &generated_dir))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn open_display_config(app: tauri::AppHandle, account_set: String) -> Result<(), String> {
     let generated_dir = resolve_generated_dir(&app)?;
     let set_dir = resolve_set_dir(&generated_dir, &account_set);
@@ -2003,7 +1796,7 @@ fn open_display_config(app: tauri::AppHandle, account_set: String) -> Result<(),
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_account_config(
     app: tauri::AppHandle,
     account_folder: String,
@@ -2015,19 +1808,19 @@ fn get_account_config(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_show_hidden(app: tauri::AppHandle, show: bool) {
     app.state::<ShowHiddenState>()
         .0
         .store(show, Ordering::Relaxed);
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_show_hidden(app: tauri::AppHandle) -> bool {
     app.state::<ShowHiddenState>().0.load(Ordering::Relaxed)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn open_url(url: String) -> Result<(), String> {
     // Only allow https:// URLs
     if !url.starts_with("https://") {
@@ -2099,11 +1892,9 @@ async fn convert_to_base_currency(
     Ok(ConversionResult { values })
 }
 
-#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn save_trade_link(
     app: tauri::AppHandle,
-    state: tauri::State<'_, MetadataState>,
     now_yyyymm: String,
     txn_id_a: String,
     txn_id_b: String,
@@ -2111,16 +1902,14 @@ async fn save_trade_link(
     is_a_sell: bool,
     account_set: String,
 ) -> Result<PipelineResponse, String> {
-    let mut lock = state.store.lock();
-    let store = lock.as_mut().ok_or("Metadata not initialized")?;
-    let id = store.save_trade_link(&txn_id_a, &txn_id_b)?;
-    store.save()?;
+    let sources_dir = resolve_sources_dir(&app)?;
+    trade_links::save(&sources_dir, &[(txn_id_a.as_str(), txn_id_b.as_str())])?;
+    let id = trade_link_id(&txn_id_a, &txn_id_b);
 
     // Generate rules in _rules.json. For an on-chain swap (both legs share a
     // txn id) the rule must be leg-anchored and co-located in the leaf folder
     // that owns the legs, or a pre-existing per-leg categorisation would
     // outrank it; plan_trade_link_rules resolves that from the built ledgers.
-    let sources_dir = resolve_sources_dir(&app)?;
     let generated_dir = resolve_generated_dir(&app)?;
     let by_folder = load_per_folder_ledgers(&generated_dir, &sources_dir);
     let (sell_txn, buy_txn) = if is_a_sell {
@@ -2163,7 +1952,6 @@ struct BulkTradeLinkItem {
 #[tauri::command]
 async fn save_trade_links_bulk(
     app: tauri::AppHandle,
-    state: tauri::State<'_, MetadataState>,
     now_yyyymm: String,
     links: Vec<BulkTradeLinkItem>,
     account_set: String,
@@ -2171,8 +1959,6 @@ async fn save_trade_links_bulk(
     if links.is_empty() {
         return Err("No links to save".to_string());
     }
-    let mut lock = state.store.lock();
-    let store = lock.as_mut().ok_or("Metadata not initialized")?;
 
     let sources_dir = resolve_sources_dir(&app)?;
     let generated_dir = resolve_generated_dir(&app)?;
@@ -2186,7 +1972,7 @@ async fn save_trade_links_bulk(
     let mut changed_folders: Vec<String> = Vec::new();
 
     for item in &links {
-        let id = store.save_trade_link(&item.txn_id_a, &item.txn_id_b)?;
+        let id = trade_link_id(&item.txn_id_a, &item.txn_id_b);
         let (sell_txn, buy_txn) = if item.is_a_sell {
             (item.txn_id_a.as_str(), item.txn_id_b.as_str())
         } else {
@@ -2204,7 +1990,11 @@ async fn save_trade_links_bulk(
         };
         rules.insert_rules(link_rules);
     }
-    store.save()?;
+    let pairs: Vec<(&str, &str)> = links
+        .iter()
+        .map(|item| (item.txn_id_a.as_str(), item.txn_id_b.as_str()))
+        .collect();
+    trade_links::save(&sources_dir, &pairs)?;
 
     // Save all modified rules files
     for (folder_name, rules) in &folder_rules {
@@ -2230,22 +2020,18 @@ async fn save_trade_links_bulk(
 #[tauri::command]
 async fn delete_trade_link(
     app: tauri::AppHandle,
-    state: tauri::State<'_, MetadataState>,
     now_yyyymm: String,
     link_id: String,
     account_folder: String,
     account_set: String,
 ) -> Result<PipelineResponse, String> {
-    let mut lock = state.store.lock();
-    let store = lock.as_mut().ok_or("Metadata not initialized")?;
-    store.delete_trade_link(&link_id)?;
-    store.save()?;
+    let sources_dir = resolve_sources_dir(&app)?;
+    trade_links::delete(&sources_dir, &link_id)?;
 
     // Suppress watcher while we modify source files and run pipeline ourselves
     let _suppress = app.state::<WatcherSuppressFlag>().suppress();
 
     // Remove trade link rules from _rules.json
-    let sources_dir = resolve_sources_dir(&app)?;
     let folder = sources_dir.join(&account_folder);
     let mut rules = RulesFile::try_load(&folder)?;
     remove_trade_link_rules(&mut rules, &link_id);
@@ -2260,29 +2046,23 @@ async fn delete_trade_link(
     build_pipeline_response(&app, result, &set_dir, &account_set)
 }
 
-#[tauri::command]
-fn get_trade_links(state: tauri::State<MetadataState>) -> Result<Vec<TradeLink>, String> {
-    let lock = state.store.lock();
-    let store = lock.as_ref().ok_or("Metadata not initialized")?;
-    store.get_trade_links()
+/// The vault's trade links; the first call in a vault whose links are still
+/// only in the pre-TASK-133 metadata document migrates them.
+#[tauri::command(async)]
+fn get_trade_links(app: tauri::AppHandle) -> Result<Vec<TradeLink>, String> {
+    trade_links::load(&resolve_sources_dir(&app)?)
 }
 
 #[tauri::command]
 async fn suggest_trade_links_cmd(
     app: tauri::AppHandle,
-    state: tauri::State<'_, MetadataState>,
     account_set: String,
     base_currency: Option<String>,
 ) -> Result<Vec<TradeSuggestion>, String> {
     let generated_dir = resolve_generated_dir(&app)?;
     let set_dir = resolve_set_dir(&generated_dir, &account_set);
     let sources_dir = resolve_sources_dir(&app)?;
-
-    let existing = {
-        let lock = state.store.lock();
-        let store = lock.as_ref().ok_or("Metadata not initialized")?;
-        store.get_trade_links()?
-    };
+    let existing = trade_links::load(&sources_dir)?;
 
     // Cache key: sources fingerprint (the ledger is derived from sources), the
     // current link ids (a new link must drop its pair from the suggestions),
@@ -2292,16 +2072,16 @@ async fn suggest_trade_links_cmd(
     link_ids.sort_unstable();
     let key = format!(
         "v{}:{}:{}:{}",
-        emuacc_covid::automerge_store::SUGGEST_VERSION,
-        emuacc_covid::build_cache::dir_fingerprint(&sources_dir)?,
-        emuacc_covid::derived_cache::value_hash(&link_ids),
+        trade_links::SUGGEST_VERSION,
+        emuaccounts::build_cache::dir_fingerprint(&sources_dir)?,
+        emuaccounts::derived_cache::value_hash(&link_ids),
         base_currency.as_deref().unwrap_or("")
     );
     let cache_file = generated_dir.join(".cache").join(format!(
         "trade-suggestions-{}.json",
         if account_set.is_empty() { "root" } else { account_set.as_str() }
     ));
-    emuacc_covid::derived_cache::get_or_compute(&cache_file, &key, || {
+    emuaccounts::derived_cache::get_or_compute(&cache_file, &key, || {
         let parse = load_active_ledger(&set_dir)?;
         let price_graph = PriceGraph::load(&sources_dir);
         Ok(suggest_trade_links(
@@ -2313,7 +2093,7 @@ async fn suggest_trade_links_cmd(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_tax_config(app: tauri::AppHandle, account_set: String) -> Result<TaxConfig, String> {
     let generated_dir = resolve_generated_dir(&app)?;
     let set_dir = resolve_set_dir(&generated_dir, &account_set);
@@ -2339,17 +2119,17 @@ async fn save_tax_config(
 ) -> Result<(), String> {
     let generated_dir = resolve_generated_dir(&app)?;
     let set_dir = resolve_set_dir(&generated_dir, &account_set);
-    emuacc_covid::report_templates::persist_tax_config(&set_dir, &config)?;
+    emuaccounts::report_templates::persist_tax_config(&set_dir, &config)?;
 
     // Regenerate reports with new tax config
     let sources_dir = resolve_sources_dir(&app)?;
     let generated_dir = resolve_generated_dir(&app)?;
     let primaries = primary_accounts_allowlist(&app, &generated_dir);
-    let _ = emuacc_covid::report_templates::regenerate_reports_for_set(
+    let _ = emuaccounts::report_templates::regenerate_reports_for_set(
         &generated_dir,
         &set_dir,
         &sources_dir,
-        emuacc_covid::report_templates::ALL_FORMATS,
+        emuaccounts::report_templates::ALL_FORMATS,
         primaries.as_ref(),
     );
 
@@ -2381,7 +2161,7 @@ async fn generate_cgt_report_cmd(
     let set_dir = resolve_set_dir(&generated_dir, &account_set);
     if base_account_scope.is_none() {
         let json_path =
-            emuacc_covid::report_templates::cgt_json_path(&set_dir, &financial_year);
+            emuaccounts::report_templates::cgt_json_path(&set_dir, &financial_year);
         if let Some(report) = read_cached_report::<CgtReport>(&json_path) {
             return Ok(report);
         }
@@ -2418,7 +2198,7 @@ async fn generate_income_report_cmd(
     let set_dir = resolve_set_dir(&generated_dir, &account_set);
     if base_account_scope.is_none() {
         let json_path =
-            emuacc_covid::report_templates::income_json_path(&set_dir, &financial_year);
+            emuaccounts::report_templates::income_json_path(&set_dir, &financial_year);
         if let Some(report) = read_cached_report::<IncomeTaxReport>(&json_path) {
             return Ok(report);
         }
@@ -2521,7 +2301,7 @@ async fn generate_balances_report_cmd(
             .is_empty()
     {
         let json_path =
-            emuacc_covid::report_templates::balances_json_path(&set_dir, &financial_year);
+            emuaccounts::report_templates::balances_json_path(&set_dir, &financial_year);
         if let Some(report) = read_cached_report::<BalancesReport>(&json_path) {
             return Ok(report);
         }
@@ -2777,7 +2557,7 @@ async fn export_report_csv_cmd(
                 base.clone(),
                 scope.clone(),
             ).await?;
-            emuacc_covid::report_csv::cgt_to_csv(&report)?
+            emuaccounts::report_csv::cgt_to_csv(&report)?
         }
         "income" => {
             let report = generate_income_report_cmd(
@@ -2787,7 +2567,7 @@ async fn export_report_csv_cmd(
                 base.clone(),
                 scope.clone(),
             ).await?;
-            emuacc_covid::report_csv::income_to_csv(&report)?
+            emuaccounts::report_csv::income_to_csv(&report)?
         }
         "balances" => {
             let report = generate_balances_report_cmd(
@@ -2797,7 +2577,7 @@ async fn export_report_csv_cmd(
                 base.clone(),
                 scope.clone(),
             ).await?;
-            emuacc_covid::report_csv::balances_to_csv(&report)?
+            emuaccounts::report_csv::balances_to_csv(&report)?
         }
         other => return Err(format!("unknown report type '{other}'")),
     };
@@ -2852,37 +2632,37 @@ async fn list_report_years_cmd(
     let generated_dir = resolve_generated_dir(&app)?;
     let set_dir = resolve_set_dir(&generated_dir, &account_set);
     let reports_dir = set_dir.join("reports");
-    Ok(emuacc_covid::report_templates::list_report_years(
+    Ok(emuaccounts::report_templates::list_report_years(
         &reports_dir,
         &report_type,
     ))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn has_root_dir(state: tauri::State<RootConfigState>) -> bool {
     state.0.lock().current_root.is_some()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_root_dir(state: tauri::State<RootConfigState>) -> Option<String> {
     state.0.lock().current_root.clone()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_known_roots(state: tauri::State<RootConfigState>) -> Vec<String> {
     state.0.lock().known_roots.clone()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn load_ui_state(app: tauri::AppHandle) -> Result<Option<serde_json::Value>, String> {
-    Ok(emuacc_covid::ui_state::load_ui_state(&resolve_generated_dir(
+    Ok(emuaccounts::ui_state::load_ui_state(&resolve_generated_dir(
         &app,
     )?))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn save_ui_state(app: tauri::AppHandle, state: serde_json::Value) -> Result<(), String> {
-    emuacc_covid::ui_state::save_ui_state(&resolve_generated_dir(&app)?, &state)
+    emuaccounts::ui_state::save_ui_state(&resolve_generated_dir(&app)?, &state)
 }
 
 #[tauri::command]
@@ -2895,64 +2675,92 @@ async fn set_root_dir(
         .path()
         .app_data_dir()
         .map_err(|e| format!("failed to resolve app data dir: {e}"))?;
-    let root_path = PathBuf::from(&path);
-    let new_config = root_config::set_root(&app_dir, &root_path)?;
+    let new_config = root_config::set_root(&app_dir, &PathBuf::from(&path))?;
     *root_config_state.0.lock() = new_config;
+    spawn_vault_rebuild(&app);
+    Ok(())
+}
 
-    // Stop existing watcher if any
-    if let Some(stop) = app.try_state::<WatcherStopHandle>() {
-        if let Some(old_stop) = stop.0.lock().take() {
-            old_stop.store(true, Ordering::Relaxed);
+/// Open the current data folder on a background thread: watch its sources,
+/// bring its generated output up to date, and refresh what the commands cache
+/// from it. Launch and a switch to another data folder both open one this way.
+/// A large vault's full rebuild takes minutes; run on the main thread, it froze
+/// the window (Not Responding). The window shows its "Rebuilding cache" screen
+/// until the rebuild ends (`await_vault_rebuild`).
+fn spawn_vault_rebuild(app: &tauri::AppHandle) {
+    // Started here, not on the thread, so the rebuild already counts as
+    // running when the caller returns to the frontend.
+    let running = app.state::<VaultRebuild>().start();
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let _running = running;
+        restart_file_watcher(&app);
+        if let Err(e) = rebuild_vault(&app) {
+            eprintln!("Vault rebuild failed: {e}");
+        }
+    });
+}
+
+/// Stop the previous data folder's watcher, if any, and watch the current
+/// folder's sources.
+fn restart_file_watcher(app: &tauri::AppHandle) {
+    let handle = app.state::<WatcherStopHandle>();
+    let mut current = handle.0.lock();
+    if let Some(old_stop) = current.take() {
+        old_stop.store(true, Ordering::Relaxed);
+    }
+    if let (Ok(sources_dir), Ok(generated_dir)) =
+        (resolve_sources_dir(app), resolve_generated_dir(app))
+    {
+        if sources_dir.exists() {
+            *current = Some(start_file_watcher(app.clone(), sources_dir, generated_dir));
         }
     }
+}
 
-    // Start new watcher on the new sources dir
-    let sources_dir = root_path.join("sources");
-    let generated_dir = root_path.join("generated");
-    if sources_dir.exists() {
-        let new_stop = start_file_watcher(app.clone(), sources_dir, generated_dir);
-        if let Some(handle) = app.try_state::<WatcherStopHandle>() {
-            *handle.0.lock() = Some(new_stop);
-        }
+/// Run the pipeline over the current data folder (a cached no-op when its
+/// sources are unchanged), then refresh what reads its output: the ledger and
+/// metadata caches, the warnings `get_pipeline_warnings` reports, and the
+/// reports.
+fn rebuild_vault(app: &tauri::AppHandle) -> Result<(), String> {
+    let config = make_pipeline_config(app, &current_yyyymm())?;
+    let result = run_pipeline(&config);
+    refresh_caches_after_root_change(&app.state::<LedgerCache>(), result.as_ref().ok());
+    let result = result?;
+    for w in &result.warnings {
+        eprintln!("Pipeline warning: {w}");
     }
-
-    // Run pipeline on the new root
-    let now_yyyymm = current_yyyymm();
-    let config = make_pipeline_config(&app, &now_yyyymm)?;
-    match run_pipeline(&config) {
-        Ok(result) => {
-            refresh_caches_after_root_change(
-                &app.state::<LedgerCache>(),
-                &app.state::<MetadataState>(),
-                Some(&result),
-            );
-            spawn_report_generation(&app, &config, &result);
-            let _ = app.emit("pipeline-rebuilt", &result);
-        }
-        Err(e) => {
-            refresh_caches_after_root_change(
-                &app.state::<LedgerCache>(),
-                &app.state::<MetadataState>(),
-                None,
-            );
-            eprintln!("Pipeline run after root change failed: {e}");
-        }
+    *app.state::<StartupWarnings>().0.lock() = result.warnings.clone();
+    spawn_report_generation(app, &config, &result);
+    if result.total_written > 0 {
+        eprintln!(
+            "Vault rebuild: {} transformed, {} cached, {} written",
+            result.csv_transformed, result.csv_cached, result.total_written
+        );
+    } else {
+        eprintln!("Vault rebuild: sources unchanged, skipped rewrite");
     }
+    Ok(())
+}
 
+/// Whether a vault rebuild is in flight: the frontend shows its "Rebuilding
+/// cache" screen only then.
+#[tauri::command(async)]
+fn vault_rebuild_running(rebuild: tauri::State<VaultRebuild>) -> bool {
+    rebuild.is_running()
+}
+
+/// Resolves once no vault rebuild is in flight — at once when none is.
+#[tauri::command]
+async fn await_vault_rebuild(rebuild: tauri::State<'_, VaultRebuild>) -> Result<(), String> {
+    rebuild.finished().await;
     Ok(())
 }
 
 /// After a root change, caches from the previous vault must never survive —
-/// even when the pipeline early-exits (unchanged inputs) or fails. The
-/// metadata store is dropped rather than re-pointed; the frontend's next
-/// init_metadata rebuilds it against the new sources path.
-fn refresh_caches_after_root_change(
-    cache: &LedgerCache,
-    metadata: &MetadataState,
-    result: Option<&PipelineResult>,
-) {
+/// even when the pipeline early-exits (unchanged inputs) or fails.
+fn refresh_caches_after_root_change(cache: &LedgerCache, result: Option<&PipelineResult>) {
     cache.invalidate();
-    *metadata.store.lock() = None;
     if let Some(result) = result {
         for set_name in result.owner_accounts.keys() {
             if let Some(parse) = result.parse_result_for_set(set_name) {
@@ -2998,6 +2806,38 @@ struct SuppressGuard(Arc<AtomicUsize>);
 impl Drop for SuppressGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The vault rebuilds in flight (`spawn_vault_rebuild`). Refcounted like
+/// `WatcherSuppressFlag`: a rebuild ends when its guard drops, so one that
+/// fails or panics cannot hold the window on the "Rebuilding cache" screen.
+struct VaultRebuild(Arc<tokio::sync::watch::Sender<usize>>);
+
+impl VaultRebuild {
+    fn new() -> Self {
+        Self(Arc::new(tokio::sync::watch::Sender::new(0)))
+    }
+    #[must_use = "the rebuild counts as running only while the guard is alive"]
+    fn start(&self) -> VaultRebuildGuard {
+        self.0.send_modify(|running| *running += 1);
+        VaultRebuildGuard(self.0.clone())
+    }
+    fn is_running(&self) -> bool {
+        *self.0.borrow() > 0
+    }
+    /// Resolves once no rebuild is running.
+    async fn finished(&self) {
+        // `self` owns the sender, so the channel cannot close while we wait.
+        let _ = self.0.subscribe().wait_for(|running| *running == 0).await;
+    }
+}
+
+struct VaultRebuildGuard(Arc<tokio::sync::watch::Sender<usize>>);
+
+impl Drop for VaultRebuildGuard {
+    fn drop(&mut self) {
+        self.0.send_modify(|running| *running -= 1);
     }
 }
 
@@ -3055,8 +2895,8 @@ fn start_file_watcher(
                         event.kind,
                         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
                     );
-                    // A relay sync rewrites only its own state, never pipeline input.
-                    if is_change && !sync_state::only_sync_state(&watched, &event.paths) {
+                    // The app's own state under sources/ is never pipeline input.
+                    if is_change && !sources_state::only_app_state(&watched, &event.paths) {
                         let _ = tx.send(());
                     }
                 }
@@ -3153,7 +2993,7 @@ fn resolve_plugins_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(root.join("plugins"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_plugins(app: tauri::AppHandle) -> Result<Vec<plugins::PluginInfo>, String> {
     let sources = resolve_sources_dir(&app)?;
     let root = sources.parent().ok_or("sources dir has no parent")?;
@@ -3178,7 +3018,7 @@ fn resolve_plugin_catalog_dir(app: &tauri::AppHandle) -> Result<PathBuf, String>
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_available_plugins(
     app: tauri::AppHandle,
 ) -> Result<Vec<plugins::AvailablePluginInfo>, String> {
@@ -3187,14 +3027,14 @@ fn list_available_plugins(
     Ok(plugins::list_available_plugins_in(&catalog, &vault_plugins))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn install_plugin_cmd(app: tauri::AppHandle, dir_name: String) -> Result<(), String> {
     let catalog = resolve_plugin_catalog_dir(&app)?;
     let vault_plugins = resolve_plugins_dir(&app)?;
     plugins::install_plugin(&catalog, &vault_plugins, &dir_name)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn register_crypto_wallet(
     app: tauri::AppHandle,
     chain: String,
@@ -3339,12 +3179,12 @@ async fn run_daily_plugins_cmd(
     Ok(summary)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_update_prices_on_startup(state: tauri::State<RootConfigState>) -> bool {
     state.0.lock().update_prices_on_startup
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_update_prices_on_startup(
     app: tauri::AppHandle,
     state: tauri::State<RootConfigState>,
@@ -3373,7 +3213,7 @@ struct AiSettings {
     user_name: String,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_ai_settings(state: tauri::State<RootConfigState>) -> AiSettings {
     let guard = state.0.lock();
     AiSettings {
@@ -3385,7 +3225,7 @@ fn get_ai_settings(state: tauri::State<RootConfigState>) -> AiSettings {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_ai_settings(
     app: tauri::AppHandle,
     state: tauri::State<RootConfigState>,
@@ -3408,7 +3248,7 @@ fn set_ai_settings(
 }
 
 /// The display-terminology catalogue with the user's overrides applied.
-#[tauri::command]
+#[tauri::command(async)]
 fn get_terms(state: tauri::State<RootConfigState>) -> Vec<terminology::Term> {
     terminology::resolve_terms(&state.0.lock().terms)
 }
@@ -3416,7 +3256,7 @@ fn get_terms(state: tauri::State<RootConfigState>) -> Vec<terminology::Term> {
 /// Persist terminology overrides (normalised: unknown keys, blank and
 /// default-equal values dropped) and return the resolved terms so the
 /// frontend swaps them in without a second round trip.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_terms(
     app: tauri::AppHandle,
     state: tauri::State<RootConfigState>,
@@ -3435,12 +3275,12 @@ fn set_terms(
     Ok(terminology::resolve_terms(&config.terms))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_extra_primary_account_prefixes(state: tauri::State<RootConfigState>) -> Vec<String> {
     state.0.lock().extra_primary_account_prefixes.clone()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_extra_primary_account_prefixes(
     app: tauri::AppHandle,
     state: tauri::State<RootConfigState>,
@@ -3482,11 +3322,11 @@ fn regenerate_reports_after_prefix_change(app: &tauri::AppHandle, prefixes: Vec<
     account_sets.sort();
     let handle = app.clone();
     std::thread::spawn(move || {
-        if let Err(e) = emuacc_covid::report_templates::generate_all_reports(
+        if let Err(e) = emuaccounts::report_templates::generate_all_reports(
             &sources_dir,
             &generated_dir,
             &account_sets,
-            emuacc_covid::report_templates::ALL_FORMATS,
+            emuaccounts::report_templates::ALL_FORMATS,
             &prefixes,
         ) {
             eprintln!("Report regeneration after prefix change failed: {e}");
@@ -3495,7 +3335,7 @@ fn regenerate_reports_after_prefix_change(app: &tauri::AppHandle, prefixes: Vec<
     });
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_plugin_config(
     app: tauri::AppHandle,
     plugin_name: String,
@@ -3504,7 +3344,7 @@ fn get_plugin_config(
     Ok(plugins::load_plugin_config(&plugins_dir.join(&plugin_name)))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn save_plugin_config_cmd(
     app: tauri::AppHandle,
     plugin_name: String,
@@ -3514,7 +3354,7 @@ fn save_plugin_config_cmd(
     plugins::save_plugin_config(&plugins_dir.join(&plugin_name), &config)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn save_plugin_secrets_cmd(
     app: tauri::AppHandle,
     plugin_name: String,
@@ -3524,7 +3364,7 @@ fn save_plugin_secrets_cmd(
     plugins::save_plugin_secrets(&plugins_dir.join(&plugin_name), &secrets)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_plugin_secrets(
     app: tauri::AppHandle,
     plugin_name: String,
@@ -3535,7 +3375,7 @@ fn get_plugin_secrets(
 
 /// The installed plugin's README.md, shown as its setup guide in the Plugins
 /// view. `plugin_name` is a plugin folder name, never a path.
-#[tauri::command]
+#[tauri::command(async)]
 fn get_plugin_readme(app: tauri::AppHandle, plugin_name: String) -> Result<Option<String>, String> {
     if plugin_name.is_empty() || plugin_name == ".." || plugin_name.contains(['/', '\\']) {
         return Err(format!("invalid plugin name: {plugin_name:?}"));
@@ -3544,110 +3384,11 @@ fn get_plugin_readme(app: tauri::AppHandle, plugin_name: String) -> Result<Optio
     Ok(plugins::load_plugin_readme(&plugins_dir.join(&plugin_name)))
 }
 
-fn main() {
-    #[allow(unused_mut)]
-    let mut builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
-
-    #[cfg(feature = "webdriver")]
-    {
-        builder = builder.plugin(tauri_plugin_webdriver_automation::init());
-    }
-
-    builder
-        .manage(MetadataState {
-            store: Mutex::new(None),
-        })
-        .manage(StartupWarnings(Mutex::new(Vec::new())))
-        .manage(ReportGeneration(AtomicU64::new(0)))
-        .manage(ShowHiddenState(AtomicBool::new(false)))
-        .manage(LedgerCache::new())
-        .manage(LastCommandRebuild::new())
-        .setup(|app| {
-            // Window title: when running from a git worktree, suffix with the
-            // worktree name so multiple instances (each on a different branch)
-            // are distinguishable in the OS window list. Detected from the
-            // build path (`CARGO_MANIFEST_DIR` set at compile time): a path
-            // segment of `worktrees/<repo>/<name>/...` extracts <name>. The
-            // `EMUACC_INSTANCE` env var overrides, e.g. for ad-hoc runs; set
-            // it empty for the plain release title (the README demos are
-            // recorded from a worktree build and do).
-            let instance: Option<String> = env::var("EMUACC_INSTANCE").ok().or_else(|| {
-                let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-                let mut iter = manifest_dir.iter();
-                while let Some(seg) = iter.next() {
-                    if seg == "worktrees" {
-                        iter.next(); // skip <repo>
-                        return iter.next().and_then(|s| s.to_str().map(String::from));
-                    }
-                }
-                None
-            })
-            .filter(|name| !name.is_empty());
-            if let Some(name) = instance {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.set_title(&format!("EmuAcc COVID — {name}"));
-                }
-            }
-
-            // Load root config from app_data_dir/config.json
-            let app_dir = app
-                .path()
-                .app_data_dir()
-                .map_err(|e| format!("failed to resolve app data dir: {e}"))?;
-            let config = root_config::load_root_config(&app_dir);
-            let has_root = config.current_root.is_some();
-            app.manage(RootConfigState(Mutex::new(config)));
-            app.manage(WatcherStopHandle(Mutex::new(None)));
-            app.manage(WatcherSuppressFlag::new());
-
-            // Skip pipeline and watcher when no root is configured yet —
-            // the frontend vault picker will call set_root_dir to bootstrap.
-            if has_root || env::var("EMUACC_SOURCES_DIR").is_ok() {
-                // Run pipeline on startup — the build cache makes this a no-op when
-                // nothing has changed (inputs_hash match skips the output rewrite).
-                {
-                    let now_yyyymm = current_yyyymm();
-                    let config = make_pipeline_config(app.handle(), &now_yyyymm)?;
-                    match run_pipeline(&config) {
-                        Ok(result) => {
-                            if !result.warnings.is_empty() {
-                                for w in &result.warnings {
-                                    eprintln!("Pipeline warning: {w}");
-                                }
-                                *app.state::<StartupWarnings>().0.lock() = result.warnings.clone();
-                            }
-                            spawn_report_generation(app.handle(), &config, &result);
-                            if result.total_written > 0 {
-                                eprintln!(
-                                    "Startup rebuild: {} transformed, {} cached, {} written",
-                                    result.csv_transformed, result.csv_cached, result.total_written
-                                );
-                            } else {
-                                eprintln!("Startup: sources unchanged, skipped rewrite");
-                            }
-                        }
-                        Err(e) => eprintln!("Startup rebuild failed: {e}"),
-                    }
-                }
-
-                // File watcher: watch sources/ for changes and auto-rebuild pipeline
-                if let (Ok(sources_dir), Ok(generated_dir)) = (
-                    resolve_sources_dir(app.handle()),
-                    resolve_generated_dir(app.handle()),
-                ) {
-                    if sources_dir.exists() {
-                        let stop =
-                            start_file_watcher(app.handle().clone(), sources_dir, generated_dir);
-                        *app.state::<WatcherStopHandle>().0.lock() = Some(stop);
-                    }
-                }
-            } else {
-                eprintln!("No root configured — waiting for user to pick a data folder");
-            }
-
-            Ok(())
-        })
-        .invoke_handler(tauri::generate_handler![
+/// The app's Tauri command handler. The sync build (docs/SYNC.md) passes its
+/// commands as `$sync`.
+macro_rules! app_handler {
+    ($($sync:tt)*) => {
+        tauri::generate_handler![
             parse_transactions_file,
             load_generated_ledger,
             load_account_tree,
@@ -3677,16 +3418,6 @@ fn main() {
             get_labels,
             update_label,
             delete_label,
-            init_metadata,
-            get_sync_log,
-            merge_metadata,
-            list_devices,
-            sync_with_remote,
-            pair_initiate,
-            pair_join,
-            sync_with_relay_cmd,
-            save_relay_config,
-            get_relay_config,
             hide_transaction,
             delete_manual_transaction,
             list_account_sets,
@@ -3729,6 +3460,8 @@ fn main() {
             get_root_dir,
             get_known_roots,
             set_root_dir,
+            vault_rebuild_running,
+            await_vault_rebuild,
             load_ui_state,
             save_ui_state,
             list_plugins,
@@ -3758,7 +3491,86 @@ fn main() {
             set_show_hidden,
             get_show_hidden,
             open_url
-        ])
+            $($sync)*
+        ]
+    };
+}
+
+fn main() {
+    #[allow(unused_mut)]
+    let mut builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
+
+    #[cfg(feature = "webdriver")]
+    {
+        builder = builder.plugin(tauri_plugin_webdriver_automation::init());
+    }
+
+    let builder = builder
+        .manage(StartupWarnings(Mutex::new(Vec::new())))
+        .manage(ReportGeneration(AtomicU64::new(0)))
+        .manage(ShowHiddenState(AtomicBool::new(false)))
+        .manage(LedgerCache::new())
+        .manage(LastCommandRebuild::new())
+        .manage(VaultRebuild::new())
+        .setup(|app| {
+            // Window title: when running from a git worktree, suffix with the
+            // worktree name so multiple instances (each on a different branch)
+            // are distinguishable in the OS window list. Detected from the
+            // build path (`CARGO_MANIFEST_DIR` set at compile time): a path
+            // segment of `worktrees/<repo>/<name>/...` extracts <name>. The
+            // `EMUACC_INSTANCE` env var overrides, e.g. for ad-hoc runs; set
+            // it empty for the plain release title (the README demos are
+            // recorded from a worktree build and do).
+            let instance: Option<String> = env::var("EMUACC_INSTANCE").ok().or_else(|| {
+                let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                let mut iter = manifest_dir.iter();
+                while let Some(seg) = iter.next() {
+                    if seg == "worktrees" {
+                        iter.next(); // skip <repo>
+                        return iter.next().and_then(|s| s.to_str().map(String::from));
+                    }
+                }
+                None
+            })
+            .filter(|name| !name.is_empty());
+            if let Some(name) = instance {
+                if let Some(window) = app.get_webview_window("main") {
+                    let product = &app.package_info().name;
+                    let _ = window.set_title(&format!("{product} — {name}"));
+                }
+            }
+
+            // Load root config from app_data_dir/config.json
+            let app_dir = app
+                .path()
+                .app_data_dir()
+                .map_err(|e| format!("failed to resolve app data dir: {e}"))?;
+            let config = root_config::load_root_config(&app_dir);
+            let has_root = config.current_root.is_some();
+            app.manage(RootConfigState(Mutex::new(config)));
+            app.manage(WatcherStopHandle(Mutex::new(None)));
+            app.manage(WatcherSuppressFlag::new());
+
+            // The setup hook runs on the main thread, so the rebuild goes to
+            // the background. Skipped when no root is configured yet — the
+            // frontend vault picker will call set_root_dir to bootstrap.
+            if has_root || env::var("EMUACC_SOURCES_DIR").is_ok() {
+                spawn_vault_rebuild(app.handle());
+            } else {
+                eprintln!("No root configured — waiting for user to pick a data folder");
+            }
+
+            Ok(())
+        });
+
+    #[cfg(not(feature = "sync"))]
+    let builder = builder.invoke_handler(app_handler!());
+    #[cfg(feature = "sync")]
+    let builder = builder
+        .manage(sync_commands::MetadataState::default())
+        .invoke_handler(sync_commands::with_sync_commands!(app_handler));
+
+    builder
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -3769,22 +3581,15 @@ mod tests {
     use tempfile::TempDir;
 
     fn empty_parse_result() -> ParseResult {
-        emuacc_covid::generated_store::empty_parse_result()
+        emuaccounts::generated_store::empty_parse_result()
     }
 
     #[test]
-    fn root_change_clears_ledger_cache_and_metadata_even_on_early_exit() {
+    fn root_change_clears_ledger_cache_even_on_early_exit() {
         // Regression: switching vaults with an early-exit pipeline run used to
-        // keep the PREVIOUS vault's parsed ledger in LedgerCache, and the
-        // MetadataStore (pointing at the old vault's automerge path) was never
-        // reset.
+        // keep the PREVIOUS vault's parsed ledger in LedgerCache.
         let cache = LedgerCache::new();
         cache.populate("", empty_parse_result());
-        let tmp = TempDir::new().unwrap();
-        let store = MetadataStore::new(tmp.path().join("emuacc-metadata.automerge")).unwrap();
-        let metadata = MetadataState {
-            store: Mutex::new(Some(store)),
-        };
         let result = PipelineResult {
             csv_transformed: 0,
             csv_cached: 0,
@@ -3803,15 +3608,11 @@ mod tests {
             in_memory: None,
         };
 
-        refresh_caches_after_root_change(&cache, &metadata, Some(&result));
+        refresh_caches_after_root_change(&cache, Some(&result));
 
         assert!(
             cache.entries.lock().is_empty(),
             "early-exit root change must still clear the ledger cache"
-        );
-        assert!(
-            metadata.store.lock().is_none(),
-            "root change must reset the metadata store"
         );
     }
 
@@ -3819,11 +3620,8 @@ mod tests {
     fn root_change_clears_caches_when_pipeline_fails() {
         let cache = LedgerCache::new();
         cache.populate("x", empty_parse_result());
-        let metadata = MetadataState {
-            store: Mutex::new(None),
-        };
 
-        refresh_caches_after_root_change(&cache, &metadata, None);
+        refresh_caches_after_root_change(&cache, None);
 
         assert!(
             cache.entries.lock().is_empty(),
@@ -3840,6 +3638,50 @@ mod tests {
             assert!(flag.is_suppressed());
         }
         assert!(!flag.is_suppressed(), "guard drop must clear suppression");
+    }
+
+    #[test]
+    fn vault_rebuild_runs_until_every_guard_drops() {
+        let rebuild = VaultRebuild::new();
+        assert!(!rebuild.is_running());
+        let launch = rebuild.start();
+        let switch = rebuild.start();
+        drop(launch);
+        assert!(rebuild.is_running(), "one rebuild is still in flight");
+        drop(switch);
+        assert!(!rebuild.is_running());
+    }
+
+    #[test]
+    fn vault_rebuild_ends_when_its_thread_panics() {
+        let rebuild = VaultRebuild::new();
+        let running = rebuild.start();
+        let _ = std::thread::spawn(move || {
+            let _running = running;
+            panic!("rebuild failed");
+        })
+        .join();
+        assert!(
+            !rebuild.is_running(),
+            "a panicking rebuild must not hold the window on the rebuilding screen"
+        );
+    }
+
+    #[test]
+    fn awaiting_the_vault_rebuild_resolves_once_it_ends() {
+        let rebuild = Arc::new(VaultRebuild::new());
+        // Idle: resolves at once.
+        tauri::async_runtime::block_on(rebuild.finished());
+
+        let running = rebuild.start();
+        let waiter = {
+            let rebuild = rebuild.clone();
+            std::thread::spawn(move || tauri::async_runtime::block_on(rebuild.finished()))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!waiter.is_finished(), "must wait while the rebuild runs");
+        drop(running);
+        waiter.join().expect("waiter resolves once the rebuild ends");
     }
 
     #[test]
@@ -3992,78 +3834,5 @@ mod tests {
         assert_eq!(ids, ["leaf-1", "inst-1", "root-1"]);
         let folders: Vec<&str> = chain.iter().map(|l| l.folder.as_str()).collect();
         assert_eq!(folders, ["cash/cba/bta", "cash/cba", ""]);
-    }
-
-    #[test]
-    fn apply_label_edit_edits_in_place_and_preserves_other_fields() {
-        let tmp = TempDir::new().unwrap();
-        let sources = tmp.path();
-        let folder = sources.join("cash");
-        std::fs::create_dir_all(&folder).unwrap();
-        let mut label = mk_label("label-1", "*old*", "Old Name");
-        label.comment = Some("keep me".to_string());
-        LabelsFile {
-            labels: vec![label],
-        }
-        .save(&folder)
-        .unwrap();
-
-        apply_label_edit(
-            sources,
-            "cash",
-            "label-1",
-            "*new*".to_string(),
-            Some("payee".to_string()),
-            "New Name".to_string(),
-        )
-        .unwrap();
-
-        let reloaded = LabelsFile::load(&folder);
-        let l = &reloaded.labels[0];
-        assert_eq!(l.pattern, "*new*");
-        assert_eq!(l.match_field.as_deref(), Some("payee"));
-        assert_eq!(l.payee.as_deref(), Some("New Name"));
-        assert_eq!(l.comment.as_deref(), Some("keep me"));
-    }
-
-    #[test]
-    fn apply_label_edit_errors_when_label_missing() {
-        let tmp = TempDir::new().unwrap();
-        let sources = tmp.path();
-        std::fs::create_dir_all(sources.join("cash")).unwrap();
-        let err = apply_label_edit(
-            sources,
-            "cash",
-            "nope",
-            "*p*".to_string(),
-            None,
-            "X".to_string(),
-        )
-        .unwrap_err();
-        assert!(err.contains("not found"), "got: {err}");
-    }
-
-    #[test]
-    fn apply_label_delete_removes_only_the_target() {
-        let tmp = TempDir::new().unwrap();
-        let sources = tmp.path();
-        let folder = sources.join("cash");
-        std::fs::create_dir_all(&folder).unwrap();
-        LabelsFile {
-            labels: vec![
-                mk_label("label-1", "*a*", "A"),
-                mk_label("label-2", "*b*", "B"),
-            ],
-        }
-        .save(&folder)
-        .unwrap();
-
-        apply_label_delete(sources, "cash", "label-1").unwrap();
-        let reloaded = LabelsFile::load(&folder);
-        assert_eq!(reloaded.labels.len(), 1);
-        assert_eq!(reloaded.labels[0].id, "label-2");
-
-        let err = apply_label_delete(sources, "cash", "label-1").unwrap_err();
-        assert!(err.contains("not found"), "got: {err}");
     }
 }

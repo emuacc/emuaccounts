@@ -1232,8 +1232,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ef6b89e5b37196644d8796de5268852ff179b44e96276cf4290264843743bb7"
 
 [[package]]
-name = "emuacc-covid"
-version = "0.1.1"
+name = "emuaccounts"
+version = "0.1.2"
 dependencies = [
  "antlr4rust",
  "automerge",
@@ -1241,6 +1241,7 @@ dependencies = [
  "chrono",
  "csv",
  "cucumber",
+ "flate2",
  "hex",
  "hostname",
  "machine-uid",

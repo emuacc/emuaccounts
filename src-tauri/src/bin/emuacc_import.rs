@@ -2,8 +2,8 @@
 
 use std::path::PathBuf;
 
-use emuacc_covid::processing_pipeline::{process_all_imports, process_imports, PipelineConfig};
-use emuacc_covid::FALLBACK_EXPENSE_ACCOUNT;
+use emuaccounts::processing_pipeline::{process_all_imports, process_imports, PipelineConfig};
+use emuaccounts::FALLBACK_EXPENSE_ACCOUNT;
 
 fn now_yyyymm() -> String {
     let now = chrono_free_now();

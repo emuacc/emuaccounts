@@ -4,10 +4,10 @@
 //!   * Reports using a base currency other than AUD.
 //!   * FX-conversion edge cases (price-graph miss, mid-year rate change).
 
-use emuacc_covid::ledger_parser::{
+use emuaccounts::ledger_parser::{
     parse_transactions, PriceDirective, PriceGraph, Transaction,
 };
-use emuacc_covid::reports::{
+use emuaccounts::reports::{
     generate_balances_report_range, generate_cgt_report, generate_income_report,
     generate_loss_harvest_report, generate_performance_report_range, holdings_as_of,
     AccountAllowlist, PerformanceReportParams, TaxConfig,

@@ -6,15 +6,16 @@
  *
  *   Round 1: list_account_sets
  *   Round 2: load_account_tree ‖ load_pipeline_metadata ‖ get_display_config
- *            ‖ init_metadata ‖ get_relay_config ‖ get_account_gaps
- *   Round 3: get_pipeline_warnings ‖ list_devices ‖ get_sync_log
- *            ‖ get_trade_links ‖ get_source_folder_path×N
+ *            ‖ get_trade_links ‖ get_account_gaps
+ *   Round 3: get_pipeline_warnings ‖ get_source_folder_path×N
  *
  * Startup deliberately does NOT invoke `rebuild_pipeline`. The backend already
- * runs the pipeline in `.setup()` at launch (a cached no-op when sources are
- * unchanged), and the fat `PipelineResponse` ships the entire active ledger
- * (~40MB JSON on a large vault) whose main-thread `JSON.parse` stalls the
- * WebView — the same reason mutations use `build_mutation_response`. Startup
+ * rebuilds the vault when it is opened (a cached no-op when sources are
+ * unchanged), and main.ts waits for that behind the "Rebuilding cache" screen
+ * (vault-rebuild.ts) before calling this. The fat `PipelineResponse` ships
+ * the entire active ledger (~40MB JSON on a large vault) whose main-thread
+ * `JSON.parse` stalls the WebView — the same reason mutations use
+ * `build_mutation_response`. Startup
  * takes the same slim path: `load_account_tree` for sidebar balances,
  * `load_pipeline_metadata` for the account maps, `get_pipeline_warnings` for
  * warnings the launch rebuild stashed. The caller (main.ts) loads the visible
@@ -64,12 +65,8 @@ export interface StartupState {
   accountFoldersMap: AccountFolders;
   accountPropertiesMap: Record<string, any>;
   accountsWithOpening: string[];
-  metadataReady?: boolean;
-  devices?: any[];
-  syncLog?: any[];
   tradeLinks: any[];
   tradeSuggestions: any[];
-  relayConfig?: any;
   accountGaps?: any[];
   sourceFolderPaths?: Record<string, string>;
 }
@@ -149,18 +146,9 @@ export async function normalStartup(state: StartupState, deps: StartupDeps): Pro
     } catch { /* brand-new vault — no pipeline-metadata.json yet */ }
   })();
 
-  const metadataP = (async () => {
-    try {
-      await deps.invoke("init_metadata");
-      state.metadataReady = true;
-    } catch { /* metadata not available */ }
-  })();
-
-  const relayP = (async () => {
-    try {
-      const c = await deps.invoke<any>("get_relay_config");
-      if (c) state.relayConfig = c;
-    } catch { /* relay not available */ }
+  const tradeLinksP = (async () => {
+    state.tradeLinks = await deps.invoke<any[]>("get_trade_links").catch(() => []);
+    mark("trade links loaded");
   })();
 
   const gapsP = (async () => {
@@ -174,7 +162,7 @@ export async function normalStartup(state: StartupState, deps: StartupDeps): Pro
     deps.onPipelineEvent(event.payload);
   }).catch(() => {});
 
-  await Promise.allSettled([treeP, metadataMapsP, displayConfigP, metadataP, relayP, gapsP]);
+  await Promise.allSettled([treeP, metadataMapsP, displayConfigP, tradeLinksP, gapsP]);
   mark("round 2 settled");
   deps.render();
 
@@ -185,22 +173,6 @@ export async function normalStartup(state: StartupState, deps: StartupDeps): Pro
       if (w.length > 0) state.pipelineWarnings = w;
       mark("pipeline warnings loaded");
     } catch { /* warnings not available */ }
-  })();
-
-  const metadataSubP = (async () => {
-    await metadataP; // ensure metadata is initialized first
-    if (!state.metadataReady) return;
-    try {
-      const [devices, syncLog, links] = await Promise.all([
-        deps.invoke<any[]>("list_devices").catch(() => []),
-        deps.invoke<any[]>("get_sync_log").catch(() => []),
-        deps.invoke<any[]>("get_trade_links").catch(() => []),
-      ]);
-      state.devices = devices;
-      state.syncLog = syncLog;
-      state.tradeLinks = links;
-      mark("devices/sync-log/trade-links loaded");
-    } catch { /* metadata sub-calls failed */ }
   })();
 
   // Trade suggestions are deliberately NOT fetched here: the full-vault scan
@@ -227,7 +199,7 @@ export async function normalStartup(state: StartupState, deps: StartupDeps): Pro
   // it measured 9.5s on the real vault — like trade suggestions, it runs
   // post-paint from the caller (main.ts).
 
-  await Promise.allSettled([warningsP, metadataSubP, foldersP]);
+  await Promise.allSettled([warningsP, foldersP]);
   mark("round 3 settled");
   deps.render();
 }

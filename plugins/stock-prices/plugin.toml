@@ -1,6 +1,6 @@
 [plugin]
 name = "Stock Yahoo Finance Price Sync"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fetch daily equity and US option prices via yfinance for every market you hold. Discovers tickers under each broker account prefix (ASX/CommSec, US/IBKR, ...) and merges new closes into one P-directive price file per commodity in sources/_prices/; US options are recognised by their OCC symbol and priced per contract. Incremental: re-runs fetch only the missing dates."
 script = "sync.py"
 daily = true

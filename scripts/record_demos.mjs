@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 /**
- * record_demos.mjs — generate the muted screencasts embedded in the README.
+ * record_demos.mjs — generate the muted screencasts shown in the README and
+ * the user guide.
  *
  * Records three flows of the real Tauri app, driving the WebView with
  * selenium-webdriver (via the macOS `tauri-wd` W3C WebDriver server) and the
  * native OS file/folder dialogs with `osascript`. The screen is captured with
  * macOS `screencapture -v`, then cropped to the app window and encoded to
- * MP4 + WebM with ffmpeg.
+ * MP4 + WebM with ffmpeg, plus the looping GIF the docs show.
  *
  * `getting-started` is the README's getting-started video: one continuous take
  * of all three flows (choose a data folder and add an account, import a CSV,
@@ -53,14 +54,14 @@ const DEMO_CSV = path.join(DEMO_IMPORT_DIR, "transactions.csv");
 const DEMO_CSV_BODY = "Date,Description,Amount\n2025-01-15,Coffee Shop,-4.50\n2025-01-16,Salary,3500.00\n";
 
 // Real app config.json — protected: only flow 1 moves it aside, always restored.
-const APP_DATA = path.join(os.homedir(), "Library", "Application Support", "com.cog32.emuacccovid");
+const APP_DATA = path.join(os.homedir(), "Library", "Application Support", "com.emusoftware.emuaccounts");
 const CONFIG = path.join(APP_DATA, "config.json");
 const CONFIG_BAK = path.join(APP_DATA, `config.json.demobak-${process.pid}`);
 
 const HOME = os.homedir();
 const APP_BINARY_CANDIDATES = [
-  path.join(HOME, ".cache", "emuacc-target-mcp", "debug", "emuacc-covid"),
-  path.join(repoRoot, "src-tauri", "target", "debug", "emuacc-covid"),
+  path.join(HOME, ".cache", "emuacc-target-mcp", "debug", "emuaccounts"),
+  path.join(repoRoot, "src-tauri", "target", "debug", "emuaccounts"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -151,7 +152,7 @@ function probeAutomationTcc() {
   }
 }
 
-/** Find the running app's System Events process name (emuacc-covid). */
+/** Find the running app's System Events process name (emuaccounts). */
 function findAppProcessName() {
   const names = osa('tell application "System Events" to get name of every process whose background only is false');
   const match = names.split(",").map((s) => s.trim()).find((n) => /emuacc/i.test(n));
@@ -435,14 +436,20 @@ function ffprobeDims(file) {
   return { w, h };
 }
 
-/** Encode one clip's segments, in order, to mp4 + webm + poster. A segment is
+/** The looping GIF a doc shows in place of a poster: 10 fps at 960 px keeps
+ *  the 72-second getting-started take at about 3 MB (1200 px is 4.5 MB). */
+const GIF_FPS = 10;
+const GIF_WIDTH = 960;
+
+/** Encode one clip's segments, in order, to mp4 + webm, plus the image a doc
+ *  shows for it: a poster frame, or with `gif` the whole clip as a looping
+ *  GIF, which plays in place where a doc cannot embed the video. A segment is
  *  a window capture with its captions (on the capture's clock) and its hold;
  *  one segment is the usual clip, the getting-started take adds the TextEdit
  *  shot as a second one, joined with a hard cut. */
-async function encodeAll(segments, flowName) {
+async function encodeAll(segments, flowName, { gif }) {
   const mp4 = path.join(OUT_DIR, `${flowName}.mp4`);
   const webm = path.join(OUT_DIR, `${flowName}.webm`);
-  const poster = path.join(OUT_DIR, `${flowName}-poster.png`);
 
   // Every segment is fitted to the first one's frame (the windows are sized
   // alike; this guards the odd pixel) so concat accepts them. screencapture
@@ -482,8 +489,21 @@ async function encodeAll(segments, flowName) {
     "-movflags", "+faststart", mp4]);
   run(["-y", ...inputs, "-filter_complex", graph, "-map", "[v]", "-an",
     "-c:v", "libvpx-vp9", "-b:v", "0", "-crf", "33", "-row-mt", "1", webm]);
-  run(["-y", "-i", mp4, "-update", "1", "-frames:v", "1", "-q:v", "3", poster]);
-  log(`wrote ${path.relative(repoRoot, mp4)}, .webm, -poster.png`);
+  if (gif) {
+    // Two passes: one 256-colour palette for the whole clip, weighted to the
+    // pixels that change (stats_mode=diff), then each frame mapped onto it.
+    // Undithered, flat UI colours stay flat, and diff_mode=rectangle leaves
+    // the unchanged part of a frame untouched, so the GIF stores only what
+    // moved.
+    const scale = `fps=${GIF_FPS},scale=${Math.min(GIF_WIDTH, args.width)}:-1:flags=lanczos`;
+    const palette = path.join(path.dirname(segments[0].movPath), `${flowName}-palette.png`);
+    run(["-y", "-i", mp4, "-vf", `${scale},palettegen=stats_mode=diff`, palette]);
+    run(["-y", "-i", mp4, "-i", palette, "-lavfi", `${scale}[x];[x][1:v]paletteuse=dither=none:diff_mode=rectangle`,
+      "-loop", "0", path.join(OUT_DIR, `${flowName}.gif`)]);
+  } else {
+    run(["-y", "-i", mp4, "-update", "1", "-frames:v", "1", "-q:v", "3", path.join(OUT_DIR, `${flowName}-poster.png`)]);
+  }
+  log(`wrote ${path.relative(repoRoot, mp4)}, .webm, ${gif ? ".gif" : "-poster.png"}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -493,9 +513,12 @@ async function encodeAll(segments, flowName) {
 // "+ Add Account" UI (which pops a native CSV dialog requiring Accessibility),
 // we pre-seed a tiny manual.transactions ledger on disk so the account shows
 // up with real history — fully in-WebView. "personal" is the account set
-// (top-level folder); the account renders as `assets:cash`.
+// (top-level folder); the account renders as `assets:cash`. The vault is a
+// set-up one: without a base currency the app stops on its first-run setup
+// screen, which only the getting-started take goes through.
 const SEED_ACCOUNT = "assets:cash";
 function seedDemoAccount(ctx) {
+  fs.writeFileSync(path.join(ctx.generated, "config.json"), JSON.stringify({ base_currency: "USD" }, null, 2));
   const dir = path.join(ctx.sources, "personal", "cash");
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(
@@ -709,13 +732,16 @@ async function openInTextEdit(file, frame) {
 }
 
 // ---------------------------------------------------------------------------
-// Flows. `needsAccessibility` flows drive native OS dialogs via osascript.
+// Flows. `needsAccessibility` flows drive native OS dialogs via osascript;
+// `gif` flows get a looping GIF instead of a poster frame.
 // ---------------------------------------------------------------------------
 const FLOWS = {
   // Flow 1 — the README's getting-started video: one continuous take of the
   // three flows in the order a new user meets them, in one throwaway vault
-  // (the folder picked in step 1 is the vault steps 2 and 3 work in).
+  // (the folder picked in step 1 is the vault steps 2 and 3 work in). The
+  // README shows it as a GIF, which plays by itself.
   "getting-started": {
+    gif: true,
     moveConfigAside: true,
     tempRoot: false, // we WANT the first-launch vault picker here
     seed: stageDemoCsv, // no account seed: the take adds the account itself
@@ -735,8 +761,10 @@ const FLOWS = {
     },
   },
 
-  // Flow 2: import a CSV into an account (transactions appear).
+  // Flow 2: import a CSV into an account (transactions appear). The user
+  // guide shows it as a GIF.
   "import-csv": {
+    gif: true,
     moveConfigAside: true,
     tempRoot: true, // current_root → temp vault: no picker, real vault never read or named
     seed: seedImportFlow,
@@ -752,7 +780,9 @@ const FLOWS = {
   },
 
   // Flow 3: add a manual transaction (fully in-WebView, no native dialog).
+  // The user guide shows it as a GIF.
   "manual-txn": {
+    gif: true,
     moveConfigAside: true,
     tempRoot: true, // current_root → temp vault: no picker, real vault never read or named
     seed: seedDemoAccount,
@@ -791,7 +821,7 @@ function startTauriWd() {
   const bin = resolveTauriWd();
   if (!fs.existsSync(bin)) throw new Error(`tauri-wd not found at ${bin}. Install: cargo install tauri-webdriver-automation`);
   // The app inherits this env. An empty EMUACC_INSTANCE keeps the release
-  // window title ("EmuAcc COVID") instead of the worktree suffix a dev build adds.
+  // window title ("EmuAcc") instead of the worktree suffix a dev build adds.
   const proc = spawn(bin, ["--port", String(WD_PORT)], {
     stdio: ["ignore", "ignore", "inherit"],
     env: { ...process.env, EMUACC_INSTANCE: "" },
@@ -809,16 +839,16 @@ function preflight() {
   for (const bin of ["ffmpeg", "ffprobe", "screencapture", "osascript"]) {
     if (!which(bin)) throw new Error(`Required tool not on PATH: ${bin}`);
   }
-  // CRITICAL: refuse to run if another emuacc-covid app is already live (e.g.
+  // CRITICAL: refuse to run if another emuaccounts app is already live (e.g.
   // `tauri dev`). tauri-wd would attach to and drive THAT app — pointed at your
   // REAL vault — instead of the isolated temp-vault binary we launch, recording
   // real data. Stop the other app first.
   // -x matches the app's exact process name only — NOT cargo/rustc build
   // processes that merely reference the binary path in their args.
-  const running = spawnSync("pgrep", ["-x", "emuacc-covid"], { encoding: "utf8" }).stdout.trim();
+  const running = spawnSync("pgrep", ["-x", "emuaccounts"], { encoding: "utf8" }).stdout.trim();
   if (running) {
     throw new Error(
-      "A emuacc-covid app is already running (e.g. `tauri dev`) — refusing to record.\n" +
+      "An emuaccounts app is already running (e.g. `tauri dev`) — refusing to record.\n" +
         "  tauri-wd would drive the running app on your REAL vault, not the isolated demo vault.\n" +
         "  Stop it, then re-run. Running pids: " + running.replace(/\s+/g, " "),
     );
@@ -915,7 +945,7 @@ async function recordFlow(flowName) {
     await driver.quit();
     driver = null;
 
-    if (args.record && args.encode) await encodeAll(segments, flowName);
+    if (args.record && args.encode) await encodeAll(segments, flowName, { gif: cfg.gif });
     else if (args.record) log(`  raw recording(s): ${segments.map((seg) => seg.movPath).join(", ")}`);
     log(`✔ ${flowName} done`);
   } catch (err) {

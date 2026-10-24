@@ -27,7 +27,7 @@ the `tauri-automation` MCP and `scripts/record_demos.mjs` already use.
 - Grant **Accessibility + Automation** permission to your terminal
   (System Settings → Privacy & Security) — the WebDriver session can't drive the
   app window without it.
-- Stop any running `emuacc-covid` (e.g. `tauri dev`) first. `tauri-wd` owns
+- Stop any running `emuaccounts` (e.g. `tauri dev`) first. `tauri-wd` owns
   port 4444; the suite `pkill`s stale `tauri-wd` servers to take the port.
 
 [tauri-webdriver-automation]: https://github.com/danielraffel/tauri-webdriver
@@ -56,7 +56,7 @@ keyed on `selectedBackend()`:
 
 1. **Build.** `tauri-driver` → `tauri build --debug --bundles none`.
    `tauri-wd` → `npm run build` then
-   `cargo build --bin emuacc-covid --features "webdriver tauri/custom-protocol"`
+   `cargo build --bin emuaccounts --features "webdriver tauri/custom-protocol"`
    into the isolated `~/.cache/emuacc-target-mcp` target dir. The `webdriver`
    feature embeds `tauri-plugin-webdriver-automation` so `tauri-wd` can attach;
    the isolated target dir keeps that feature's extra crates from churning the

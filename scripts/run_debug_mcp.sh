@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build emuacc-covid for MCP-based UI verification.
+# Build emuaccounts for MCP-based UI verification.
 #
 # Uses an isolated CARGO_TARGET_DIR so this build does NOT share cache with
 # `run_debug.sh` (which runs `tauri dev`). The two workflows compile with
@@ -33,7 +33,7 @@ echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
 # Kill any previously-launched MCP-build app instance (specifically the
 # binary in this isolated target dir, so we don't disturb `tauri dev` or
 # the installed app).
-pkill -f "$CARGO_TARGET_DIR/debug/emuacc-covid" 2>/dev/null || true
+pkill -f "$CARGO_TARGET_DIR/debug/emuaccounts" 2>/dev/null || true
 
 # Frontend bundle goes into dist/, which tauri-build embeds into the binary
 # via the tauri/custom-protocol feature.
@@ -47,13 +47,13 @@ npm run build
 # reused (no dependency-rebuild churn). Still skips:
 #   - 10 other emuacc-* CLI binaries (saves most of the link work)
 #   - The .app/DMG bundler (saves ~60-120 s of hdiutil + codesign per build)
-echo "Building emuacc-covid + emuacc-query (cargo)..."
+echo "Building emuaccounts + emuacc-query (cargo)..."
 cargo build --manifest-path src-tauri/Cargo.toml \
-  --bin emuacc-covid \
+  --bin emuaccounts \
   --bin emuacc-query \
   --features "webdriver tauri/custom-protocol"
 
-BIN="$CARGO_TARGET_DIR/debug/emuacc-covid"
+BIN="$CARGO_TARGET_DIR/debug/emuaccounts"
 
 echo ""
 echo "Built: $BIN"

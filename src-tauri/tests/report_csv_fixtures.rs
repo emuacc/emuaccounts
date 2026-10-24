@@ -4,8 +4,8 @@
 //!   * Negative values (fees, losses).
 //!   * Locale-safety: decimal separator is always `.`, never `,`.
 
-use emuacc_covid::report_csv::{balances_to_csv, cgt_to_csv, income_to_csv};
-use emuacc_covid::reports::{
+use emuaccounts::report_csv::{balances_to_csv, cgt_to_csv, income_to_csv};
+use emuaccounts::reports::{
     AccountBalance, BalancesReport, CgtEvent, CgtReport, CoinBalance, IncomeEvent, IncomeTaxReport,
 };
 

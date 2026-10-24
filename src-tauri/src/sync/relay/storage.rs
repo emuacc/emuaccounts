@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-use crate::automerge_store::EmuAccMetadata;
+use crate::sync::metadata::EmuAccMetadata;
 
 /// Relay-side storage for a sync group. Stores metadata (Automerge doc)
 /// and blobs using the same CAS layout as ContentStore.

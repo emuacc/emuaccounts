@@ -36,6 +36,10 @@ commodities (the USD/AUD cash legs) are excluded from discovery.
 Output (P-directive format)::
 
     P <YYYY-MM-DD>T00:00:00.000000Z <COMMODITY> <PRICE> <CURRENCY>
+
+A file that already holds rows quoted in another currency than the market's
+(a London listing held at a US broker, kept in GBP by non-usd-prices) is left
+untouched and reported.
 """
 
 import datetime
@@ -105,6 +109,29 @@ def commodity_from_price_stem(stem):
     """Inverse of price_file_stem, for deriving a commodity from a file name.
     Unambiguous because '%' is outside the commodity grammar."""
     return re.sub(r"%([0-9A-Fa-f]{2})", lambda m: chr(int(m.group(1), 16)), stem)
+
+
+# --- one quote currency per file ---------------------------------------------
+# A price plugin reads a file back by date and rewrites every line under the one
+# quote currency it writes. A row already quoted in another currency would be
+# relabelled (GBP 1.9053 AUD becomes GBP 1.9053 USD), a silent revaluation, so a
+# file holding any is left untouched and the conflict is reported instead.
+#
+# This MUST stay identical in every price plugin: like price_file_stem it is
+# copied, not shared, because plugins are installed into vaults standalone.
+def quote_conflict(path, quote):
+    """A warning when a P row in `path` is quoted in anything but `quote`, else None."""
+    others = set()
+    if os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                p = line.split()
+                if len(p) >= 5 and p[0] == "P" and p[4] != quote:
+                    others.add(p[4])
+    if not others:
+        return None
+    return (f"_prices/{os.path.basename(path)} left untouched: it holds prices quoted in "
+            f"{', '.join(sorted(others))} and this plugin writes {quote}")
 
 
 def parse_kv_overrides(raw):
@@ -348,6 +375,10 @@ def main():
                     ok += 1  # already up to date — incremental fetch found nothing
                 else:
                     warnings.append(f"{commodity} ({ticker}): no data returned")
+                continue
+            conflict = quote_conflict(filepath, currency)
+            if conflict:
+                warnings.append(f"{commodity} ({ticker}): {conflict}")
                 continue
 
             ok += 1

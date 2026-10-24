@@ -1,10 +1,9 @@
 // Central app branding — the single frontend source for the product name.
 //
-// Override at build time (no code change) via Vite env vars:
-//   VITE_APP_NAME    short brand  (sidebar, vault picker, PWA short_name)  default "EmuAcc"
-//   VITE_APP_TITLE   full title   (window / browser tab)                   default "EmuAcc COVID"
+// Override at build time (no code change) via a Vite env var:
+//   VITE_APP_NAME    product name (window / browser tab, sidebar, vault picker)  default "EmuAcc"
 //
-// The native shell carries the same name in three static files that a runtime
+// The native shell carries the same name in static files that a runtime
 // variable can't reach — keep these in sync when renaming:
 //   - src-tauri/tauri.conf.json    (productName, window title)
 //   - index.html                   (<title>, apple-mobile-web-app-title)
@@ -12,8 +11,5 @@
 
 const env = import.meta.env as Record<string, string | undefined>;
 
-/** Short brand — shown in the sidebar and vault picker. */
+/** Product name — window/tab title, sidebar and vault picker. */
 export const APP_NAME = env.VITE_APP_NAME ?? "EmuAcc";
-
-/** Full window/tab title; defaults to "<APP_NAME> COVID" (the private variant). */
-export const APP_TITLE = env.VITE_APP_TITLE ?? `${APP_NAME} COVID`;

@@ -93,3 +93,8 @@ jobs:
 
       - name: BDD tests (Rust cucumber suite + UI suite dry-run)
         run: scripts/run_feature_tests.sh
+
+      # Multi-device sync is compiled only with the `sync` feature
+      # (docs/SYNC.md), so the two steps above never run its tests.
+      - name: Sync build tests (cargo nextest + cucumber-rs, --features sync)
+        run: scripts/run_sync_tests.sh

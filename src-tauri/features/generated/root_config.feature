@@ -120,3 +120,19 @@ Feature: Root folder configuration
     And a temporary root whose generated folder has a file tracked by git
     When I set the root directory to that path
     Then no .gitignore should exist in the generated subdirectory
+
+  # --- where the settings live (TASK-128) ---
+  # config.json lives in the platform app-data folder named by the bundle
+  # identifier. The desktop app gets that folder from Tauri; every CLI tool
+  # resolves it through root_config, and EMUACC_APP_DATA_DIR points them at
+  # another one.
+
+  Scenario: The app and its CLI tools keep their settings in the com.emusoftware.emuaccounts folder
+    When I resolve the app's settings folder
+    Then the app's bundle identifier should be "com.emusoftware.emuaccounts"
+    And the settings folder should be named "com.emusoftware.emuaccounts"
+
+  Scenario: A CLI tool reads the vault from the settings EMUACC_APP_DATA_DIR points to
+    Given app settings whose current root is a vault with one "EMUTEST" transaction
+    When I run emuacc-query for commodity "EMUTEST" with EMUACC_APP_DATA_DIR pointing at those settings
+    Then emuacc-query should report 1 transaction

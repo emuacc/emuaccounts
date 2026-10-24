@@ -22,11 +22,7 @@ const MOCK_RESPONSES: Record<string, unknown> = {
   load_account_tree: MOCK_BALANCES,
   load_pipeline_metadata: MOCK_PIPELINE_METADATA,
   get_pipeline_warnings: [],
-  init_metadata: undefined,
-  list_devices: [],
-  get_sync_log: [],
   get_trade_links: [],
-  get_relay_config: null,
   get_account_gaps: [],
   get_source_folder_path: "/mock/path",
 };
@@ -132,8 +128,7 @@ describe("normalStartup invoke rounds", () => {
     expect(r2.sort()).toEqual([
       "get_account_gaps",
       "get_display_config",
-      "get_relay_config",
-      "init_metadata",
+      "get_trade_links",
       "load_account_tree",
       "load_pipeline_metadata",
     ]);
@@ -142,7 +137,7 @@ describe("normalStartup invoke rounds", () => {
     await done;
   });
 
-  it("round 3: dependent operations after tree + config + metadata", async () => {
+  it("round 3: dependent operations after tree + pipeline metadata", async () => {
     const { state, deps, flush } = createHarness();
     const done = normalStartup(state, deps);
 
@@ -153,9 +148,6 @@ describe("normalStartup invoke rounds", () => {
 
     // These all require results from round 2
     expect(r3).toContain("get_pipeline_warnings");
-    expect(r3).toContain("list_devices");
-    expect(r3).toContain("get_sync_log");
-    expect(r3).toContain("get_trade_links");
     expect(r3).toContain("get_source_folder_path");
 
     while ((await flush()).length > 0) { /* drain */ }
@@ -184,18 +176,42 @@ describe("normalStartup invoke rounds", () => {
     expect(allCmds).toContain("load_account_tree");
     expect(allCmds).toContain("load_pipeline_metadata");
     expect(allCmds).toContain("get_display_config");
-    expect(allCmds).toContain("init_metadata");
-    expect(allCmds).toContain("get_relay_config");
     expect(allCmds).toContain("get_account_gaps");
     expect(allCmds).toContain("get_pipeline_warnings");
-    expect(allCmds).toContain("list_devices");
-    expect(allCmds).toContain("get_sync_log");
     expect(allCmds).toContain("get_trade_links");
     expect(allCmds).toContain("get_source_folder_path");
   });
 
+  it("never invokes the multi-device sync commands (only the sync build's src/sync.ts does)", async () => {
+    const { state, deps, flush, rounds } = createHarness();
+    const done = normalStartup(state, deps);
+
+    while ((await flush()).length > 0) { /* drain */ }
+    await done;
+
+    const allCmds = rounds.flat();
+    for (const cmd of ["init_sync", "get_relay_config", "list_devices", "get_sync_log"]) {
+      expect(allCmds, cmd).not.toContain(cmd);
+    }
+  });
+
+  it("leaves the trade links empty when they cannot be read", async () => {
+    const { state, deps, flush } = createHarness();
+    state.tradeLinks = [{ id: "stale" }];
+    deps.invoke = ((orig) => <T>(cmd: string, args?: Record<string, unknown>): Promise<T> => {
+      if (cmd === "get_trade_links") return Promise.reject("unreadable _trade_links.json");
+      return orig<T>(cmd, args);
+    })(deps.invoke);
+    const done = normalStartup(state, deps);
+
+    while ((await flush()).length > 0) { /* drain */ }
+    await done;
+
+    expect(state.tradeLinks).toEqual([]);
+  });
+
   it("is slim: never rebuilds the pipeline or ships the full ledger", async () => {
-    // The backend already runs the pipeline in .setup() at launch; the fat
+    // The backend already rebuilds the vault when it is opened; the fat
     // rebuild_pipeline response carries the entire active ledger (~40MB JSON
     // on a large vault) whose main-thread JSON.parse stalls the WebView.
     const { state, deps, flush, rounds } = createHarness();
@@ -262,7 +278,6 @@ describe("normalStartup invoke rounds", () => {
     expect(state.selectedAccount).toBe("assets:crypto:wallet:ethereum");
     // Not the render fallback's misleading "Parsed (0 transactions)"
     expect(state.status).toBe("Loaded 1 account");
-    expect(state.metadataReady).toBe(true);
     expect(state.accountSetMap).toEqual(MOCK_PIPELINE_METADATA.owner_accounts);
     expect(state.accountFoldersMap).toEqual(MOCK_PIPELINE_METADATA.account_folders);
     // The unverified-balance hint reads this — the slim parse's own
@@ -375,7 +390,7 @@ describe("application is efficient", () => {
     expect(counts.get("list_account_sets")).toBe(1);
   });
 
-  it("when loading the application, config and metadata are fetched once each", async () => {
+  it("when loading the application, config and trade links are fetched once each", async () => {
     const { state, deps, flush, rounds } = createHarness();
     const done = normalStartup(state, deps);
     while ((await flush()).length > 0) { /* drain */ }
@@ -383,8 +398,7 @@ describe("application is efficient", () => {
 
     const counts = countInvokes(rounds);
     expect(counts.get("get_display_config")).toBe(1);
-    expect(counts.get("init_metadata")).toBe(1);
-    expect(counts.get("get_relay_config")).toBe(1);
+    expect(counts.get("get_trade_links")).toBe(1);
   });
 
   it("when loading the application, render is called at most 5 times", async () => {

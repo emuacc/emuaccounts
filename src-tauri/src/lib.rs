@@ -45,9 +45,7 @@ pub fn to_sorted_json_pretty(value: &impl serde::Serialize) -> Result<String, se
 pub mod ai_client;
 pub mod ai_import;
 pub mod ai_suggest;
-pub mod automerge_store;
 pub mod build_cache;
-pub mod content_store;
 pub mod csv_transform;
 pub mod dedupe;
 pub mod derived_cache;
@@ -61,17 +59,18 @@ pub mod ofx_parser;
 pub mod plugins;
 pub mod processing_pipeline;
 pub mod query;
-pub mod relay;
-pub mod relay_client;
 pub mod report_csv;
 pub mod report_templates;
 pub mod reports;
 pub mod root_config;
 pub mod rules;
+pub mod sources_state;
+/// Multi-device sync, compiled only with the `sync` feature (docs/SYNC.md).
+#[cfg(feature = "sync")]
 pub mod sync;
-pub mod sync_state;
 pub mod terminology;
 pub mod trade_link_repair;
+pub mod trade_links;
 pub mod transform_suggest;
 pub mod ui_state;
 pub mod web;

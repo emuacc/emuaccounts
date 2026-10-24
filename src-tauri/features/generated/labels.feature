@@ -64,3 +64,23 @@ Feature: Payee labels
     And a labels file at "bank/_labels.json" matching "*Google Workspace*" on field "payee" with payee "Google Australia"
     When I run the pipeline for month "202501"
     Then transactions with narration "Google Workspace_x.c Sydney AU Card xx1234 Value Date: 15/01/2025" should have payee "Google Australia"
+
+  # Saving, editing and deleting a label each load the folder's _labels.json,
+  # change it and write it back. A file that is there but does not parse (a
+  # hand edit with a trailing comma, sync conflict markers) must stop the
+  # change, or the write would replace every other label with just this one.
+  Scenario Outline: A label change leaves an unparseable labels file untouched
+    Given a clean sources directory
+    And a labels file at "bank/_labels.json" with raw contents:
+      """
+      {"labels": [{"id": "label-keep", "pattern": "*Coffee*", "payee": "Coffee Shop"},]}
+      """
+    When I try to <change> in folder "bank"
+    Then the operation should fail with "bank/_labels.json"
+    And the labels file "bank/_labels.json" should be unchanged
+
+    Examples:
+      | change                                                          |
+      | save a label matching "*Tea*" with payee "Tea House"            |
+      | edit label "label-keep" to match "*Coffee*" with payee "Cafe"   |
+      | delete label "label-keep"                                       |

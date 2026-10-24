@@ -1,6 +1,6 @@
 [plugin]
 name = "Crypto Spot Prices"
-version = "0.3.0"
+version = "0.3.1"
 description = "Single daily crypto spot-price source. Reads a plain-text commodities file (one block per commodity, sources tried in order: Binance -> CoinGecko -> yfinance), backfills full history, and discovers commodities you hold but haven't declared. The core pipeline only reads the price files it writes."
 script = "sync.py"
 daily = true

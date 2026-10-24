@@ -14,6 +14,9 @@ export default defineConfig({
         "src/**/*.test.ts",
         "src/**/*.d.ts",
         "src/main.ts", // wired via DOM events; integration-tested via UI
+        // Only compiled into the sync build (VITE_SYNC=1, docs/SYNC.md); like
+        // main.ts it is DOM-wired.
+        "src/sync.ts",
         "src/types.ts", // pure type declarations, no runtime
         ".covid/**",
         "node_modules/**",

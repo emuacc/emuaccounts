@@ -3,8 +3,8 @@
 //! report command returns serializable JSON on an empty vault.
 
 use serde_json::json;
-use emuacc_covid::web::context::WebCtx;
-use emuacc_covid::web::dispatch::dispatch;
+use emuaccounts::web::context::WebCtx;
+use emuaccounts::web::dispatch::dispatch;
 
 fn empty_ctx() -> (tempfile::TempDir, WebCtx) {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -65,7 +65,7 @@ fn load_ui_state_reads_vault_file() {
     assert_eq!(dispatch(&ctx, "load_ui_state", &json!({})).unwrap(), json!(null));
 
     let value = json!({ "version": 1, "nav": { "sidebarView": "accounts" } });
-    emuacc_covid::ui_state::save_ui_state(&ctx.generated_dir, &value).unwrap();
+    emuaccounts::ui_state::save_ui_state(&ctx.generated_dir, &value).unwrap();
     assert_eq!(dispatch(&ctx, "load_ui_state", &json!({})).unwrap(), value);
 }
 

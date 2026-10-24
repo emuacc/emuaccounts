@@ -10,7 +10,7 @@
 //! against mocked invokes — they cannot catch a regression where this path
 //! starts doing real work, nor a slowdown in `load_cache` itself.
 
-use emuacc_covid::processing_pipeline::{run_pipeline, PipelineConfig};
+use emuaccounts::processing_pipeline::{run_pipeline, PipelineConfig};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -32,7 +32,7 @@ fn make_config(sources: &PathBuf, generated: &PathBuf) -> PipelineConfig {
         generated_dir: generated.clone(),
         now_yyyymm: "202501".to_string(),
         force: false,
-        default_expense_account: emuacc_covid::FALLBACK_EXPENSE_ACCOUNT.to_string(),
+        default_expense_account: emuaccounts::FALLBACK_EXPENSE_ACCOUNT.to_string(),
         changed_folder_hint: None,
     }
 }

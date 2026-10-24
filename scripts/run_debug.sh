@@ -20,7 +20,7 @@
 # sidebar's "Data Folder" label still shows the configured root, not this one.
 set -euo pipefail
 
-APP_DATA="$HOME/Library/Application Support/com.cog32.emuacccovid"
+APP_DATA="$HOME/Library/Application Support/com.emusoftware.emuaccounts"
 CONFIG_FILE="$APP_DATA/config.json"
 
 FRESH=0
@@ -72,7 +72,7 @@ export EMUACC_PLUGIN_CATALOG="$PWD/plugins"
 
 # Kill previous dev server and Tauri instances
 lsof -ti:1420 2>/dev/null | xargs kill 2>/dev/null || true
-pkill -f 'emuacc-covid' 2>/dev/null || true
+pkill -x emuaccounts 2>/dev/null || true
 
 if [ -n "$ROOT" ] && [ -d "plugins" ]; then
   echo "Installing plugins to $ROOT/plugins..."

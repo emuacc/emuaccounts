@@ -1,6 +1,6 @@
 #![deny(warnings)]
 
-use emuacc_covid::relay::server::{RelayConfig, RelayServer};
+use emuaccounts::sync::relay::server::{RelayConfig, RelayServer};
 use std::path::PathBuf;
 
 fn main() {

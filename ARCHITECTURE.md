@@ -20,8 +20,8 @@ and report is derived from that ledger. The principles behind it are in the
   as a warning badge on the account rather than failing the whole build.
 - **Incremental build.** A SHA256 content hash plus a directory fingerprint per
   folder lets a rebuild skip everything that didn't change. A file watcher on
-  `sources/` recompiles automatically whenever a file changes, except the relay
-  sync state (see [Data file locations](USER_GUIDE.md#data-file-locations)).
+  `sources/` recompiles automatically whenever a file changes, except the app's
+  own trade-link store (see [Files the app keeps in sources/](USER_GUIDE.md#files-the-app-keeps-in-sources)).
 - **Generated** (`generated/`) is the compiled output: per-folder ledgers plus a
   unified active ledger per account set. It is derived and never hand-edited —
   delete it and it rebuilds from `sources/`.
@@ -56,12 +56,17 @@ and report is derived from that ledger. The principles behind it are in the
 - **Desktop app.** A [Tauri](https://tauri.app) app — a Rust core with a WebView
   UI. The UI queries the generated ledgers; user actions (import, add/classify
   transactions, link trades) write back to `sources/` and trigger a rebuild, so the
-  ledger stays the single source of truth.
+  ledger stays the single source of truth. The main thread only runs the window:
+  opening a data folder rebuilds it on a background thread behind a "Rebuilding
+  cache" screen, and every command except the UI's log line runs off the main
+  thread, so a minutes-long rebuild of a large vault never freezes the window.
 - **Plugins** fetch external data and only ever write to `sources/`, where it
   flows through the normal pipeline ([PLUGINS.md](PLUGINS.md)).
-- **Sync.** Changes are stored locally in an [Automerge](https://automerge.org) CRDT
-  and can be synced across devices through a self-hosted relay (see
-  [Multi-device sync](USER_GUIDE.md#multi-device-sync)).
+- **Trade links** are kept in a plain JSON file, `sources/_trade_links.json`, laid
+  out like `_rules.json` so a changed link reviews as a small diff. Syncing devices
+  through a self-hosted relay (an [Automerge](https://automerge.org) document of
+  sync metadata) is unfinished, so only an opt-in build compiles it
+  ([docs/SYNC.md](docs/SYNC.md)).
 
 The CLI mirrors the app: `emuacc-regenerate` runs the same pipeline headlessly,
 and `emuacc-query` reads the generated ledgers (see

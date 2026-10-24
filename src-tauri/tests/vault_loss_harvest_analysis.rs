@@ -6,13 +6,13 @@
 //! Inert unless `EMUACC_ANALYZE_VAULT=1` so it never runs in normal suites.
 //! EMUACC_VAULT names the vault root; the run fails without it.
 
-use emuacc_covid::generated_store::{
+use emuaccounts::generated_store::{
     filter_hidden_accounts, load_active_ledger, load_hidden_accounts,
 };
-use emuacc_covid::ledger_parser::PriceGraph;
-use emuacc_covid::processing_pipeline::{auto_link_equity_swaps, PipelineMetadata};
-use emuacc_covid::report_templates::load_tax_config;
-use emuacc_covid::reports::{generate_loss_harvest_report, holdings_as_of, AccountAllowlist};
+use emuaccounts::ledger_parser::PriceGraph;
+use emuaccounts::processing_pipeline::{auto_link_equity_swaps, PipelineMetadata};
+use emuaccounts::report_templates::load_tax_config;
+use emuaccounts::reports::{generate_loss_harvest_report, holdings_as_of, AccountAllowlist};
 use std::collections::BTreeSet;
 use std::path::Path;
 

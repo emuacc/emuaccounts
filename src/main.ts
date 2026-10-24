@@ -4,7 +4,7 @@ import { bindOnceDuring } from "./bind-once";
 import { ROW_AI_SPARKLE_SELECTOR } from "./ai-sparkle";
 import { buildSaveRuleArgs } from "./save-rule-args";
 import { invoke, listen, open, confirm, save } from "./ipc";
-import { APP_NAME, APP_TITLE } from "./app-config";
+import { APP_NAME } from "./app-config";
 import type {
   Posting, Transaction, CommodityAmount, AccountBalance, AccountFolders, AccountProperties,
   Diagnostic, ParseResponse, QueryResult, PipelineResult, PipelineResponse,
@@ -60,6 +60,7 @@ import { type SearchPill, parseSmartInput, toFlatString, renderSmartSearch, atta
 import { collectIssues, buildAccountIssueCounts, type IssueGroup, type AccountGap } from "./issues";
 import { loadTreeBaseTotals } from "./currency-totals";
 import { chosenBaseCurrency, needsBaseCurrencySetup, preselectBaseCurrency, renderBaseCurrencySetup } from "./base-currency-setup";
+import { renderVaultRebuilding, waitForVaultRebuild } from "./vault-rebuild";
 import { applyPipelineResponse, applyMutationResponse, applyParse, type MutationResponse } from "./apply-pipeline";
 import { MutationQueue } from "./mutation-queue";
 import {
@@ -84,6 +85,10 @@ import {
 import { displayName, escapeText, highlightNonAscii } from "./text";
 import { type DateFilter, dateFilterStart, nowYYYYMM, nowYYYYMMDD, fyDateRange } from "./date-helpers";
 import { syncPerformanceChart, syncPerformanceGrowthChart } from "./performance-chart";
+import type { SyncUi } from "./sync";
+
+/** Set at boot in the sync build only; undefined in a default build. */
+let syncUi: SyncUi | undefined;
 
 function formatAmount(amount: number, commodity: string): string {
   return formatAmountPure(amount, commodity, state.displayConfig);
@@ -459,42 +464,6 @@ type ManualTransactionInput = {
   postings: ManualPostingInput[];
 };
 
-type SyncEvent = {
-  timestamp: number;
-  device_id: string;
-  event_type: string;
-  target_id: string;
-  details: string;
-};
-
-type DeviceInfo = {
-  device_id: string;
-  device_name: string;
-  last_seen: number;
-};
-
-type SyncResponse = {
-  files_transferred: number;
-  metadata_merged: boolean;
-};
-
-type PairInitiateResult = {
-  group_id: string;
-  pairing_code: string;
-  expires_in: number;
-};
-
-type RelayConfig = {
-  relay_url: string;
-  group_id: string;
-};
-
-type RelaySyncResponse = {
-  metadata_merged: boolean;
-  blobs_uploaded: number;
-  blobs_downloaded: number;
-};
-
 type TreeNode = {
   name: string;
   fullPath: string;
@@ -740,8 +709,8 @@ if (!app) {
   throw new Error("#app not found");
 }
 
-// Product name lives in one place (src/app-config.ts); override via VITE_APP_TITLE.
-document.title = APP_TITLE;
+// Product name lives in one place (src/app-config.ts); override via VITE_APP_NAME.
+document.title = APP_NAME;
 
 // Debug log — captures console.warn, console.error, unhandled rejections, and
 // explicit pushDebug entries. Kept in memory for `__diag` (MCP inspection) and
@@ -1173,17 +1142,15 @@ async function refreshHeavy(state: AppState): Promise<void> {
     loadAccountTotalValue(state).finally(() => mark("account total value")),
     _loadTreeBaseCurrencyTotals(state).finally(() => mark("tree base-currency totals")),
   ]);
-  if (state.metadataReady) {
-    try {
-      const suggestions = await invoke<TradeSuggestion[]>("suggest_trade_links_cmd", {
-        accountSet: state.selectedAccountSet ?? "",
-        baseCurrency: state.displayConfig?.base_currency ?? null,
-      });
-      state.tradeSuggestions = suggestions;
-      mark(`trade suggestions (${suggestions.length})`);
-    } catch (e) {
-      console.warn("trade suggestions failed:", e);
-    }
+  try {
+    const suggestions = await invoke<TradeSuggestion[]>("suggest_trade_links_cmd", {
+      accountSet: state.selectedAccountSet ?? "",
+      baseCurrency: state.displayConfig?.base_currency ?? null,
+    });
+    state.tradeSuggestions = suggestions;
+    mark(`trade suggestions (${suggestions.length})`);
+  } catch (e) {
+    console.warn("trade suggestions failed:", e);
   }
   render(state);
 }
@@ -1777,16 +1744,6 @@ function renderSidebarContent(state: AppState, tree: TreeNode[], selectedAccount
   return renderReportMenu(state.selectedReport);
 }
 
-function renderSidebarSync(state: AppState): string {
-  const relayHtml = state.relayConfig
-    ? `<div class="relayStatus"><div class="relayStatus__label">Relay</div><div class="relayStatus__url">${escapeText(state.relayConfig.relay_url)}</div><button id="relaySyncBtn" class="btn btn--full" type="button" ${state.busy ? "disabled" : ""}>Sync Now</button></div>`
-    : `<button id="relayPairBtn" class="btn btn--secondary btn--full" type="button" style="margin-top:4px" ${state.busy ? "disabled" : ""}>Pair Device</button>`;
-  const devicesHtml = state.devices && state.devices.length > 0
-    ? `<div class="syncDevices"><div class="syncDevices__title">Devices</div>${state.devices.map((d) => `<div class="syncDevices__item"><span class="syncDevices__name">${escapeText(d.device_name)}</span><span class="syncDevices__id">${escapeText(d.device_id)}</span></div>`).join("")}</div>`
-    : "";
-  return `<details class="syncAccordion"><summary class="syncAccordion__toggle">Sync</summary><div class="syncAccordion__body">${relayHtml}<button id="syncViewLogBtn" class="btn btn--secondary btn--full" type="button" style="margin-top:4px">View Sync Log</button>${devicesHtml}</div></details>`;
-}
-
 function renderSidebar(state: AppState, tree: TreeNode[], selectedAccount: string | undefined, balances: AccountBalance[], issueCounts: Map<string, number>): string {
   const navItems = (["accounts", "categories", "reports", "plugins"] as const).map((view) => {
     const icons: Record<string, string> = {
@@ -1804,10 +1761,10 @@ function renderSidebar(state: AppState, tree: TreeNode[], selectedAccount: strin
     : "";
 
   return `<aside class="sidebar">
-    <div class="sidebar__top"><div class="brandLockup"><img class="brandMark" src="/brand/emu-light.png" alt="" /><div class="brandText"><div class="brand">${APP_NAME}</div><div class="brandSub">Understand your accounts</div></div></div></div>
+    <div class="sidebar__top"><div class="brandLockup"><img class="brandMark" src="/brand/emu-light.png" alt="" /><div class="brandText"><div class="brand">${APP_NAME}</div><div class="brandSub" data-testid="brand-tagline">Understand your finances</div></div></div></div>
     <nav class="sidebarNav">${navItems}</nav>
     <div class="sidebar__section">${renderSidebarContent(state, tree, selectedAccount, issueCounts)}</div>
-    <div class="sidebar__bottom"><button id="globalSettingsBtn" class="sidebarSettingsBtn" type="button" title="Global Settings">⚙ Settings</button>${dataFolderHtml}${renderSidebarSync(state)}</div>
+    <div class="sidebar__bottom"><button id="globalSettingsBtn" class="sidebarSettingsBtn" type="button" title="Global Settings">⚙ Settings</button>${dataFolderHtml}${syncUi?.renderSidebar() ?? ""}</div>
   </aside>`;
 }
 
@@ -2650,37 +2607,6 @@ function renderTransformModal(state: AppState): string {
   </div>`;
 }
 
-function renderSyncLogModal(state: AppState): string {
-  if (!state.syncLogOpen) return "";
-  return `<div class="modalOverlay" role="dialog" aria-modal="true" data-testid="sync-log-modal">
-    <div class="modal modal--wide">
-      <div class="modal__title">Sync Log</div>
-      ${state.devices && state.devices.length > 0 ? `<div class="syncLogDevices"><strong>Known devices:</strong> ${state.devices.map((d) => `<span class="syncLogDevice">${escapeText(d.device_name)} (${escapeText(d.device_id)}) — last seen ${new Date(d.last_seen * 1000).toLocaleString()}</span>`).join(", ")}</div>` : ""}
-      ${state.syncLog && state.syncLog.length > 0 ? `<table class="syncLogTable"><thead><tr><th>Time</th><th>Device</th><th>Event</th><th>Details</th></tr></thead><tbody>${state.syncLog.slice().reverse().map((e) => `<tr><td>${escapeText(new Date(e.timestamp * 1000).toLocaleString())}</td><td>${escapeText(e.device_id)}</td><td><span class="syncLogEvent__type">${escapeText(e.event_type)}</span></td><td>${escapeText(e.details)}</td></tr>`).join("")}</tbody></table>` : `<div class="syncLogEmpty">No sync events yet.</div>`}
-      <div class="modal__actions"><button id="syncLogExport" class="btn btn--secondary">Export JSON</button><button id="syncLogClose" class="btn">Close</button></div>
-    </div>
-  </div>`;
-}
-
-function renderRelayPairingModal(state: AppState): string {
-  if (!state.relayPairingOpen) return "";
-  const d = state.busy ? "disabled" : "";
-  let body: string;
-  if (!state.relayPairingMode) {
-    body = `<label class="field"><div class="field__label">Relay Server URL</div><input id="relayUrlInput" class="field__input" value="" placeholder="http://your-server:8384" ${d} /></label>
-      <div class="modal__actions" style="margin-top:12px"><button id="relayPairCancel" class="btn btn--secondary" ${d}>Cancel</button><button id="relayCreateCode" class="btn btn--secondary" ${d}>Create Code</button><button id="relayEnterCode" class="btn" ${d}>Enter Code</button></div>`;
-  } else if (state.relayPairingMode === "create") {
-    body = `<div class="pairingCode"><div class="pairingCode__label">Share this code with the other device:</div><div class="pairingCode__value">${escapeText(state.relayPairingCode ?? "")}</div></div>
-      ${state.relayPairingError ? `<div class="modal__error">${escapeText(state.relayPairingError)}</div>` : ""}
-      <div class="modal__actions"><button id="relayPairDone" class="btn">Done</button></div>`;
-  } else {
-    body = `<label class="field"><div class="field__label">Enter the 6-digit pairing code</div><input id="relayJoinCodeInput" class="field__input" maxlength="6" placeholder="000000" ${d} /></label>
-      ${state.relayPairingError ? `<div class="modal__error">${escapeText(state.relayPairingError)}</div>` : ""}
-      <div class="modal__actions"><button id="relayPairCancel2" class="btn btn--secondary" ${d}>Cancel</button><button id="relayJoinSubmit" class="btn" ${d}>Join</button></div>`;
-  }
-  return `<div class="modalOverlay" role="dialog" aria-modal="true" data-testid="relay-pairing-modal"><div class="modal"><div class="modal__title">Pair Device</div>${body}</div></div>`;
-}
-
 function renderAiSuggestModal(state: AppState): string {
   if (!state.aiSuggest) return "";
   const ai = state.aiSuggest;
@@ -2719,8 +2645,7 @@ function renderModals(state: AppState): string {
     + renderOpeningBalanceModal(state)
     + renderSetPriceModal(state)
     + renderTransformModal(state)
-    + renderSyncLogModal(state)
-    + renderRelayPairingModal(state)
+    + (syncUi?.renderModals() ?? "")
     + renderAiSuggestModal(state)
     + renderDocImportModal(state.docImportDraft, state.busy)
     + (state.addPluginsModalOpen ? buildAddPluginsModalHtml(state.availablePlugins ?? [], state.pluginInstalling) : "");
@@ -3085,21 +3010,25 @@ async function switchVault(path: string): Promise<void> {
  * exercising the startup gates without a page reload. */
 async function reopenVault(state: AppState): Promise<void> {
   resetVaultScopedState(state as unknown as Record<string, unknown>);
+  syncUi?.reset();
   resetNavHistory();
   render(state);
   await startVault(state, { priceSync: false });
 }
 
-/** Everything that runs once a vault is known: the base-currency gate, then
- * the vault's persisted UI state, then the normal startup. Both the launch
- * path and vault switching go through here; the setup screen's Continue
- * button re-enters it once the currency is saved. */
+/** Everything that runs once a vault is known: the wait for the backend's
+ * rebuild of it, the base-currency gate, then the vault's persisted UI state,
+ * then the normal startup. Both the launch path and vault switching go through
+ * here; the setup screen's Continue button re-enters it once the currency is
+ * saved. */
 async function startVault(state: AppState, opts: { priceSync: boolean }): Promise<void> {
+  await waitForVaultRebuild(state, { invoke, render: () => render(state) });
   if (!(await ensureBaseCurrency(state))) return; // setup screen owns the rest
   await loadAndApplyUiState(state);
   pushNav(state);
   updateNavFlags(state);
   await normalStartup();
+  await syncUi?.load();
   // Background backfill of daily prices (no-op unless the setting is enabled).
   if (opts.priceSync) void maybeRunStartupPriceSync();
 }
@@ -3165,11 +3094,16 @@ function renderBaseCurrencySetupScreen(state: AppState): void {
   (input ?? select)?.focus();
 }
 
-/** First-run setup screens, in order: data folder, then base currency. Returns
- * true when one of them owns the window and the main page must not render. */
+/** Screens that stand in for the main page, in order: data folder, the
+ * rebuild of the folder just opened, then base currency. Returns true when one
+ * of them owns the window and the main page must not render. */
 function renderSetupGate(state: AppState): boolean {
   if (state.showVaultPicker) {
     renderVaultPickerScreen(state);
+    return true;
+  }
+  if (state.rebuildingCache) {
+    app.innerHTML = renderVaultRebuilding(APP_NAME);
     return true;
   }
   if (state.showBaseCurrencySetup) {
@@ -3794,8 +3728,11 @@ function attachRenderHandlers(state: AppState, vs: RenderViewState): void {
   attachAccountDataHandlers(state, vs);
   // ── Group 3: AI suggest & account management ──
   attachAiAccountHandlers(state, vs);
-  // ── Group 4: Price, sync, relay, transform ──
-  attachModalSyncHandlers(state);
+  // ── Group 4: Price, transform and document-import modals; data folder ──
+  attachSetPriceModalHandlers(state);
+  attachTransformAndDocImportHandlers(state);
+  attachDataFolderHandler();
+  syncUi?.attachHandlers();
   // ── Group 5–7: Rule editor, txn table, table controls (share closures) ──
   attachRuleAndTableHandlers(state, vs);
 }
@@ -5404,8 +5341,7 @@ function attachAiAccountHandlers(state: AppState, vs: RenderViewState): void {
   });
 }
 
-function attachModalSyncHandlers(state: AppState): void {
-  // Set-price modal handlers
+function attachSetPriceModalHandlers(state: AppState): void {
   document.getElementById("setPriceCancel")?.addEventListener("click", () => {
     state.setPriceDraft = undefined;
     render(state);
@@ -5460,79 +5396,10 @@ function attachModalSyncHandlers(state: AppState): void {
       render(state);
     }
   });
-
-  // Sync handlers
-  const syncViewLogBtn = document.querySelector<HTMLButtonElement>("#syncViewLogBtn");
-  syncViewLogBtn?.addEventListener("click", async () => {
-    try {
-      const syncLog: SyncEvent[] = await invoke("get_sync_log");
-      const devices: DeviceInfo[] = await invoke("list_devices");
-      state.syncLog = syncLog;
-      state.devices = devices;
-    } catch {
-      // May fail if metadata not initialized, show empty
-    }
-    state.syncLogOpen = true;
-    render(state);
-  });
-
-  const syncLogClose = document.querySelector<HTMLButtonElement>("#syncLogClose");
-  syncLogClose?.addEventListener("click", () => {
-    state.syncLogOpen = false;
-    render(state);
-  });
-
-  const syncLogExport = document.querySelector<HTMLButtonElement>("#syncLogExport");
-  syncLogExport?.addEventListener("click", () => {
-    const data = JSON.stringify(
-      { syncLog: state.syncLog ?? [], devices: state.devices ?? [] },
-      null,
-      2,
-    );
-    const blob = new Blob([data], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `sync-log-${new Date().toISOString().slice(0, 10)}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-  });
-
-  attachRelaySyncHandlers(state);
 }
 
-// eslint-disable-next-line complexity -- pre-existing; decomposition tracked on the refactor-main branch
-function attachRelaySyncHandlers(state: AppState): void {
-  // Relay handlers
-  const relayPairBtn = document.querySelector<HTMLButtonElement>("#relayPairBtn");
-  relayPairBtn?.addEventListener("click", () => {
-    state.relayPairingOpen = true;
-    state.relayPairingMode = undefined;
-    state.relayPairingCode = undefined;
-    state.relayPairingError = undefined;
-    render(state);
-  });
-
-  const relaySyncBtn = document.querySelector<HTMLButtonElement>("#relaySyncBtn");
-  relaySyncBtn?.addEventListener("click", async () => {
-    state.busy = true;
-    state.status = "Syncing with relay...";
-    render(state);
-    try {
-      const result = await invoke<RelaySyncResponse>("sync_with_relay_cmd");
-      const devices: DeviceInfo[] = await invoke("list_devices");
-      const syncLog: SyncEvent[] = await invoke("get_sync_log");
-      state.devices = devices;
-      state.syncLog = syncLog;
-      state.status = `Synced: ${result.blobs_uploaded} up, ${result.blobs_downloaded} down`;
-    } catch (err) {
-      state.status = `Sync failed: ${String(err)}`;
-    }
-    state.busy = false;
-    render(state);
-  });
-
-  // Root folder change handler
+/** The sidebar's data-folder "Change" button: pick a folder and switch the vault to it. */
+function attachDataFolderHandler(): void {
   const changeRootBtn = document.querySelector<HTMLButtonElement>("#changeRootBtn");
   changeRootBtn?.addEventListener("click", async () => {
     const selected = await open({ directory: true, multiple: false });
@@ -5544,107 +5411,9 @@ function attachRelaySyncHandlers(state: AppState): void {
       }
     }
   });
+}
 
-  const relayPairCancel = document.querySelector<HTMLButtonElement>("#relayPairCancel");
-  relayPairCancel?.addEventListener("click", () => {
-    state.relayPairingOpen = false;
-    state.pendingRelayConfig = undefined;
-    render(state);
-  });
-
-  const relayCreateCode = document.querySelector<HTMLButtonElement>("#relayCreateCode");
-  relayCreateCode?.addEventListener("click", async () => {
-    const relayUrl = document.querySelector<HTMLInputElement>("#relayUrlInput")?.value?.trim() ?? "";
-    if (!relayUrl) {
-      state.relayPairingError = "Enter a relay URL";
-      render(state);
-      return;
-    }
-    state.busy = true;
-    state.status = "Creating pairing code...";
-    render(state);
-    try {
-      const result = await invoke<PairInitiateResult>("pair_initiate", { relayUrl });
-      state.relayPairingMode = "create";
-      state.relayPairingCode = result.pairing_code;
-      state.pendingRelayConfig = { relay_url: relayUrl, group_id: result.group_id };
-      state.status = undefined;
-    } catch (err) {
-      state.relayPairingError = String(err);
-      state.status = `Pairing failed: ${String(err)}`;
-    }
-    state.busy = false;
-    render(state);
-  });
-
-  const relayEnterCode = document.querySelector<HTMLButtonElement>("#relayEnterCode");
-  relayEnterCode?.addEventListener("click", () => {
-    const relayUrl = document.querySelector<HTMLInputElement>("#relayUrlInput")?.value?.trim() ?? "";
-    if (!relayUrl) {
-      state.relayPairingError = "Enter a relay URL";
-      render(state);
-      return;
-    }
-    state.relayPairingMode = "join";
-    // Store URL temporarily for the join step
-    (state as Record<string, unknown>)._relayUrl = relayUrl;
-    render(state);
-  });
-
-  const relayPairCancel2 = document.querySelector<HTMLButtonElement>("#relayPairCancel2");
-  relayPairCancel2?.addEventListener("click", () => {
-    state.relayPairingOpen = false;
-    state.relayPairingMode = undefined;
-    state.pendingRelayConfig = undefined;
-    render(state);
-  });
-
-  const relayJoinSubmit = document.querySelector<HTMLButtonElement>("#relayJoinSubmit");
-  relayJoinSubmit?.addEventListener("click", async () => {
-    const code = document.querySelector<HTMLInputElement>("#relayJoinCodeInput")?.value?.trim() ?? "";
-    if (!code || code.length !== 6) {
-      state.relayPairingError = "Enter a 6-digit code";
-      render(state);
-      return;
-    }
-    const relayUrl = (state as Record<string, unknown>)._relayUrl as string;
-    state.busy = true;
-    state.status = "Joining...";
-    render(state);
-    try {
-      const groupId = await invoke<string>("pair_join", { relayUrl, pairingCode: code });
-      await invoke("save_relay_config", { relayUrl, groupId });
-      state.relayConfig = { relay_url: relayUrl, group_id: groupId };
-      state.relayPairingOpen = false;
-      state.relayPairingMode = undefined;
-      state.status = "Paired successfully";
-    } catch (err) {
-      state.relayPairingError = String(err);
-      state.status = `Join failed: ${String(err)}`;
-    }
-    state.busy = false;
-    render(state);
-  });
-
-  const relayPairDone = document.querySelector<HTMLButtonElement>("#relayPairDone");
-  relayPairDone?.addEventListener("click", async () => {
-    if (state.pendingRelayConfig) {
-      try {
-        await invoke("save_relay_config", {
-          relayUrl: state.pendingRelayConfig.relay_url,
-          groupId: state.pendingRelayConfig.group_id,
-        });
-        state.relayConfig = state.pendingRelayConfig;
-      } catch (err) {
-        state.status = `Failed to save relay config: ${String(err)}`;
-      }
-      state.pendingRelayConfig = undefined;
-    }
-    state.relayPairingOpen = false;
-    state.relayPairingMode = undefined;
-    render(state);
-  });
-
+function attachTransformAndDocImportHandlers(state: AppState): void {
   // Transform modal handlers
   const transformCancel = document.querySelector<HTMLButtonElement>("#transformCancel");
   transformCancel?.addEventListener("click", () => {
@@ -6876,8 +6645,7 @@ function attachRuleEditorPageHandlers(state: AppState): void {
       state.transformDraft = undefined;
       state.ruleEditorDraft = undefined;
       state.labelEditorDraft = undefined;
-      state.syncLogOpen = false;
-      state.relayPairingOpen = false;
+      syncUi?.closeModals();
       render(state);
     });
   });
@@ -7107,15 +6875,6 @@ type AppState = {
   docImportDraft?: DocImportDraft;
   // Documents still queued behind the one currently in the preview modal.
   docImportQueue?: string[];
-  syncLogOpen?: boolean;
-  syncLog?: SyncEvent[];
-  devices?: DeviceInfo[];
-  relayConfig?: RelayConfig;
-  relayPairingOpen?: boolean;
-  relayPairingMode?: "create" | "join";
-  relayPairingCode?: string;
-  relayPairingError?: string;
-  pendingRelayConfig?: RelayConfig;
   accountGaps?: AccountGap[];
   searchError?: string;
   ruleEditorDraft?: {
@@ -7189,7 +6948,6 @@ type AppState = {
   tradeLinks: TradeLink[];
   tradeSuggestions: TradeSuggestion[];
   tradeLinkSelection?: string;
-  metadataReady?: boolean;
   sidebarView: "accounts" | "categories" | "reports" | "rule-editor" | "label-editor" | "plugins";
   pluginsList?: PluginInfo[];
   availablePlugins?: AvailablePluginInfo[];
@@ -7256,6 +7014,8 @@ type AppState = {
   rootDir?: string;
   knownRoots: string[];
   showVaultPicker?: boolean;
+  /** The backend is rebuilding the vault just opened (see vault-rebuild.ts). */
+  rebuildingCache?: boolean;
   /** First-run setup step 2: the vault has no base currency yet. */
   showBaseCurrencySetup?: boolean;
   baseCurrencyCandidates?: string[];
@@ -7578,6 +7338,11 @@ async function maybeRunStartupPriceSync(): Promise<void> {
 }
 
 (async () => {
+  // The sync build (VITE_SYNC=1, docs/SYNC.md) adds the multi-device sync UI; a default build compiles none of it.
+  if (import.meta.env.VITE_SYNC === "1") {
+    const { createSyncUi } = await import("./sync");
+    syncUi = createSyncUi({ app: state, render: () => render(state) });
+  }
   // Check if a root folder is configured
   try {
     const hasRoot = await invoke<boolean>("has_root_dir");

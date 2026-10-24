@@ -6,11 +6,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use emuacc_covid::dedupe::apply::{apply, archive_timestamp, write_report, Report};
-use emuacc_covid::dedupe::csv as dcsv;
-use emuacc_covid::dedupe::ofx as dofx;
-use emuacc_covid::dedupe::plan::{DupeKind, FolderPlan, StripLocations};
-use emuacc_covid::root_config;
+use emuaccounts::dedupe::apply::{apply, archive_timestamp, write_report, Report};
+use emuaccounts::dedupe::csv as dcsv;
+use emuaccounts::dedupe::ofx as dofx;
+use emuaccounts::dedupe::plan::{DupeKind, FolderPlan, StripLocations};
+use emuaccounts::root_config::{self, platform_app_data_dir};
 
 fn print_usage() {
     eprintln!("Usage: emuacc-dedupe [OPTIONS]");
@@ -28,32 +28,6 @@ fn print_usage() {
     eprintln!("  --verbose          Print per-key/per-row drop detail");
     eprintln!("  --sources-dir PATH Override sources directory");
     eprintln!("  --help             Show this help");
-}
-
-fn platform_app_data_dir() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join("Library/Application Support/com.cog32.emuacccovid");
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(data) = std::env::var("XDG_DATA_HOME").ok().or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| format!("{h}/.local/share"))
-        }) {
-            return PathBuf::from(data).join("com.cog32.emuacccovid");
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            return PathBuf::from(appdata).join("com.cog32.emuacccovid");
-        }
-    }
-    PathBuf::from(".")
 }
 
 fn resolve_sources_dir(override_path: Option<&Path>) -> PathBuf {

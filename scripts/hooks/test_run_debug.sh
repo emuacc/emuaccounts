@@ -6,7 +6,7 @@
 #
 # npm, cargo, lsof, pkill and rsync are stubs on PATH that only record their
 # arguments, so nothing is built, launched, synced or killed (the real launcher
-# stops any running emuacc-covid).
+# stops any running emuaccounts).
 #
 # The per-vault wrappers (scripts/run_*_debug.sh) are one person's launchers
 # and are not published, so the wrapper section covers whichever exist and
