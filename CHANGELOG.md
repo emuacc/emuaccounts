@@ -12,7 +12,33 @@ built (`.github/workflows/build.yml`), and `scripts/release_ready.py` refuses
 to hand out the tag command while the section is missing. Use absolute links
 inside a section: it is read on the release page as well as in this file.
 
-## 0.1.2 - unreleased
+## 0.1.3 - unreleased
+
+This release irons out installing: a download opens on macOS again, and the
+Linux AppImage opens on distributions with a current graphics stack. The app
+and its installers are version 0.1.3, and `generated/generator.json` records
+0.1.3 as the version that wrote a data folder. (TASK-136)
+
+Getting started, in one take recorded from this release — choose a data
+folder and add an account, import a CSV, add a manual transaction, then open
+the ledger text file the pipeline wrote from all of it:
+[watch the recording](https://github.com/emuacc/emuaccounts/blob/v0.1.3/docs/demos/getting-started.mp4)
+(the README plays it as a looping GIF). (TASK-138)
+
+### New
+
+- EmuAcc's icon is the emu from the top of the sidebar, on the sidebar's navy, in place of the plain blue square: in the Dock or taskbar, on the installers, and on the [phone view](https://github.com/emuacc/emuaccounts/blob/v0.1.3/docs/PWA.md) added to a home screen. The 0.1.2 downloads already carried it, but their notes left it out. (TASK-123)
+
+### Fixed
+
+- The Linux AppImage opens on distributions with a current graphics stack, such as Arch and Fedora 44 (Mesa 26). Before, it shipped its own older copy of the Wayland client library, and the system's graphics driver failed to load against it: the app's web view aborted at launch ("Could not create default EGL display: EGL_BAD_PARAMETER") and the window stayed blank. The AppImage now uses the system's copy, and on a Wayland desktop it runs as a native Wayland window instead of through XWayland. (TASK-134)
+- On macOS, a downloaded EmuAcc opens again. macOS refused 0.1.2 with "“EmuAcc” is damaged and can't be opened", with no way past it, because the app as a whole carried no valid signature. The app is now signed, so macOS asks once instead: click **Open Anyway** in System Settings > Privacy & Security, as the [install steps](https://github.com/emuacc/emuaccounts/blob/v0.1.3/USER_GUIDE.md#macos) describe. `EmuAcc.app.zip` opens too; in 0.1.2 the programs inside it had lost their permission to run. (TASK-135)
+
+### Breaking changes
+
+None.
+
+## 0.1.2 - 2026-10-24
 
 This release removes obvious errors: a window that froze while a large data
 folder rebuilt, label edits that could wipe a folder's labels, and price files

@@ -10,7 +10,8 @@ tell them apart from the other installs that live on a developer Mac.
 | Rust | **1.98.0** — rustup toolchain `1.98.0-aarch64-apple-darwin` | `rust-toolchain.toml` (channel `1.98.0`, minimal profile + rustfmt, clippy, llvm-tools); `src-tauri/Cargo.toml` `rust-version = "1.98"`; `dtolnay/rust-toolchain@1.98.0` in `.github/workflows/ci.yml` and `build.yml` | Every Cargo build and test |
 | Java | **OpenJDK 21** — Homebrew `openjdk@21` (21.0.12.1 at time of writing) | `.java-version` (`21`); `actions/setup-java` 21 in the CI `grammar-drift` job; `scripts/generate_ledger_parsers.sh` refuses anything older than 21 | Only `scripts/generate_ledger_parsers.sh` (ANTLR → Rust). Ordinary builds never invoke Java |
 | ANTLR | antlr4rust runtime `=0.5.2` (a dev-dependency: test builds only); generator jar antlr4rust v0.5.0 (ANTLR 4.13.3), sha256-verified on download | `src-tauri/Cargo.toml`; `scripts/generate_ledger_parsers.sh` | Committed sources in `src-tauri/src/ledger_parser/generated/`, used only by the grammar parity tests |
-| Node | 24 | `.nvmrc` (`.github/workflows/build.yml` currently installs Node 20) | Vite, Vitest, Cucumber |
+| Node | 24 | `.nvmrc`, read by `actions/setup-node` in `.github/workflows/ci.yml` and `build.yml` | Vite, Vitest, Cucumber |
+| Tauri CLI | **2.12.4** or later | `package.json` `@tauri-apps/cli` `^2.12.4`, `package-lock.json` | `tauri build`, `tauri dev`. 2.12 is the first whose Linux AppImage leaves `libwayland-client` to the host; an older one ships a build that aborts on a current Mesa (TASK-134) |
 
 `cargo` is the rustup proxy at `~/.cargo/bin/cargo`, the only `cargo` on the
 machine. It reads `rust-toolchain.toml` and selects 1.98.0 regardless of the

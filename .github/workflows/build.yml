@@ -63,6 +63,30 @@ jobs:
       - name: Build Tauri app
         run: npx tauri build --verbose
 
+      # A bundled libwayland-client makes WebKit abort on hosts with a newer
+      # Mesa (TASK-134), so no release ships one.
+      - name: Check the AppImage leaves the graphics stack to the host
+        if: matrix.target == 'linux'
+        run: scripts/check_appimage_libs.sh src-tauri/target/release/bundle/appimage/*.AppImage
+
+      # Zip the app here: ditto keeps the bundle's signature and the binaries'
+      # exec bits, which an .app uploaded as an artifact loses (TASK-135).
+      # --norsrc leaves out the AppleDouble ._ files that unzip would put
+      # inside the signed bundle.
+      - name: Zip the macOS app
+        if: matrix.target == 'macos'
+        working-directory: src-tauri/target/release/bundle/macos
+        run: |
+          for app in *.app; do
+            ditto -c -k --norsrc --keepParent "$app" "$app.zip"
+          done
+
+      # A downloaded app whose bundle signature does not verify is "damaged"
+      # to Gatekeeper, with no Open Anyway (TASK-135).
+      - name: Check the macOS app is signed and executable
+        if: matrix.target == 'macos'
+        run: scripts/check_macos_bundle.sh src-tauri/target/release/bundle/dmg/*.dmg src-tauri/target/release/bundle/macos/*.app.zip
+
       - name: Upload Linux artifacts
         if: matrix.target == 'linux'
         uses: actions/upload-artifact@v4
@@ -80,7 +104,7 @@ jobs:
           name: emuaccounts-macos
           path: |
             src-tauri/target/release/bundle/dmg/*.dmg
-            src-tauri/target/release/bundle/macos/*.app
+            src-tauri/target/release/bundle/macos/*.app.zip
           if-no-files-found: error
 
       - name: Upload Windows artifacts
@@ -113,11 +137,7 @@ jobs:
           mkdir -p release-assets
           # Flatten artifacts into release-assets with platform prefixes
           find artifacts/emuaccounts-linux -type f \( -name "*.deb" -o -name "*.AppImage" \) -exec cp {} release-assets/ \; 2>/dev/null || true
-          find artifacts/emuaccounts-macos -type f \( -name "*.dmg" \) -exec cp {} release-assets/ \; 2>/dev/null || true
-          # Zip the .app bundle for macOS
-          if [ -d "artifacts/emuaccounts-macos" ]; then
-            find artifacts/emuaccounts-macos -type d -name "*.app" -exec sh -c 'cd "$(dirname "{}")" && zip -r "../../../release-assets/$(basename "{}").zip" "$(basename "{}")"' \; 2>/dev/null || true
-          fi
+          find artifacts/emuaccounts-macos -type f \( -name "*.dmg" -o -name "*.app.zip" \) -exec cp {} release-assets/ \; 2>/dev/null || true
           find artifacts/emuaccounts-windows -type f \( -name "*.msi" -o -name "*.exe" \) -exec cp {} release-assets/ \; 2>/dev/null || true
           ls -la release-assets/
 
