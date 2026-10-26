@@ -12,9 +12,16 @@ changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
 1. Download the `.dmg` file
 2. Open the disk image and drag **EmuAcc** to Applications
-3. On first launch, macOS may block the app. Go to **System Settings > Privacy & Security** and click **Open Anyway**
+3. Open EmuAcc. The app is not notarized by Apple, so macOS stops the first launch with "“EmuAcc” Not Opened. Apple could not verify “EmuAcc” is free of malware…". Click **Done**
+4. Open **System Settings > Privacy & Security** and scroll down to **Security**, which shows "“EmuAcc” was blocked to protect your Mac." Click **Open Anyway**, confirm with your password or Touch ID, and click **Open Anyway** again if macOS asks. The button appears only after a blocked launch, for about an hour. After that, EmuAcc opens normally
 
-Alternatively, download the `.app.zip`, unzip it, and move the `.app` to Applications.
+If there is no **Open Anyway** button, remove the download's quarantine flag in Terminal, then open EmuAcc again:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/EmuAcc.app
+```
+
+Alternatively, download `EmuAcc.app.zip`, open it to unzip it, move **EmuAcc** to Applications, and continue from step 3.
 
 ### Windows
 

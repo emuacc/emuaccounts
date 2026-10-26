@@ -62,6 +62,14 @@ if [ "$tooling" = 1 ]; then
     echo "[$HOOK] release notes self-test"
     scripts/hooks/test_release_notes.sh || hook_fail "$HOOK" "release notes self-test failed"
   fi
+  if [ -x scripts/hooks/test_check_appimage_libs.sh ]; then
+    echo "[$HOOK] AppImage library check self-test"
+    scripts/hooks/test_check_appimage_libs.sh || hook_fail "$HOOK" "AppImage library check self-test failed"
+  fi
+  if [ -x scripts/hooks/test_check_macos_bundle.sh ]; then
+    echo "[$HOOK] macOS bundle check self-test"
+    scripts/hooks/test_check_macos_bundle.sh || hook_fail "$HOOK" "macOS bundle check self-test failed"
+  fi
 fi
 
 echo "[$HOOK] Staged areas: ts=$ts rust=$rust features=$features covid=$covid"
