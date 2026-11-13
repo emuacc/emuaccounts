@@ -23,7 +23,7 @@ while IFS= read -r f; do
     src-tauri/*|rust-toolchain.toml|*.g4) rust=1 ;;
     features/*) features=1 ;;
     .covid) covid=1 ;;
-    .githooks/*|scripts/*) tooling=1 ;;
+    .githooks/*|scripts/*|copybara) tooling=1 ;;
   esac
 done <<< "$staged"
 # Changing the hooks or the helper scripts can affect every gate: run them all,
@@ -69,6 +69,10 @@ if [ "$tooling" = 1 ]; then
   if [ -x scripts/hooks/test_check_macos_bundle.sh ]; then
     echo "[$HOOK] macOS bundle check self-test"
     scripts/hooks/test_check_macos_bundle.sh || hook_fail "$HOOK" "macOS bundle check self-test failed"
+  fi
+  if [ -x scripts/hooks/test_copybara.sh ]; then
+    echo "[$HOOK] Copybara launcher self-test"
+    scripts/hooks/test_copybara.sh || hook_fail "$HOOK" "Copybara launcher self-test failed"
   fi
 fi
 

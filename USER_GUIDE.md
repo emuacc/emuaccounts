@@ -38,6 +38,8 @@ Run the installer and follow the prompts.
 sudo dpkg -i EmuAcc_*_amd64.deb
 ```
 
+On arm64, such as a Raspberry Pi, install `EmuAcc_*_arm64.deb` instead. There is no arm64 AppImage.
+
 ### Linux (Arch)
 
 Use the `.AppImage` (below), or convert the `.deb` with [`debtap`](https://aur.archlinux.org/packages/debtap):

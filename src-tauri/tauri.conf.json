@@ -1,6 +1,6 @@
 {
   "productName": "EmuAcc",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "identifier": "com.emusoftware.emuaccounts",
   "build": {
     "beforeBuildCommand": "npm run build",

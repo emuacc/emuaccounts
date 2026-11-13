@@ -8,8 +8,8 @@ out, everything up to the next ``## `` heading), or writes it to --out.
 Exits 3 with a message when the changelog has no such section or the
 section is empty. The release job in .github/workflows/build.yml writes the
 file this way and hands it to the GitHub release as its body;
-scripts/release_ready.py uses the same lookup to refuse the tag command
-while the section is missing.
+scripts/release_ready.py uses the same lookup to hold back the release
+steps while the section is missing.
 """
 from __future__ import annotations
 
