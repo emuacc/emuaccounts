@@ -4,7 +4,7 @@ name: Build Release
 #   tag (or unset)  Only a pushed v* tag builds and releases. Branch pushes
 #                   still start a run, but every job is skipped, so they cost
 #                   nothing; platform breakage shows up when you cut a release.
-#   push            Every push builds all three platforms (macOS bills 10x,
+#   push            Every push builds every platform (macOS bills 10x,
 #                   Windows 2x: ~320 billed minutes a push). main releases
 #                   v{package.json version} unless that tag exists; any other
 #                   branch publishes a {branch}-{short sha} pre-release.
@@ -26,6 +26,12 @@ jobs:
         include:
           - platform: ubuntu-22.04
             target: linux
+          # The .deb only: it carries the command-line tools, which is what an
+          # arm64 server (a Raspberry Pi) runs. The AppImage's graphics-stack
+          # check (TASK-134) has only been proven on x86_64.
+          - platform: ubuntu-22.04-arm
+            target: linux-arm64
+            build_args: --bundles deb
           - platform: macos-latest
             target: macos
           - platform: windows-latest
@@ -52,7 +58,7 @@ jobs:
           workspaces: src-tauri
 
       - name: Install Linux dependencies
-        if: matrix.target == 'linux'
+        if: startsWith(matrix.target, 'linux')
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
@@ -61,7 +67,7 @@ jobs:
         run: npm ci
 
       - name: Build Tauri app
-        run: npx tauri build --verbose
+        run: npx tauri build --verbose ${{ matrix.build_args }}
 
       # A bundled libwayland-client makes WebKit abort on hosts with a newer
       # Mesa (TASK-134), so no release ships one.
@@ -95,6 +101,14 @@ jobs:
           path: |
             src-tauri/target/release/bundle/deb/*.deb
             src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+
+      - name: Upload Linux arm64 artifacts
+        if: matrix.target == 'linux-arm64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: emuaccounts-linux-arm64
+          path: src-tauri/target/release/bundle/deb/*.deb
           if-no-files-found: error
 
       - name: Upload macOS artifacts
@@ -137,6 +151,7 @@ jobs:
           mkdir -p release-assets
           # Flatten artifacts into release-assets with platform prefixes
           find artifacts/emuaccounts-linux -type f \( -name "*.deb" -o -name "*.AppImage" \) -exec cp {} release-assets/ \; 2>/dev/null || true
+          find artifacts/emuaccounts-linux-arm64 -type f -name "*.deb" -exec cp {} release-assets/ \; 2>/dev/null || true
           find artifacts/emuaccounts-macos -type f \( -name "*.dmg" -o -name "*.app.zip" \) -exec cp {} release-assets/ \; 2>/dev/null || true
           find artifacts/emuaccounts-windows -type f \( -name "*.msi" -o -name "*.exe" \) -exec cp {} release-assets/ \; 2>/dev/null || true
           ls -la release-assets/

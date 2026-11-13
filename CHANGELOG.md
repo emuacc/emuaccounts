@@ -12,6 +12,20 @@ built (`.github/workflows/build.yml`), and `scripts/release_ready.py` refuses
 to hand out the tag command while the section is missing. Use absolute links
 inside a section: it is read on the release page as well as in this file.
 
+## 0.1.5 - 2026-11-14
+
+This release adds a Linux download for arm64 machines. The app and its
+installers are version 0.1.5, and `generated/generator.json` records 0.1.5 as
+the version that wrote a data folder. (TASK-171)
+
+### New
+
+- An arm64 Linux `.deb`, `EmuAcc_0.1.5_arm64.deb`, beside the x86_64 downloads. It installs the app and its command-line tools, so an arm64 Linux machine such as a Raspberry Pi can keep a data folder up to date from cron with `emuacc-update` and search it with `emuacc-query`, as [Keeping data fresh from cron](https://github.com/emuacc/emuaccounts/blob/v0.1.5/USER_GUIDE.md#keeping-data-fresh-from-cron) describes. There is no arm64 AppImage; [Linux (Debian / Ubuntu)](https://github.com/emuacc/emuaccounts/blob/v0.1.5/USER_GUIDE.md#linux-debian--ubuntu) says which file to install. (TASK-171)
+
+### Breaking changes
+
+None.
+
 ## 0.1.4 - 2026-11-13
 
 This release makes the app feel live and polishes what you see. Edits in the
