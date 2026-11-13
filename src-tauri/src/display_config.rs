@@ -3,7 +3,8 @@
 //! Two JSON files participate:
 //!
 //! - `generated/config.json` — the **vault** config. Carries the default
-//!   `base_currency` every account set inherits.
+//!   `base_currency` every account set inherits, and the vault-wide
+//!   `clearing_accounts` ([`vault_clearing_accounts`]).
 //! - `generated/<set>/config.json` — the **set** config. Any key present here
 //!   overrides the vault value for that set (`base_currency`, `commodities`,
 //!   `default_decimals`, `default_account`, `hidden_accounts`, `tax`, …).
@@ -97,6 +98,45 @@ pub fn set_vault_base_currency(generated_dir: &Path, currency: &str) -> Result<(
     map.insert(
         "base_currency".to_string(),
         Value::String(currency.to_string()),
+    );
+    write_json(&path, &map)
+}
+
+/// Trimmed, non-blank, first occurrence of each.
+fn clean_account_list<'a>(accounts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for account in accounts.into_iter().map(str::trim).filter(|a| !a.is_empty()) {
+        if !out.iter().any(|a| a == account) {
+            out.push(account.to_string());
+        }
+    }
+    out
+}
+
+/// The vault's clearing accounts: pass-through accounts that should net to
+/// zero, each covering its sub-accounts. Read from `clearing_accounts` in the
+/// vault config; with none declared it is the self-transfer account.
+pub fn vault_clearing_accounts(generated_dir: &Path) -> Result<Vec<String>, String> {
+    let declared = read_json(&vault_config_path(generated_dir))?
+        .and_then(|map| map.get("clearing_accounts").and_then(Value::as_array).cloned())
+        .unwrap_or_default();
+    let declared = clean_account_list(declared.iter().filter_map(Value::as_str));
+    if declared.is_empty() {
+        return Ok(vec![crate::SELF_TRANSFER_ACCOUNT.to_string()]);
+    }
+    Ok(declared)
+}
+
+/// Write `clearing_accounts` into the vault config, preserving every other
+/// key. Creates the file when absent. An empty list declares none, so the
+/// default applies again.
+pub fn set_vault_clearing_accounts(generated_dir: &Path, accounts: &[String]) -> Result<(), String> {
+    let path = vault_config_path(generated_dir);
+    let mut map = read_json(&path)?.unwrap_or_default();
+    let accounts = clean_account_list(accounts.iter().map(String::as_str));
+    map.insert(
+        "clearing_accounts".to_string(),
+        Value::Array(accounts.into_iter().map(Value::String).collect()),
     );
     write_json(&path, &map)
 }

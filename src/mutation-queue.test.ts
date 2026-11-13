@@ -95,14 +95,13 @@ describe("MutationQueue", () => {
     expect(counts).toEqual([0, 1, 2, 1, 0]);
   });
 
-  it("schedules at least one render per mutation (deferred to idle)", async () => {
+  it("schedules at least one render per mutation (deferred)", async () => {
     const state = makeState();
     const render = vi.fn();
     const q = new MutationQueue({ render });
 
     await q.enqueue(state, "x", async () => {});
-    // Renders are deferred via requestIdleCallback (or setTimeout(0))
-    // so the click flow doesn't block. Flush the timer queue.
+    // Renders are deferred (a microtask) so the click flow doesn't block.
     await new Promise((r) => setTimeout(r, 20));
     expect(render.mock.calls.length).toBeGreaterThanOrEqual(1);
   });

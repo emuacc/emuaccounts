@@ -3,6 +3,8 @@
  * Used for client-side rule preview in the rules editor page.
  */
 
+import { isIdAnchored, metaSegmentMatch } from "./meta";
+
 /** Walk through glob parts (from `pattern.split("*")`) confirming each
  *  non-empty part appears in order within text. Anchors the first part to
  *  the start and the last part to the end. */
@@ -154,6 +156,12 @@ function patternMatchesFields(rule: RuleInfo, fields: MatchFields): boolean {
       rule.match_field === "narration" ? fields.narration :
       rule.match_field === "commodity" ? fields.commodity :
       undefined;
+    // A bare `txn:`/`leg:` id matches one meta segment exactly, as in
+    // rules.rs `rule_matches` — a glob compare against the whole meta string
+    // would never match it.
+    if (rule.match_field === "meta" && isIdAnchored(rule.pattern)) {
+      return target != null && metaSegmentMatch(rule.pattern, target);
+    }
     const fallback =
       rule.match_field === "payee" ? fields.display_payee :
       rule.match_field === "commodity" ? fields.display_commodity :

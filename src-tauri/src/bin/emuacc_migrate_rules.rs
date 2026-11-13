@@ -11,17 +11,10 @@
 //!   emuacc-migrate-rules            # dry-run; reports what would change
 //!   emuacc-migrate-rules --write    # apply the changes
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use emuaccounts::root_config::{self, platform_app_data_dir};
+use emuaccounts::root_config::CliVault;
 use emuaccounts::rules::RulesFile;
-
-fn resolve_sources_dir() -> PathBuf {
-    let env_override = std::env::var("EMUACC_SOURCES_DIR").ok();
-    let app_dir = platform_app_data_dir();
-    let config = root_config::load_root_config(&app_dir);
-    root_config::resolve_sources(env_override.as_deref(), &config, &app_dir)
-}
 
 /// Walk `dir` recursively, calling `cb` for every directory that
 /// contains a `_rules.json`.
@@ -54,7 +47,7 @@ fn main() {
         return;
     }
 
-    let sources = resolve_sources_dir();
+    let sources = CliVault::load().sources_dir;
     if !sources.is_dir() {
         eprintln!("sources dir not found: {}", sources.display());
         std::process::exit(1);

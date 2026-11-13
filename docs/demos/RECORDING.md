@@ -11,8 +11,8 @@ strips the `src` and `poster` from a `<video>` whose source is a file in the
 repository (only uploaded attachments play inline), so the page would show
 nothing. So the README (the getting-started take) and the user guide (the other
 two) show each recording as its GIF, which plays by itself and loops, with text
-links to the MP4 and WebM under it. The GIF is 960 px at 10 fps, about 3 MB for
-the 72-second getting-started take; the MP4 and WebM keep 1200 px at 30 fps.
+links to the MP4 and WebM under it. The GIF is 960 px at 10 fps, about 3.7 MB
+for the 84-second getting-started take; the MP4 and WebM keep 1200 px at 30 fps.
 Every flow is marked `gif: true` in the script; one without it gets a poster
 frame instead.
 
@@ -30,17 +30,20 @@ Flows:
   session and one throwaway vault. Choose a data folder in the vault picker,
   set the vault's base currency and add an account; import a CSV into that
   account (the app offers the file dialog as soon as the account exists) and
-  map its columns in the Rhai transform; add a transaction by hand and see it
-  in the list. It ends on the ledger text file the pipeline wrote for that
-  account under the vault's `generated/` folder, open in TextEdit, with the
-  imported rows and the manual transaction visible as ledger lines: the one
-  hard cut in the take. The app has no text viewer and a window-id capture
-  cannot show another app's window, so that closing shot is a second segment,
-  recorded by TextEdit's own window id (sized like the app window, the file
-  name in its title) and joined to the first with ffmpeg. TextEdit is driven
-  through System Events and `open -a`, needs no extra permission, and is quit
-  afterwards when it was not already running; its plain-text font size is
-  raised to 16 pt for the shot through its preference and put back after.
+  map its columns in the Rhai transform, the bank's Category column becoming
+  each row's category; add a transaction by hand and see it in the list. Then
+  the Categories pane: income holds the imported salary, expenses the imported
+  coffee and the one added by hand. It ends on the ledger text file the
+  pipeline wrote for that account under the vault's `generated/` folder, open
+  in TextEdit, with the imported rows and the manual transaction visible as
+  ledger lines: the one hard cut in the take. The app has no text viewer and a
+  window-id capture cannot show another app's window, so that closing shot is
+  a second segment, recorded by TextEdit's own window id (sized like the app
+  window, the file name in its title) and joined to the first with ffmpeg.
+  TextEdit is driven through System Events and `open -a`, needs no extra
+  permission, and is quit afterwards when it was not already running; its
+  plain-text font size is raised to 16 pt for the shot through its preference
+  and put back after.
 - `import-csv` — the CSV import on its own, into a pre-seeded account.
 - `manual-txn` — the manual transaction on its own.
 

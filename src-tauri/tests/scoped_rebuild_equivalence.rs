@@ -135,6 +135,146 @@ fn scoped_rebuild_matches_full_for_manual_add() {
     }
 }
 
+/// The two snapshots must list the same files with the same bytes.
+fn assert_same_output(scoped: &[(String, Vec<u8>)], full: &[(String, Vec<u8>)], what: &str) {
+    assert_eq!(
+        scoped.iter().map(|(p, _)| p).collect::<Vec<_>>(),
+        full.iter().map(|(p, _)| p).collect::<Vec<_>>(),
+        "{what}: a different set of generated files",
+    );
+    for ((sp, sb), (fp, fb)) in scoped.iter().zip(full.iter()) {
+        assert_eq!(sp, fp, "path ordering mismatch");
+        assert_eq!(
+            sb,
+            fb,
+            "{what}: output differs at {sp}\n--- scoped ---\n{}\n--- full ---\n{}",
+            String::from_utf8_lossy(sb),
+            String::from_utf8_lossy(fb),
+        );
+    }
+}
+
+/// A rule file written into one folder: what saving a category from the
+/// table does.
+fn write_rule(sources: &Path, folder_rel: &str, pattern: &str, account: &str) {
+    fs::write(
+        sources.join(folder_rel).join("_rules.json"),
+        format!(
+            r#"{{"rules":[{{"id":"r1","pattern":"*{pattern}*","amount_account":"{account}"}}]}}"#
+        ),
+    )
+    .unwrap();
+}
+
+/// A one-set vault of three bank folders, built once so every folder has a
+/// ledger, a summary with its accounts list and a cache entry.
+fn one_set_vault() -> (PathBuf, PathBuf) {
+    let sources = tmp("scoped-one-src");
+    let generated = tmp("scoped-one-gen");
+    write_folder(
+        &sources,
+        "alex/cash/bank/cba",
+        "assets:cash:bank:cba",
+        "2025-01-15 * Payroll\n    assets:cash:bank:cba    1000.00 AUD\n    income:salary          -1000.00 AUD\n\n2025-01-16 * Coffee Shop\n    assets:cash:bank:cba      -4.50 AUD\n    expenses:unknown           4.50 AUD\n",
+    );
+    write_folder(
+        &sources,
+        "alex/cash/bank/anz",
+        "assets:cash:bank:anz",
+        "2025-01-20 * Rent\n    assets:cash:bank:anz    -800.00 AUD\n    expenses:rent            800.00 AUD\n",
+    );
+    write_folder(
+        &sources,
+        "alex/cash/bank/ubank",
+        "assets:cash:bank:ubank",
+        "2025-01-21 * Interest\n    assets:cash:bank:ubank    12.00 AUD\n    income:interest          -12.00 AUD\n",
+    );
+    run_pipeline(&config(&sources, &generated, false, None)).expect("baseline build");
+    (sources, generated)
+}
+
+/// The scoped run of a one-folder change, then the forced full rebuild of
+/// the same sources: the generated trees must match byte for byte.
+fn scoped_then_full(sources: &Path, generated: &Path, hint: Option<Vec<String>>) -> (bool, Vec<(String, Vec<u8>)>, Vec<(String, Vec<u8>)>) {
+    let result = run_pipeline(&config(sources, generated, false, hint)).expect("rebuild");
+    let scoped = snapshot(generated);
+    run_pipeline(&config(sources, generated, true, None)).expect("forced full rebuild");
+    (result.scoped, scoped, snapshot(generated))
+}
+
+/// A rule saved into one folder of a one-set vault: the run is scoped (the
+/// other folders stay on disk unread) and its output matches a full rebuild.
+#[test]
+fn a_rule_change_in_one_folder_is_scoped_and_matches_a_full_rebuild() {
+    let (sources, generated) = one_set_vault();
+    write_rule(&sources, "alex/cash/bank/cba", "Coffee", "expenses:coffee");
+
+    let (scoped, scoped_out, full_out) = scoped_then_full(&sources, &generated, None);
+
+    assert!(scoped, "a rule change in one folder should be a scoped run");
+    assert_same_output(&scoped_out, &full_out, "scoped rule change vs full rebuild");
+    let ledger = fs::read_to_string(generated.join("alex/cash/bank/cba/ledger.transactions")).unwrap();
+    assert!(ledger.contains("expenses:coffee"), "the rule should have re-categorised the row:\n{ledger}");
+}
+
+/// The same with the folder hint the rule commands pass.
+#[test]
+fn a_hinted_rule_change_is_scoped_and_matches_a_full_rebuild() {
+    let (sources, generated) = one_set_vault();
+    write_rule(&sources, "alex/cash/bank/cba", "Coffee", "expenses:coffee");
+
+    let (scoped, scoped_out, full_out) =
+        scoped_then_full(&sources, &generated, Some(vec!["alex/cash/bank/cba".to_string()]));
+
+    assert!(scoped, "a hinted rule change should be a scoped run");
+    assert_same_output(&scoped_out, &full_out, "hinted rule change vs full rebuild");
+}
+
+/// A change that brings a trade into a folder that had none: the swap linker
+/// needs the whole set, so the run loads it after the transform and still
+/// matches a full rebuild.
+#[test]
+fn a_change_that_introduces_a_trade_loads_the_set_and_matches_a_full_rebuild() {
+    let (sources, generated) = one_set_vault();
+    let manual = sources.join("alex/cash/bank/cba/manual.transactions");
+    let mut body = fs::read_to_string(&manual).unwrap();
+    body.push_str("\n2025-02-01 12:00:00 * Buy ETH\n    assets:cash:bank:cba    -1000.00 AUD\n    equity:trading           1000.00 AUD\n");
+    fs::write(&manual, &body).unwrap();
+
+    let (scoped, scoped_out, full_out) = scoped_then_full(&sources, &generated, None);
+
+    assert!(!scoped, "a folder that now holds a trade needs the whole set");
+    assert_same_output(&scoped_out, &full_out, "new trade vs full rebuild");
+}
+
+/// A change to the ignored list can hide a row in any folder: a full run.
+#[test]
+fn an_ignored_list_change_is_a_full_run_and_matches_a_full_rebuild() {
+    let (sources, generated) = one_set_vault();
+    fs::write(sources.join("_ignored.txt"), "txn:nothing-matches\n").unwrap();
+
+    let (scoped, scoped_out, full_out) = scoped_then_full(&sources, &generated, None);
+
+    assert!(!scoped, "an ignored-list change needs every folder");
+    assert_same_output(&scoped_out, &full_out, "ignored list vs full rebuild");
+}
+
+/// An unchanged folder whose ledger was clobbered is not what the pipeline
+/// last wrote: the full run's recovery path restores it.
+#[test]
+fn a_clobbered_unchanged_ledger_is_a_full_run_that_restores_it() {
+    let (sources, generated) = one_set_vault();
+    write_rule(&sources, "alex/cash/bank/cba", "Coffee", "expenses:coffee");
+    let anz = generated.join("alex/cash/bank/anz/ledger.transactions");
+    fs::write(&anz, "; clobbered by an external tool\n").unwrap();
+
+    let (scoped, scoped_out, full_out) = scoped_then_full(&sources, &generated, None);
+
+    assert!(!scoped, "a clobbered ledger needs the recovery path");
+    assert_same_output(&scoped_out, &full_out, "clobbered ledger vs full rebuild");
+    assert!(fs::read_to_string(&anz).unwrap().contains("Rent"), "the clobbered ledger should be restored");
+}
+
 /// Exercises the `auto_link` skip directly: a vault that DOES contain
 /// `equity:trading` (so auto_link's own fast-reject does not fire), where the
 /// change is to a folder with no trade. The scoped rebuild must skip auto_link

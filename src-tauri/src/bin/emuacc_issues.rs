@@ -4,17 +4,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use emuaccounts::issues::{self, Category, CollectFilter, IssueGroup, IssueSeverity};
-use emuaccounts::root_config::{self, platform_app_data_dir};
-
-fn resolve_dirs() -> (PathBuf, PathBuf) {
-    let env_sources = std::env::var("EMUACC_SOURCES_DIR").ok();
-    let env_generated = std::env::var("EMUACC_GENERATED_DIR").ok();
-    let app_dir = platform_app_data_dir();
-    let config = root_config::load_root_config(&app_dir);
-    let sources = root_config::resolve_sources(env_sources.as_deref(), &config, &app_dir);
-    let generated = root_config::resolve_generated(env_generated.as_deref(), &config, &app_dir);
-    (sources, generated)
-}
+use emuaccounts::root_config::CliVault;
 
 fn print_usage() {
     eprintln!("Usage: emuacc-issues [CATEGORY...] [OPTIONS]");
@@ -28,6 +18,7 @@ fn print_usage() {
     eprintln!("  --pipeline-warnings  Warnings emitted by the import/transform pipeline");
     eprintln!("  --gaps               Accounts with missing months");
     eprintln!("  --unverified         assets:* accounts lacking an opening balance");
+    eprintln!("  --unbalanced-clearing  Clearing accounts whose postings don't net to zero");
     eprintln!("  --trade-suggestions  Auto-detected trade link candidates");
     eprintln!("  --unpriced           Commodities missing price data for conversion to base currency");
     eprintln!();
@@ -84,6 +75,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
             }
             "--unverified" => {
                 categories.insert(Category::UnverifiedBalances);
+            }
+            "--unbalanced-clearing" => {
+                categories.insert(Category::UnbalancedClearing);
             }
             "--trade-suggestions" => {
                 categories.insert(Category::TradeSuggestions);
@@ -167,9 +161,9 @@ fn main() {
         }
     };
 
-    let (resolved_sources, resolved_generated) = resolve_dirs();
-    let sources = parsed.sources_dir.unwrap_or(resolved_sources);
-    let generated = parsed.generated_dir.unwrap_or(resolved_generated);
+    let vault = CliVault::load();
+    let sources = parsed.sources_dir.unwrap_or(vault.sources_dir);
+    let generated = parsed.generated_dir.unwrap_or(vault.generated_dir);
 
     let filter = CollectFilter {
         categories: parsed.categories,

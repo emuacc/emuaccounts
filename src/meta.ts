@@ -11,6 +11,17 @@ export function matchesPrefix(acct: string, prefix: string): boolean {
   return acct === prefix || acct.startsWith(prefix + ":");
 }
 
+/**
+ * The search term matching the transactions with a leg on `account` or a child
+ * of it, as {@link matchesPrefix} does. The query engine compiles an `account:`
+ * pattern as an unanchored, case-insensitive regex — `account:income` also
+ * matches `expenses:tax:income` — so the account is escaped, anchored at a
+ * segment boundary and matched case-sensitively.
+ */
+export function accountSubtreeTerm(account: string): string {
+  return `account:(?-i)^${account.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(:|$)`;
+}
+
 /** Extract the `rule:<id>` value, or undefined when absent. */
 export function extractRuleId(meta?: string | null): string | undefined {
   if (!meta) return undefined;
@@ -30,6 +41,29 @@ export function txnIdFromMeta(meta: string | null | undefined): string {
  */
 export function legIdFromMeta(meta: string | null | undefined): string {
   return (meta ?? "").split(",").map((p) => p.trim()).find((p) => p.startsWith("leg:")) ?? "";
+}
+
+/** Port of rules.rs `id_anchor_prefix`: a bare `txn:<id>` / `leg:<id>`
+ *  pattern with no glob/alternation/whitespace is id-anchored. */
+export function isIdAnchored(pattern: string): boolean {
+  const p = pattern.trim();
+  for (const prefix of ["leg:", "txn:"]) {
+    if (p.startsWith(prefix)) {
+      const rest = p.slice(prefix.length);
+      if (rest && !rest.includes("*") && !rest.includes("|") && !rest.includes(",") && !/\s/.test(rest)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** Port of rules.rs `meta_segment_match`: split meta on `,`, trim, and
+ *  require one segment to equal the pattern case-insensitively. */
+export function metaSegmentMatch(pattern: string, meta: string): boolean {
+  const p = pattern.trim().toLowerCase();
+  if (!p) return false;
+  return meta.split(",").some((seg) => seg.trim().toLowerCase() === p);
 }
 
 /**

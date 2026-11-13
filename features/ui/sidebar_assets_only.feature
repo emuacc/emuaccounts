@@ -9,6 +9,7 @@ Feature: Sidebar shows only asset accounts
   Scenario: Sidebar lists asset sub-accounts without the assets group
     Given the app is running
     When I parse the transactions file "src-tauri/features/fixtures/example.transactions"
+    And I select the account "assets:exchange:kraken:btc"
     Then the sidebar should include the account "assets:exchange:kraken:btc"
     And the sidebar should not include the account group "liabilities"
     And the sidebar should not include the account group "expenses"

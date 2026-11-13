@@ -10,6 +10,24 @@ const SHIFT_THRESHOLD = 50;
 
 export type WindowRange = { start: number; end: number };
 
+/** Both left-panes that render the account header + transaction table (Accounts
+ *  and Categories), as opposed to Reports/Plugins/rule-editor. */
+export function isTransactionPane(state: { sidebarView: string }): boolean {
+  return state.sidebarView === "accounts" || state.sidebarView === "categories";
+}
+
+/** Should nearing the bottom of the page fetch the next page of rows? The other
+ *  panes keep the window the selection loaded but show none of its rows. */
+export function hasMoreRowsToLoad(state: {
+  sidebarView: string;
+  searchFilteredTransactions?: unknown[] | undefined;
+  searchFilteredCount?: number | undefined;
+}): boolean {
+  if (!isTransactionPane(state)) return false;
+  const loaded = state.searchFilteredTransactions?.length ?? 0;
+  return state.searchFilteredCount !== undefined && loaded > 0 && loaded < state.searchFilteredCount;
+}
+
 export function calculateWindow(
   scrollTop: number,
   tableOffsetTop: number,

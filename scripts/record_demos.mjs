@@ -12,9 +12,9 @@
  * `getting-started` is the README's getting-started video: one continuous take
  * of all three flows (choose a data folder and add an account, import a CSV,
  * add a manual transaction) in a single app session and one throwaway vault,
- * ending on the account's generated ledger file in TextEdit (a second capture,
- * joined with a hard cut). It is re-recorded for every release — see
- * docs/demos/RECORDING.md.
+ * then the Categories pane, ending on the account's generated ledger file in
+ * TextEdit (a second capture, joined with a hard cut). It is re-recorded for
+ * every release — see docs/demos/RECORDING.md.
  *
  *   node scripts/record_demos.mjs --flow manual-txn
  *   node scripts/record_demos.mjs --all
@@ -52,6 +52,11 @@ const OUT_DIR = path.join(repoRoot, "docs", "demos");
 const DEMO_IMPORT_DIR = "/tmp/test";
 const DEMO_CSV = path.join(DEMO_IMPORT_DIR, "transactions.csv");
 const DEMO_CSV_BODY = "Date,Description,Amount\n2025-01-15,Coffee Shop,-4.50\n2025-01-16,Salary,3500.00\n";
+// The getting-started take's export also carries the bank's category, which
+// its transform maps to each row's contra account, so the Categories pane has
+// income and expenses to show.
+const CATEGORISED_CSV_BODY =
+  "Date,Description,Amount,Category\n2025-01-15,Coffee Shop,-4.50,expenses:coffee\n2025-01-16,Salary,3500.00,income:salary\n";
 
 // Real app config.json — protected: only flow 1 moves it aside, always restored.
 const APP_DATA = path.join(os.homedir(), "Library", "Application Support", "com.emusoftware.emuaccounts");
@@ -437,7 +442,7 @@ function ffprobeDims(file) {
 }
 
 /** The looping GIF a doc shows in place of a poster: 10 fps at 960 px keeps
- *  the 72-second getting-started take at about 3 MB (1200 px is 4.5 MB). */
+ *  the 84-second getting-started take at about 3.7 MB (1200 px is 4.9 MB). */
 const GIF_FPS = 10;
 const GIF_WIDTH = 960;
 
@@ -541,10 +546,10 @@ function seedDemoAccount(ctx) {
 }
 
 // Clean import folder + CSV staged fresh.
-function stageDemoCsv() {
+function stageDemoCsv(body = DEMO_CSV_BODY) {
   try { fs.rmSync(DEMO_IMPORT_DIR, { recursive: true, force: true }); } catch { /* ignore */ }
   fs.mkdirSync(DEMO_IMPORT_DIR, { recursive: true });
-  fs.writeFileSync(DEMO_CSV, DEMO_CSV_BODY);
+  fs.writeFileSync(DEMO_CSV, body);
 }
 
 // The standalone import demo also needs an account to import into; its
@@ -555,15 +560,12 @@ function seedImportFlow(ctx) {
 }
 
 // A clean, hand-written transform typed into the editor during the import demo —
-// shows users how to map columns and sets the commodity to USD.
-const USD_TRANSFORM = [
-  "#{",
-  '  date: row["Date"],',
-  '  payee: row["Description"],',
-  '  amount: row["Amount"],',
-  '  commodity: "USD",',
-  "}",
-].join("\n");
+// shows users how to map columns and sets the commodity to USD. The
+// getting-started take maps the Category column to the contra account too.
+const transformScript = (fields) => ["#{", ...fields.map((f) => `  ${f},`), "}"].join("\n");
+const USD_FIELDS = ['date: row["Date"]', 'payee: row["Description"]', 'amount: row["Amount"]', 'commodity: "USD"'];
+const USD_TRANSFORM = transformScript(USD_FIELDS);
+const CATEGORISED_TRANSFORM = transformScript([...USD_FIELDS, 'contra: row["Category"]']);
 
 async function selectAccount(driver, account) {
   await click(driver, `[data-testid="account-item"][data-account="${account}"]`);
@@ -612,8 +614,9 @@ async function chooseVaultAndAddAccountSteps(driver, proc, ctx) {
 
 /** Import the staged CSV into the selected account through the column-mapping
  *  modal. With `dialogOpen` the native file dialog is already up (the app opens
- *  one right after an account is added); otherwise the Import button opens it. */
-async function importCsvSteps(driver, proc, { dialogOpen }) {
+ *  one right after an account is added); otherwise the Import button opens it.
+ *  `transform` is the Rhai typed into the editor. */
+async function importCsvSteps(driver, proc, { dialogOpen, transform = USD_TRANSFORM }) {
   if (dialogOpen) {
     caption("The app offers to import a bank export straight away");
   } else {
@@ -625,7 +628,7 @@ async function importCsvSteps(driver, proc, { dialogOpen }) {
   // The column-mapping modal appears for a new CSV format.
   await waitFor(driver, "#transformScript", 15000);
   caption("Edit the Rhai transform to map the columns");
-  await type(driver, "#transformScript", USD_TRANSFORM);
+  await type(driver, "#transformScript", transform);
   caption("Save and import");
   await click(driver, "#transformSave");
   // The status line is the deterministic success signal ("Imported CSV (N…)").
@@ -637,8 +640,13 @@ async function importCsvSteps(driver, proc, { dialogOpen }) {
   await sleep(PACE);
 }
 
-/** Add a transaction by hand. Done when a row shows its payee — the list may
- *  already hold imported rows, so a bare row count is no signal. */
+/** Wait for a transaction row showing `text` (a payee) — the list may already
+ *  hold other rows, so a bare row count is no signal. */
+async function waitForRow(driver, text, timeout = 30000) {
+  await driver.wait(until.elementLocated(By.xpath(`//*[@data-testid="txn-row"][contains(., "${text}")]`)), timeout);
+}
+
+/** Add a transaction by hand. Done when a row shows its payee. */
 async function manualTxnSteps(driver) {
   caption("Add a transaction by hand");
   await click(driver, "#addNew");
@@ -651,11 +659,25 @@ async function manualTxnSteps(driver) {
   await type(driver, "#manualContraAccount-0", "expenses:coffee");
   caption("Save");
   await click(driver, "#manualSave");
-  await driver.wait(
-    until.elementLocated(By.xpath('//*[@data-testid="txn-row"][contains(., "Coffee Hut")]')),
-    30000,
-  );
+  await waitForRow(driver, "Coffee Hut");
   caption("Transaction added");
+}
+
+/** The Categories pane: what the money was earned and spent on, income and
+ *  expenses only. Drilling into a category lists its rows from every account. */
+async function categoriesSteps(driver) {
+  await sleep(PACE); // the previous step's last caption gets its own beat
+  caption("Categories show what you earned and spent");
+  await click(driver, '.sidebarNav__item[data-view="categories"]');
+  caption("Income: the salary from the bank export");
+  await click(driver, '[data-testid="drilldown-item"][data-group="income"]');
+  await waitForRow(driver, "Salary");
+  await sleep(PACE);
+  await click(driver, '[data-testid="drilldown-back"]');
+  caption("Expenses: the imported coffee and the one added by hand");
+  await click(driver, '[data-testid="drilldown-item"][data-group="expenses"]');
+  await waitForRow(driver, "Coffee Hut");
+  await waitForRow(driver, "Coffee Shop");
 }
 
 // ---------------------------------------------------------------------------
@@ -738,20 +760,22 @@ async function openInTextEdit(file, frame) {
 const FLOWS = {
   // Flow 1 — the README's getting-started video: one continuous take of the
   // three flows in the order a new user meets them, in one throwaway vault
-  // (the folder picked in step 1 is the vault steps 2 and 3 work in). The
-  // README shows it as a GIF, which plays by itself.
+  // (the folder picked in step 1 is the vault steps 2 and 3 work in), then
+  // what they add up to in the Categories pane. The README shows it as a GIF,
+  // which plays by itself.
   "getting-started": {
     gif: true,
     moveConfigAside: true,
     tempRoot: false, // we WANT the first-launch vault picker here
-    seed: stageDemoCsv, // no account seed: the take adds the account itself
+    seed: () => stageDemoCsv(CATEGORISED_CSV_BODY), // no account seed: the take adds the account itself
     needsAccessibility: true,
     initialReady: '[data-testid="vault-picker"]',
     prepare: null,
     async steps(driver, proc, ctx) {
       await chooseVaultAndAddAccountSteps(driver, proc, ctx);
-      await importCsvSteps(driver, proc, { dialogOpen: true });
+      await importCsvSteps(driver, proc, { dialogOpen: true, transform: CATEGORISED_TRANSFORM });
       await manualTxnSteps(driver);
+      await categoriesSteps(driver);
     },
     // Closing shot: the ledger the pipeline wrote for the account, as text.
     finale(ctx) {

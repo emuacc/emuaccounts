@@ -31,7 +31,7 @@ When(
     );
     await this.driver.executeScript(FIND_PAYEE_ROW_SCRIPT, payee, true);
     await this.driver.wait(
-      until.elementLocated(By.css(".txDetail__ruleBtn")),
+      until.elementLocated(By.css(".txRow__detail")),
       5_000,
     );
   },
@@ -178,6 +178,16 @@ Then(
     assert.ok(buttons.length >= 1, `no "${label}" button found in detail row`);
     const text = (await buttons[0].getText()).trim();
     assert.equal(text, label);
+  },
+);
+
+Then(
+  "the detail row should not contain an {string} button",
+  async function (label) {
+    const target = DETAIL_BUTTONS[label];
+    assert.ok(target, `Unknown detail button "${label}" — add it to DETAIL_BUTTONS`);
+    const buttons = await this.driver.findElements(By.css(`.txRow__detail ${target.button}`));
+    assert.equal(buttons.length, 0, `"${label}" is offered, and on this row it would do nothing`);
   },
 );
 

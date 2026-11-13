@@ -16,6 +16,10 @@
 //     the item's dataset and using it directly on commit, rather than
 //     re-extracting from textContent.
 //
+//   - The dropdown outliving its input. It sits outside the rendered tree and
+//     WebKit fires no blur when a focused input is removed, so it watches for
+//     the input leaving the page and closes itself.
+//
 // The component mutates `input.value` to the chosen value and then invokes
 // `onCommit(value, kind)`. Callers decide what "commit" means for them
 // (save a rule, update a draft, do nothing and rely on the modal's button).
@@ -84,6 +88,11 @@ export function attachAccountInput(
   let highlightIdx = -1;
   let committed = false;
   let blurTimer: ReturnType<typeof setTimeout> | null = null;
+  // Observing only while the dropdown is open. A render that merely moves the
+  // input re-inserts it in the same pass, so it is connected again by now.
+  const inputWatcher = new MutationObserver(() => {
+    if (!input.isConnected) close();
+  });
 
   function withPrefix(typed: string): string {
     return opts.prefix ? `${opts.prefix}${typed}` : typed;
@@ -93,6 +102,7 @@ export function attachAccountInput(
     if (dropdown) {
       dropdown.remove();
       dropdown = null;
+      inputWatcher.disconnect();
       window.removeEventListener("scroll", onScrollOrResize, true);
       window.removeEventListener("resize", onScrollOrResize);
     }
@@ -147,6 +157,7 @@ export function attachAccountInput(
     }
 
     document.body.appendChild(dropdown);
+    inputWatcher.observe(document.body, { childList: true, subtree: true });
     window.addEventListener("scroll", onScrollOrResize, true);
     window.addEventListener("resize", onScrollOrResize);
     position();
@@ -178,7 +189,12 @@ export function attachAccountInput(
   }
 
   function commit(value: string, kind: CommitKind): void {
-    if (committed) return;
+    // Focus reopens the dropdown on a settled field: only a different pick
+    // from it is a new commit.
+    if (committed && value === input.value) {
+      close();
+      return;
+    }
     committed = true;
     if (blurTimer !== null) {
       clearTimeout(blurTimer);
@@ -200,7 +216,10 @@ export function attachAccountInput(
    * new account requires the user to explicitly pick the "+ Add" item.
    */
   function settle(): void {
-    if (committed) return;
+    if (committed) {
+      close();
+      return;
+    }
     const typed = input.value.trim();
     const match = suggestions.find((s) => s.toLowerCase() === typed.toLowerCase());
     if (match) {
@@ -236,7 +255,8 @@ export function attachAccountInput(
     }
     if (e.key === "Escape") {
       e.preventDefault();
-      commit(initialValue, "cancel");
+      if (committed) close();
+      else commit(initialValue, "cancel");
       return;
     }
     if (e.key === "Enter") {

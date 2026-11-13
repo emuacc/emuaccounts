@@ -1,6 +1,6 @@
 [package]
 name = "emuaccounts"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 rust-version = "1.98"
 default-run = "emuaccounts"
@@ -65,13 +65,25 @@ antlr4rust = "=0.5.2"
 panic = "abort"
 codegen-units = 1
 lto = true
-opt-level = "s"
+# 3, not "s": the pipeline and the queries are parsing-heavy, and 3 rebuilds
+# a one-folder rule change 10% faster for a 13% larger binary (SPEED.md,
+# "Optimisation level of the dev profile", 2026-11-05).
+opt-level = 3
 
-# Faster dev/test compile + link by emitting only line-table debug info.
-# Trade-off: less detail when stepping in a debugger; line numbers in
-# panic backtraces still work.
+# The dev profile is what `tauri dev` (the launchers in scripts/), the CLIs
+# and the tests run. Unoptimised, the pipeline is 13x slower than release: a
+# one-folder rule change took 42 s, which is the delay a table edit showed.
+# Optimising the dependencies fully and this crate lightly brings that to
+# 4.5 s while an incremental rebuild stays at 3 s; the cold build roughly
+# doubles. Measured in SPEED.md, "Optimisation level of the dev profile".
+# Only line-table debug info is emitted: less detail when stepping in a
+# debugger, line numbers in panic backtraces still work.
 [profile.dev]
 debug = "line-tables-only"
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
 
 # Bins are thin CLI wrappers with no in-bin #[test] items. Their tested
 # logic lives in the library and integration tests. Skip their test

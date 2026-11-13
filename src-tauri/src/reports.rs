@@ -1865,51 +1865,28 @@ pub fn generate_balances_report(
     )
 }
 
-/// Generate a Balances report as of `as_of_date`.
+/// Balances as of one date, per commodity and per (commodity, account).
+struct BalancesAsOf {
+    by_commodity: HashMap<String, f64>,
+    by_commodity_account: HashMap<(String, String), f64>,
+}
+
+/// Openings plus every posting dated on or before `as_of_date`, over the
+/// accounts `counts` accepts.
 ///
-/// Walks all transactions with `datetime <= as_of_date`, aggregating postings
-/// whose account is under `base_account_scope` (if given) AND, when
-/// `allowed_accounts` is supplied, whose account is in that set. The allowlist
-/// keeps reconciliation totals tied to primary source-folder accounts and
-/// excludes routing contras (transfer / lending / bridge / wrap / staking)
-/// that share the scope prefix.
+/// Aggregated at the posting level so both date and scope filters propagate
+/// through to the final balances (unlike `QueryResult.aggregated_balance`,
+/// which is all-time per-account and ignores filters).
 ///
-/// `opening_balances` (the `opening` lines on account declarations) count under
-/// the same scope and allowlist rules. They carry no date — an opening is the
-/// balance before the first recorded transaction — so they are always inside
-/// the as-of window.
-///
-/// This is THE holdings computation: the Balances report, the sidebar's
-/// base-currency totals and the Accounts-page folder header all come from it
-/// (see [`tree_base_totals`]), so those numbers can never disagree.
-pub fn generate_balances_report_range(
+/// Transactions touching any `ignore:*` account (spam tokens, approvals,
+/// failed/no-op events) are skipped entirely — they don't contribute to
+/// holdings, and they don't trigger missing-price warnings either.
+fn balances_as_of(
     transactions: &[Transaction],
     opening_balances: &[crate::ledger_parser::AccountBalance],
-    price_graph: &PriceGraph,
     as_of_date: &str,
-    base_currency: &str,
-    base_account_scope: Option<&str>,
-    allowed_accounts: Option<&AccountAllowlist>,
-) -> BalancesReport {
-    let counts = |account: &str| -> bool {
-        let in_scope = match base_account_scope {
-            Some(scope) => account == scope || account.starts_with(&format!("{scope}:")),
-            None => true,
-        };
-        let allowed = match allowed_accounts {
-            Some(al) => al.allows(account),
-            None => true,
-        };
-        in_scope && allowed
-    };
-
-    // Aggregate at the posting level so both date and scope filters propagate
-    // through to the final balances (unlike `QueryResult.aggregated_balance`,
-    // which is all-time per-account and ignores filters).
-    //
-    // Transactions touching any `ignore:*` account (spam tokens, approvals,
-    // failed/no-op events) are skipped entirely — they don't contribute to
-    // holdings, and they don't trigger missing-price warnings either.
+    counts: impl Fn(&str) -> bool,
+) -> BalancesAsOf {
     let mut by_commodity: HashMap<String, f64> = HashMap::new();
     let mut by_commodity_account: HashMap<(String, String), f64> = HashMap::new();
     for opening in opening_balances {
@@ -1950,6 +1927,54 @@ pub fn generate_balances_report_range(
             }
         }
     }
+    BalancesAsOf {
+        by_commodity,
+        by_commodity_account,
+    }
+}
+
+/// Generate a Balances report as of `as_of_date`.
+///
+/// Walks all transactions with `datetime <= as_of_date`, aggregating postings
+/// whose account is under `base_account_scope` (if given) AND, when
+/// `allowed_accounts` is supplied, whose account is in that set. The allowlist
+/// keeps reconciliation totals tied to primary source-folder accounts and
+/// excludes routing contras (transfer / lending / bridge / wrap / staking)
+/// that share the scope prefix.
+///
+/// `opening_balances` (the `opening` lines on account declarations) count under
+/// the same scope and allowlist rules. They carry no date — an opening is the
+/// balance before the first recorded transaction — so they are always inside
+/// the as-of window.
+///
+/// This is THE holdings computation: the Balances report, the sidebar's
+/// base-currency totals and the Accounts-page folder header all come from it
+/// (see [`tree_base_totals`]), so those numbers can never disagree.
+pub fn generate_balances_report_range(
+    transactions: &[Transaction],
+    opening_balances: &[crate::ledger_parser::AccountBalance],
+    price_graph: &PriceGraph,
+    as_of_date: &str,
+    base_currency: &str,
+    base_account_scope: Option<&str>,
+    allowed_accounts: Option<&AccountAllowlist>,
+) -> BalancesReport {
+    let counts = |account: &str| -> bool {
+        let in_scope = match base_account_scope {
+            Some(scope) => account == scope || account.starts_with(&format!("{scope}:")),
+            None => true,
+        };
+        let allowed = match allowed_accounts {
+            Some(al) => al.allows(account),
+            None => true,
+        };
+        in_scope && allowed
+    };
+
+    let BalancesAsOf {
+        by_commodity,
+        by_commodity_account,
+    } = balances_as_of(transactions, opening_balances, as_of_date, counts);
 
     let datetime_key = format!("{as_of_date}T23:59:59");
     let mut holdings: Vec<CoinBalance> = Vec::new();
@@ -2017,7 +2042,7 @@ pub fn generate_balances_report_range(
         match price_graph.convert_to_base(commodity, 1.0, &datetime_key, base_currency) {
             Some(price) => {
                 let price_date = price_graph
-                    .lookup(commodity, &datetime_key)
+                    .lookup(commodity, &datetime_key, base_currency)
                     .map(|p| p.datetime.clone())
                     .unwrap_or_else(|| as_of_date.to_string());
                 let accounts = build_accounts(commodity, price);
@@ -2068,14 +2093,63 @@ pub fn account_base_values(report: &BalancesReport) -> BTreeMap<String, f64> {
     let mut values: BTreeMap<String, f64> = BTreeMap::new();
     for holding in &report.holdings {
         for ab in &holding.accounts {
-            let mut path = String::new();
-            for (i, segment) in ab.account.split(':').enumerate() {
-                if i > 0 {
-                    path.push(':');
-                }
-                path.push_str(segment);
-                *values.entry(path.clone()).or_insert(0.0) += ab.value;
+            roll_up(&mut values, &ab.account, ab.value);
+        }
+    }
+    values
+}
+
+/// Add `value` to `account` and to each of its ancestors.
+fn roll_up(values: &mut BTreeMap<String, f64>, account: &str, value: f64) {
+    let mut path = String::new();
+    for (i, segment) in account.split(':').enumerate() {
+        if i > 0 {
+            path.push(':');
+        }
+        path.push_str(segment);
+        *values.entry(path.clone()).or_insert(0.0) += value;
+    }
+}
+
+/// Every account's OWN balance as of `as_of_date`, valued in `base_currency`
+/// commodity by commodity and rolled up to every ancestor.
+///
+/// The Balances report values holdings: a commodity's total across the
+/// accounts it counts. Over the whole ledger that total is zero for nearly
+/// every commodity (double entry), so it would leave almost every account
+/// without a value. Here each account is valued by itself, the way its own
+/// balance reads. A commodity with no price contributes nothing, as in the
+/// report. Openings, the as-of date and the `ignore:*` rule are the report's
+/// own ([`balances_as_of`]).
+pub fn own_balance_base_values(
+    transactions: &[Transaction],
+    opening_balances: &[crate::ledger_parser::AccountBalance],
+    price_graph: &PriceGraph,
+    as_of_date: &str,
+    base_currency: &str,
+) -> BTreeMap<String, f64> {
+    let balances = balances_as_of(transactions, opening_balances, as_of_date, |_| true);
+    let datetime_key = format!("{as_of_date}T23:59:59");
+    // DETERMINISM: value and roll up in (commodity, account) order, so the f64
+    // sums don't depend on HashMap iteration order.
+    let mut entries: Vec<(&(String, String), &f64)> = balances
+        .by_commodity_account
+        .iter()
+        .filter(|(_, quantity)| quantity.abs() >= EPSILON)
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let mut prices: HashMap<&str, Option<f64>> = HashMap::new();
+    let mut values: BTreeMap<String, f64> = BTreeMap::new();
+    for ((commodity, account), quantity) in entries {
+        let price = *prices.entry(commodity.as_str()).or_insert_with(|| {
+            if commodity == base_currency {
+                Some(1.0)
+            } else {
+                price_graph.convert_to_base(commodity, 1.0, &datetime_key, base_currency)
             }
+        });
+        if let Some(price) = price {
+            roll_up(&mut values, account, quantity * price);
         }
     }
     values
@@ -2091,13 +2165,14 @@ pub struct TreeBaseTotals {
     /// rolled up to every ancestor. Feeds the Accounts sidebar rows and the
     /// folder header; `primary["assets"]` is the Balances report total.
     pub primary: BTreeMap<String, f64>,
-    /// Every account, rolled up — for the Categories pane (income, expenses,
-    /// contras), which lists accounts outside the primary scope.
+    /// Every account valued by its own balance, rolled up
+    /// ([`own_balance_base_values`]): the Categories rows and the holdings
+    /// "Show all holdings" reveals outside the primary scope.
     pub all: BTreeMap<String, f64>,
 }
 
-/// Run the Balances computation twice over one ledger — once restricted to the
-/// primary accounts, once unrestricted — and roll each up the account tree.
+/// The primary totals from the Balances computation restricted to the primary
+/// accounts, and every account's own value, each rolled up the account tree.
 pub fn tree_base_totals(
     transactions: &[Transaction],
     opening_balances: &[crate::ledger_parser::AccountBalance],
@@ -2106,22 +2181,26 @@ pub fn tree_base_totals(
     base_currency: &str,
     allowed_accounts: Option<&AccountAllowlist>,
 ) -> TreeBaseTotals {
-    let report = |allowlist: Option<&AccountAllowlist>| {
-        generate_balances_report_range(
+    let primary = generate_balances_report_range(
+        transactions,
+        opening_balances,
+        price_graph,
+        as_of_date,
+        base_currency,
+        None,
+        allowed_accounts,
+    );
+    TreeBaseTotals {
+        as_of_date: as_of_date.to_string(),
+        base_currency: base_currency.to_string(),
+        primary: account_base_values(&primary),
+        all: own_balance_base_values(
             transactions,
             opening_balances,
             price_graph,
             as_of_date,
             base_currency,
-            None,
-            allowlist,
-        )
-    };
-    TreeBaseTotals {
-        as_of_date: as_of_date.to_string(),
-        base_currency: base_currency.to_string(),
-        primary: account_base_values(&report(allowed_accounts)),
-        all: account_base_values(&report(None)),
+        ),
     }
 }
 
@@ -2404,7 +2483,7 @@ pub fn holdings_as_of(
         match price_graph.convert_to_base(commodity, 1.0, &datetime_key, base_currency) {
             Some(price) => {
                 let price_date = price_graph
-                    .lookup(commodity, &datetime_key)
+                    .lookup(commodity, &datetime_key, base_currency)
                     .map(|p| p.datetime.clone())
                     .unwrap_or_else(|| as_of_date.to_string());
                 let value = quantity * price;

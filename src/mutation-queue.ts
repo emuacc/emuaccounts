@@ -69,11 +69,11 @@ export class MutationQueue {
       const item = this.queue.shift()!;
       this.running = true;
       state.status = item.label;
-      // Schedule the strip-indicator render for when the browser is
-      // idle. Critically: do NOT await this. The mutation fn proceeds
-      // immediately; if a render fires before the fn finishes that's
-      // fine (state is already updated), and if it doesn't, the post-
-      // mutation render below picks up everything.
+      // Ask for the strip-indicator render. Critically: do NOT await
+      // this. The mutation fn proceeds immediately; if a render fires
+      // before the fn finishes that's fine (state is already updated),
+      // and if it doesn't, the post-mutation render below picks up
+      // everything.
       this.scheduleRender();
       try {
         await item.fn();
@@ -88,13 +88,13 @@ export class MutationQueue {
     }
   }
 
+  /** Never render synchronously in the caller's tick: the click handler
+   *  returns to the event loop first. A microtask is enough for that, and
+   *  it lands before the next frame, so with a frame-coalescing render
+   *  (main.ts requestRender) this request rides on the same render as the
+   *  optimistic edit or the refresh that asked in the same tick. */
   private scheduleRender(): void {
     const fn = this.deps.render;
-    const ric = (globalThis as { requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => void }).requestIdleCallback;
-    if (typeof ric === "function") {
-      ric(() => fn(), { timeout: 1000 });
-    } else {
-      setTimeout(fn, 0);
-    }
+    queueMicrotask(() => fn());
   }
 }

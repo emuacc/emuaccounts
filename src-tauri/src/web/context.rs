@@ -1,14 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use crate::root_config::{self, RootConfig};
+use crate::root_config::{CliVault, RootConfig};
 
 /// Read-only request context for the web server. Resolves the active vault
-/// (the same one the desktop app uses) without any Tauri `AppHandle`.
-///
-/// The desktop `resolve_generated_dir`/`resolve_sources_dir` helpers do exactly
-/// this — read `app_data_dir/config.json`, honor the `EMUACC_*_DIR` env
-/// overrides, then call `root_config::resolve_*`. The only thing they need the
-/// `AppHandle` for is the app-data dir path, which is a fixed location.
+/// (the same one the desktop app uses) without any Tauri `AppHandle`, through
+/// [`CliVault`] like every CLI tool.
 #[derive(Debug, Clone)]
 pub struct WebCtx {
     pub config: RootConfig,
@@ -24,17 +20,11 @@ impl WebCtx {
     /// desktop app writes) plus the `EMUACC_SOURCES_DIR` /
     /// `EMUACC_GENERATED_DIR` env overrides the Tauri commands already honor.
     pub fn from_app_data_dir(app_data_dir: &Path) -> Self {
-        let config = root_config::load_root_config(app_data_dir);
-        let sources_dir = root_config::resolve_sources(
-            std::env::var("EMUACC_SOURCES_DIR").ok().as_deref(),
-            &config,
-            app_data_dir,
-        );
-        let generated_dir = root_config::resolve_generated(
-            std::env::var("EMUACC_GENERATED_DIR").ok().as_deref(),
-            &config,
-            app_data_dir,
-        );
+        let CliVault {
+            config,
+            sources_dir,
+            generated_dir,
+        } = CliVault::from_app_data_dir(app_data_dir);
         Self {
             config,
             sources_dir,

@@ -1,19 +1,21 @@
 use crate::build_cache::{
-    dir_fingerprint, file_hash, load_cache, load_cache_filtered, lookup, save_cache,
-    sources_fingerprint, string_hash, BuildCache, CacheEntry, CachedTransaction,
+    complete_output_stats, dir_fingerprint, file_hash, file_stat, hydrate_folder_cache,
+    load_cache_filtered, load_manifest, lookup, outputs_intact, save_cache,
+    sources_fingerprint, string_hash, BuildCache, CacheEntry, CacheManifest, CachedTransaction,
 };
 use crate::csv_transform::{
-    apply_labels_and_rules, apply_rules_with_accounts, resolve_transform,
-    transform_csv_with_default,
+    apply_labels_and_rules, apply_labels_and_rules_to_all, apply_rules_with_accounts,
+    resolve_transform, transform_csv_raw,
 };
 use crate::generated_store::{
     append_text, normalize_blank_lines, posting_to_text, quote, ManualTransactionInput,
 };
 use crate::ledger_parser::{
-    parse_prices, parse_prices_csv, parse_transactions, price_file_stem, AccountBalance,
-    AccountProperties, CommodityAmount, ParseResult, Posting, PriceDirective, Transaction,
+    account_balances_from_map, add_account_balances, parse_prices, parse_prices_csv,
+    parse_transactions, price_file_stem, AccountBalance, AccountProperties, CommodityAmount,
+    ParseResult, Posting, PriceDirective, Transaction,
 };
-use crate::ofx_parser::{ofx_to_transactions_with_default, parse_ofx};
+use crate::ofx_parser::{ofx_to_raw_transactions, parse_ofx};
 use crate::rules::{generate_rule_id, LabelsFile, Rule, RulesFile};
 use crate::FALLBACK_ASSET_ACCOUNT;
 use serde::{Deserialize, Serialize};
@@ -43,10 +45,22 @@ const DIR_IMPORTS: &str = "imports";
 const DIR_PRICES: &str = "_prices";
 const FILE_SUMMARY: &str = "summary.json";
 
+/// A folder's `summary.json`: what the sidebar tree loads without parsing the
+/// ledger, and the figure a script or a person reads to check a balance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FolderSummary {
     pub transaction_count: usize,
+    /// Per-account totals of the folder's postings plus `openings`.
     pub balances: Vec<AccountBalance>,
+    /// The opening balances declared in the folder's own accounts.transactions,
+    /// already counted in `balances`. Omitted when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub openings: Vec<AccountBalance>,
+    /// The accounts under a folder root the folder's transactions post to:
+    /// what the owner-account map is rebuilt from without loading the ledger
+    /// (a scoped run). None in a summary written before the list existed.
+    #[serde(default)]
+    pub accounts: Option<Vec<String>>,
 }
 
 pub fn validate_folder_name(folder: &str) -> Result<(), String> {
@@ -94,6 +108,10 @@ pub struct PipelineResult {
     /// Source folders whose ledger files were rewritten this run, sorted.
     #[serde(default)]
     pub changed_folders: Vec<String>,
+    /// True when the run wrote the changed folders from their own sources and
+    /// left the rest on disk unread (see `full_run_blockers`).
+    #[serde(default)]
+    pub scoped: bool,
     /// In-memory data for constructing ParseResult without re-reading from disk.
     /// Boxed to minimize PipelineResult stack footprint (cucumber async state machines are stack-sensitive).
     #[serde(skip)]
@@ -1265,6 +1283,55 @@ pub fn link_equity_swaps_per_set<'b>(
     }
 }
 
+/// A row the swap linker may rewrite: one with an equity:trading leg (plain,
+/// `:sell` or `:buy`), or one whose meta already carries a swap reference.
+/// Every mutation in [`link_equity_swaps_per_set`] lands on such a row.
+fn is_trade(txn: &Transaction) -> bool {
+    txn.postings
+        .iter()
+        .any(|p| p.account.starts_with("equity:trading"))
+        || txn
+            .meta
+            .as_deref()
+            .is_some_and(|m| m.split(',').any(|tag| tag.trim().starts_with("swap:")))
+}
+
+/// The first trade in a folder that changed this run, if any: the row that
+/// makes the swap linker run. A row of unknown provenance counts as changed.
+fn changed_folder_trade<'a>(
+    tagged_txns: &'a [(Option<String>, Option<String>, Transaction)],
+    unchanged_folders: &std::collections::HashSet<String>,
+) -> Option<&'a (Option<String>, Option<String>, Transaction)> {
+    tagged_txns.iter().find(|(_, folder_opt, txn)| {
+        let in_changed_folder = match folder_opt {
+            Some(f) => !unchanged_folders.contains(f),
+            None => true,
+        };
+        in_changed_folder && is_trade(txn)
+    })
+}
+
+/// The trades of each folder, serialised and sorted, so two snapshots say
+/// which folders the linker changed between them.
+fn trades_by_folder(
+    tagged_txns: &[(Option<String>, Option<String>, Transaction)],
+) -> HashMap<String, Vec<String>> {
+    let mut acc: HashMap<String, Vec<String>> = HashMap::new();
+    for (_, folder_opt, txn) in tagged_txns {
+        if let Some(folder_rel) = folder_opt {
+            if is_trade(txn) {
+                acc.entry(folder_rel.clone())
+                    .or_default()
+                    .push(transaction_to_text(txn));
+            }
+        }
+    }
+    for texts in acc.values_mut() {
+        texts.sort();
+    }
+    acc
+}
+
 fn extract_txn_id_from_meta(meta: &Option<String>) -> Option<String> {
     meta.as_ref().and_then(|m| {
         m.split(',')
@@ -1785,35 +1852,17 @@ pub fn run_pipeline(config: &PipelineConfig) -> Result<PipelineResult, String> {
     let reconcile_warnings = reconcile_generated_folders(&config.generated_dir, &source_folders);
     timing!("reconcile_folders");
 
-    let mut cache = if has_hint {
-        // Selective load: only folder caches for the affected account sets
-        let folders_to_load: std::collections::HashSet<String> = source_folders
-            .iter()
-            .filter(|f| {
-                if let Some(ref sets) = affected_sets {
-                    extract_account_set(f).is_some_and(|s| sets.contains(&s))
-                } else {
-                    true
-                }
-            })
-            .cloned()
-            .collect();
-        eprintln!(
-            "[pipeline] hint: loading {} of {} folder caches",
-            folders_to_load.len(),
-            source_folders.len()
-        );
-        load_cache_filtered(&config.generated_dir, Some(&folders_to_load))
-    } else {
-        load_cache(&config.generated_dir)
-    };
-    timing!("load_cache");
-
-    // Layer 1: Global early-exit via inputs_hash (skip when we have a hint — we know something changed).
-    // MATCHER_VERSION is folded in so a version bump gets past this early exit
-    // too — otherwise unchanged sources short-circuit before the folder-level
-    // checks ever see the new version. Relay sync state is left out: a sync
-    // rewrites it without changing any pipeline input.
+    // Layer 1: the global early exit, decided from the cache manifest alone.
+    // When the sources fingerprint matches the one the manifest recorded and
+    // every output file is still what the pipeline last wrote, the result is
+    // the saved metadata and nothing else is read: the folder caches (tens of
+    // MB of transactions on a large vault) are loaded only when there is work
+    // to do. A hint means the caller knows something changed, so the
+    // fingerprint is skipped. MATCHER_VERSION is folded in so a version bump
+    // gets past this early exit too — otherwise unchanged sources
+    // short-circuit before the folder-level checks ever see the new version.
+    // Relay sync state is left out: a sync rewrites it without changing any
+    // pipeline input.
     let global_fp = if has_hint {
         String::new() // skip fingerprinting
     } else {
@@ -1824,56 +1873,49 @@ pub fn run_pipeline(config: &PipelineConfig) -> Result<PipelineResult, String> {
         ))
     };
     timing!("global_fingerprint");
-    if !has_hint
-        && !config.force
-        && !global_fp.is_empty()
-        && cache.inputs_hash.as_deref() == Some(&global_fp)
-    {
-        // Validate that every known output file still matches its cached
-        // hash. Without this check, an externally-modified generated file
-        // (git checkout, manual edit, another tool) is invisible — the
-        // sources fingerprint matches, so the pipeline returns immediately
-        // and never writes the corrected file. With it, any divergence
-        // triggers the full pipeline, which re-loads cached txns from
-        // cache.entries and lets write_if_changed restore the on-disk file.
-        let outputs_intact = cache.output_hashes.iter().all(|(rel_key, expected)| {
-            let path = config.generated_dir.join(rel_key);
-            match fs::read_to_string(&path) {
-                Ok(text) => &string_hash(&text) == expected,
-                Err(_) => false,
-            }
-        });
-        if outputs_intact {
-            if let Some(meta) = PipelineMetadata::load(&config.generated_dir) {
-                let mut csv_cached_count = 0usize;
-                let mut ofx_cached_count = 0usize;
-                for key in cache.entries.keys() {
-                    if key.ends_with(".csv") {
-                        csv_cached_count += 1;
-                    } else if key.ends_with(".ofx") {
-                        ofx_cached_count += 1;
-                    }
+    if !has_hint && !config.force {
+        if let Some(mut manifest) = load_manifest(&config.generated_dir) {
+            if manifest.inputs_hash.as_deref() == Some(&global_fp)
+                && outputs_intact(&config.generated_dir, &manifest)
+            {
+                if let Some(meta) = PipelineMetadata::load(&config.generated_dir) {
+                    // A manifest from before output stats existed had every
+                    // file re-hashed just now; record the stats so the next
+                    // run trusts them.
+                    complete_output_stats(&config.generated_dir, &mut manifest)?;
+                    // Every source file was served from the cache.
+                    let csv_cached = scan_csv_files(&config.sources_dir)?.len();
+                    let ofx_cached = scan_ofx_files(&config.sources_dir)?.len();
+                    timing!("early_exit");
+                    return Ok(PipelineResult {
+                        csv_transformed: 0,
+                        csv_cached,
+                        ofx_transformed: 0,
+                        ofx_cached,
+                        manual_count: 0,
+                        total_written: 0,
+                        warnings: reconcile_warnings,
+                        owner_accounts: meta.owner_accounts,
+                        account_folders: meta.account_folders,
+                        account_properties: meta.account_properties,
+                        early_exit: true,
+                        output_files_written: 0,
+                        output_files_skipped: 0,
+                        changed_folders: Vec::new(),
+                        scoped: false,
+                        in_memory: None,
+                    });
                 }
-                return Ok(PipelineResult {
-                    csv_transformed: 0,
-                    csv_cached: csv_cached_count,
-                    ofx_transformed: 0,
-                    ofx_cached: ofx_cached_count,
-                    manual_count: 0,
-                    total_written: 0,
-                    warnings: reconcile_warnings,
-                    owner_accounts: meta.owner_accounts,
-                    account_folders: meta.account_folders,
-                    account_properties: meta.account_properties,
-                    early_exit: true,
-                    output_files_written: 0,
-                    output_files_skipped: 0,
-                    changed_folders: Vec::new(),
-                    in_memory: None,
-                });
             }
         }
     }
+
+    // The manifest alone (fingerprints, output hashes) says what changed; the
+    // folder caches (tens of MB of rows on a large vault) are read once the
+    // run knows which folders it needs — the changed ones, or every folder
+    // of the affected sets when the change cannot be scoped.
+    let mut cache = load_cache_filtered(&config.generated_dir, Some(&HashSet::new()));
+    timing!("load_cache");
 
     let csv_files = scan_csv_files(&config.sources_dir)?;
     let ofx_files = scan_ofx_files(&config.sources_dir)?;
@@ -1998,6 +2040,44 @@ pub fn run_pipeline(config: &PipelineConfig) -> Result<PipelineResult, String> {
 
     timing!("layer2_unchanged_folders");
 
+    // A scoped run writes the changed folders from their own sources and
+    // leaves the rest on disk unread; a full run loads every folder of the
+    // affected sets. The folder caches are read accordingly.
+    let fingerprint_changed: Vec<String> = source_folders
+        .iter()
+        .filter(|f| !unchanged_folders.contains(*f))
+        .cloned()
+        .collect();
+    let blockers = full_run_blockers(
+        config,
+        &fingerprint_changed,
+        &unchanged_folders,
+        &cache,
+        load_manifest(&config.generated_dir).as_ref(),
+    );
+    // A run that leaves no folder on disk is a full run by definition: every
+    // set is complete in memory.
+    let mut scoped = blockers.is_empty() && !unchanged_folders.is_empty();
+    if scoped {
+        eprintln!(
+            "[pipeline] scoped run: {} changed folder(s), {} left on disk",
+            fingerprint_changed.len(),
+            unchanged_folders.len()
+        );
+        for folder_rel in &fingerprint_changed {
+            hydrate_folder_cache(&mut cache, &config.generated_dir, folder_rel);
+        }
+    } else {
+        let why = if blockers.is_empty() {
+            "every folder changed".to_string()
+        } else {
+            blockers.join("; ")
+        };
+        eprintln!("[pipeline] full run: {why}");
+        hydrate_folders(&mut cache, config, &source_folders, affected_sets.as_ref());
+    }
+    timing!("hydrate_cache");
+
     // Initialize pipeline state
     let mut state = PipelineState {
         tagged_txns: Vec::new(),
@@ -2035,140 +2115,26 @@ pub fn run_pipeline(config: &PipelineConfig) -> Result<PipelineResult, String> {
     let mut force_rewrite_folders: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
-    // Load cached transactions for unchanged folders.
-    // When we have a hint, only load folders in the affected set(s) — skip the rest entirely.
-    for folder_rel in &unchanged_folders {
-        // Skip folders outside the affected set when using hints
-        if let Some(ref sets) = affected_sets {
-            let folder_set = extract_account_set(folder_rel);
-            if !folder_set.as_ref().is_some_and(|s| sets.contains(s)) {
-                // Still track folder metadata for the result
-                if let Some(ref owner) = folder_set {
-                    let account_name = folder_to_account_name(folder_rel);
-                    state
-                        .owner_accounts
-                        .entry(owner.clone())
-                        .or_default()
-                        .push(account_name.clone());
-                    state
-                        .account_folders
-                        .entry(owner.clone())
-                        .or_default()
-                        .insert(account_name.clone(), folder_rel.clone());
-                    state
-                        .auto_accounts
-                        .entry(owner.clone())
-                        .or_default()
-                        .insert(account_name);
-                }
-                continue;
-            }
-        }
-
-        let account_set = extract_account_set(folder_rel);
-
-        // Track owner_accounts/account_folders/auto_accounts from folder structure
-        if let Some(ref owner) = account_set {
-            let account_name = folder_to_account_name(folder_rel);
-            state
-                .owner_accounts
-                .entry(owner.clone())
-                .or_default()
-                .push(account_name.clone());
-            state
-                .account_folders
-                .entry(owner.clone())
-                .or_default()
-                .insert(account_name.clone(), folder_rel.clone());
-            state
-                .auto_accounts
-                .entry(owner.clone())
-                .or_default()
-                .insert(account_name);
-        }
-
-        // Two states feed unchanged-folder loading:
-        //
-        //   intact   — on-disk ledger.transactions hash matches the cached
-        //              output_hash. The file is what we last wrote, including
-        //              auto_link price annotations and any other late-stage
-        //              mutations. Load from disk and push into tagged_txns;
-        //              skip rewrite unless a now-ignored txn forces it.
-        //
-        //   diverged — on-disk file has been clobbered externally (git
-        //              checkout, manual edit, another tool) or is missing.
-        //              Load from cache.entries (pre-auto_link) and flag for
-        //              rewrite via `force_rewrite_folders`. The downstream
-        //              auto_link path re-applies price annotations.
-        let ledger_path = config.generated_dir.join(folder_rel).join(FILE_LEDGER);
-        let on_disk_text = fs::read_to_string(&ledger_path).ok();
-        let ledger_rel_key = format!("{folder_rel}/{FILE_LEDGER}");
-        let on_disk_intact = match (&on_disk_text, cache.output_hashes.get(&ledger_rel_key)) {
-            (Some(t), Some(expected)) => &string_hash(t) == expected,
-            _ => false,
-        };
-
-        if on_disk_intact {
-            let text = on_disk_text.expect("intact implies Some(text)");
-            let result = parse_transactions(&text);
-            let count = result.transactions.len();
+    if scoped {
+        // The unchanged folders stay on disk: only their derived accounts are
+        // registered, and their manual entries are already in their ledgers
+        // (so the manual loop below skips them, as for an intact folder).
+        for folder_rel in &unchanged_folders {
+            register_folder(&mut state, folder_rel);
             intact_folders.insert(folder_rel.clone());
-            let folder_has_ignored = !ignored_ids.is_empty()
-                && result
-                    .transactions
-                    .iter()
-                    .any(|t| has_ignored_id(t.meta.as_deref(), &ignored_ids));
-            // The folder is fingerprint-unchanged but the on-disk ledger
-            // includes a now-ignored txn: force a rewrite. tagged_txns is
-            // filtered with the same `has_ignored_id` below (`filter_ignored`),
-            // so the rewrite omits them automatically.
-            if folder_has_ignored {
-                force_rewrite_folders.insert(folder_rel.clone());
-            }
-            for txn in result.transactions {
-                state
-                    .tagged_txns
-                    .push((account_set.clone(), Some(folder_rel.clone()), txn));
-            }
-            state.csv_cached += count;
-        } else {
-            // Recovery path: on-disk file is corrupt or missing. Rebuild
-            // from cache.entries and flag for rewrite. Manual transactions
-            // are deliberately excluded here — they're re-parsed downstream
-            // from sources/.../manual.transactions, so loading them from
-            // cache too would double-count.
-            let folder_prefix = if folder_rel.is_empty() {
-                String::new()
-            } else {
-                format!("{folder_rel}/")
-            };
-            let mut entries_for_folder: Vec<(&String, &CacheEntry)> = cache
-                .entries
-                .iter()
-                .filter(|(k, _)| !folder_prefix.is_empty() && k.starts_with(&folder_prefix))
-                .collect();
-            entries_for_folder.sort_by(|a, b| a.0.cmp(b.0));
-            let mut count = 0usize;
-            for (_path, entry) in &entries_for_folder {
-                for ct in &entry.transactions {
-                    let txn = match ct.txn.as_ref() {
-                        Some(t) => t.clone(),
-                        None => match parse_transactions(&ct.text).transactions.into_iter().next() {
-                            Some(t) => t,
-                            None => continue,
-                        },
-                    };
-                    state
-                        .tagged_txns
-                        .push((account_set.clone(), Some(folder_rel.clone()), txn));
-                    count += 1;
-                }
-            }
-            if count > 0 {
-                force_rewrite_folders.insert(folder_rel.clone());
-            }
-            state.csv_cached += count;
         }
+    } else {
+        load_unchanged_folders(
+            &mut state,
+            &unchanged_folders,
+            affected_sets.as_ref(),
+            config,
+            &cache,
+            &ignored_ids,
+            &declared_accounts,
+            &mut intact_folders,
+            &mut force_rewrite_folders,
+        )?;
     }
 
     timing!("load_cached_txns");
@@ -2192,6 +2158,16 @@ pub fn run_pipeline(config: &PipelineConfig) -> Result<PipelineResult, String> {
         &declared_accounts,
     )?;
     timing!("process_ofx");
+    if scoped {
+        // Every file of an unchanged folder was served by its ledger on disk.
+        let in_unchanged = |path: &PathBuf| {
+            path.parent()
+                .and_then(|dir| dir.strip_prefix(&config.sources_dir).ok())
+                .is_some_and(|rel| unchanged_folders.contains(&rel.to_string_lossy().to_string()))
+        };
+        state.csv_cached += csv_files.iter().filter(|p| in_unchanged(p)).count();
+        state.ofx_cached += ofx_files.iter().filter(|p| in_unchanged(p)).count();
+    }
 
     // Prune cache entries for files that no longer exist
     let active_paths: Vec<String> = state.active_csv_paths.clone();
@@ -2252,6 +2228,30 @@ pub fn run_pipeline(config: &PipelineConfig) -> Result<PipelineResult, String> {
         state.tagged_txns.push((set, folder_opt, txn));
     }
 
+    // A changed folder may hold a trade it did not before: the swap linker
+    // pairs legs across the whole set, so the rest of it is loaded after all
+    // (the folders' old ledgers were checked before the transform).
+    if scoped
+        && state.tagged_txns.iter().any(|(_, folder, txn)| {
+            folder.as_ref().is_none_or(|f| !unchanged_folders.contains(f)) && is_trade(txn)
+        })
+    {
+        eprintln!("[pipeline] full run: a changed folder now holds trades");
+        hydrate_folders(&mut cache, config, &source_folders, affected_sets.as_ref());
+        load_unchanged_folders(
+            &mut state,
+            &unchanged_folders,
+            affected_sets.as_ref(),
+            config,
+            &cache,
+            &ignored_ids,
+            &declared_accounts,
+            &mut intact_folders,
+            &mut force_rewrite_folders,
+        )?;
+        scoped = false;
+    }
+
     // Filter out ignored transactions (ids loaded above)
     if !ignored_ids.is_empty() {
         state
@@ -2267,6 +2267,15 @@ pub fn run_pipeline(config: &PipelineConfig) -> Result<PipelineResult, String> {
         &state.tagged_txns,
         &config.sources_dir,
     );
+    if scoped {
+        // The unchanged folders' postings were not loaded: their summaries
+        // say which accounts they post to.
+        add_owner_accounts_from_summaries(
+            &mut state.owner_accounts,
+            &unchanged_folders,
+            &config.generated_dir,
+        )?;
+    }
     timing!("rebuild_owner_accounts");
 
     // Sort: by datetime, then meta, then a per-txn tiebreak — see `sort_tagged_txns`.
@@ -2282,88 +2291,62 @@ pub fn run_pipeline(config: &PipelineConfig) -> Result<PipelineResult, String> {
     // Auto-link equity:trading swap pairs and derive prices from counterparts,
     // each set's legs in that set's own base currency (set-then-vault lookup;
     // a transaction that belongs to no set prices in the vault default).
-    let price_graph = crate::ledger_parser::PriceGraph::load(&config.sources_dir);
-    let base_currencies = crate::display_config::resolve_base_currencies(
-        &config.generated_dir,
-        state
-            .tagged_txns
-            .iter()
-            .map(|(set, _, _)| set.as_deref().unwrap_or("")),
-    );
-
-    // Snapshot per-folder serialised text BEFORE auto_link so we can detect
-    // which folders auto_link mutated (price annotations, sell/buy suffixes,
-    // swap-cross-reference meta). Folders whose post-link content differs
-    // join `changed_folders` so their ledger files get rewritten.
-    let pre_link_by_folder: HashMap<String, Vec<String>> = {
-        let mut acc: HashMap<String, Vec<String>> = HashMap::new();
-        for (_, folder_opt, txn) in &state.tagged_txns {
-            if let Some(folder_rel) = folder_opt {
-                acc.entry(folder_rel.clone())
-                    .or_default()
-                    .push(transaction_to_text(txn));
-            }
-        }
-        for v in acc.values_mut() {
-            v.sort();
-        }
-        acc
-    };
-
-    // auto_link is the dominant rebuild cost (~2.7s on a 54k-txn vault) — it
-    // scans the whole affected set. But its output only changes when an
-    // equity:trading leg is added/removed/modified, which can only happen in a
-    // folder that changed this run. So run it only when a CHANGED folder
-    // actually contains equity:trading; otherwise the swap links already cached
-    // in tagged_txns are still correct and we skip the scan entirely.
+    //
+    // auto_link scans the whole affected set, but its output only changes
+    // when an equity:trading leg is added, removed or modified, which can
+    // only happen in a folder that changed this run. So it runs only when a
+    // changed folder holds a trade; otherwise the swap links already in
+    // tagged_txns are still correct and the scan is skipped entirely.
     //
     // Two narrowing layers: the hint restricts tagged_txns to the affected
     // account-set (the linker groups legs by set, so swaps never pair across
     // sets — a future cross-set swap feature must force a full rebuild); this
     // skip then avoids the scan when no changed folder trades. `force` empties
     // unchanged_folders, so a forced full rebuild always re-runs auto_link.
-    let changed_touches_equity_trading = state.tagged_txns.iter().any(|(_, folder_opt, txn)| {
-        let in_changed_folder = match folder_opt {
-            Some(f) => !unchanged_folders.contains(f),
-            None => true, // unknown provenance — treat as changed (conservative)
+    //
+    // The price graph (every file under sources/_prices, 27 MB on a large
+    // vault) is read only for the linker, so a skipped run never parses it.
+    //
+    // The folders the linker changed (price annotations, sell/buy suffixes,
+    // swap cross-references) join `changed_folders` so their ledgers are
+    // rewritten. They are found by comparing the trades before and after:
+    // only the trades, since those are the only rows the linker rewrites —
+    // a few thousand on a vault whose other tens of thousands are bank rows.
+    let auto_link_modified_folders: std::collections::HashSet<String> =
+        match changed_folder_trade(&state.tagged_txns, &unchanged_folders) {
+            None => std::collections::HashSet::new(),
+            Some((_, folder_opt, _)) => {
+                eprintln!(
+                    "[pipeline] auto_link: changed folder {} holds trades",
+                    folder_opt.as_deref().unwrap_or("(root)")
+                );
+                let price_graph = crate::ledger_parser::PriceGraph::load(&config.sources_dir);
+                let base_currencies = crate::display_config::resolve_base_currencies(
+                    &config.generated_dir,
+                    state
+                        .tagged_txns
+                        .iter()
+                        .map(|(set, _, _)| set.as_deref().unwrap_or("")),
+                );
+                timing!("auto_link_price_graph");
+                let before = trades_by_folder(&state.tagged_txns);
+                timing!("auto_link_snapshot");
+                link_equity_swaps_per_set(&mut state.tagged_txns, Some(&price_graph), &|set| {
+                    base_currencies
+                        .get(set.unwrap_or(""))
+                        .and_then(|currency| currency.as_deref())
+                });
+                timing!("auto_link_equity_swaps");
+                let after = trades_by_folder(&state.tagged_txns);
+                before
+                    .keys()
+                    .chain(after.keys())
+                    .filter(|folder| before.get(*folder) != after.get(*folder))
+                    .cloned()
+                    .collect()
+            }
         };
-        in_changed_folder
-            && txn
-                .postings
-                .iter()
-                .any(|p| p.account.starts_with("equity:trading"))
-    });
-    if changed_touches_equity_trading {
-        link_equity_swaps_per_set(&mut state.tagged_txns, Some(&price_graph), &|set| {
-            base_currencies
-                .get(set.unwrap_or(""))
-                .and_then(|currency| currency.as_deref())
-        });
-    }
-
-    // Detect folders whose tagged_txns content was mutated by auto_link.
-    let mut auto_link_modified_folders: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    {
-        let mut post_link_by_folder: HashMap<&String, Vec<String>> = HashMap::new();
-        for (_, folder_opt, txn) in &state.tagged_txns {
-            if let Some(folder_rel) = folder_opt {
-                post_link_by_folder
-                    .entry(folder_rel)
-                    .or_default()
-                    .push(transaction_to_text(txn));
-            }
-        }
-        for (folder_rel, mut post_texts) in post_link_by_folder {
-            post_texts.sort();
-            let pre = pre_link_by_folder.get(folder_rel.as_str());
-            if pre.map(|v| v.as_slice()) != Some(post_texts.as_slice()) {
-                auto_link_modified_folders.insert(folder_rel.clone());
-            }
-        }
-    }
-
-    timing!("auto_link_equity_swaps");
+    timing!("auto_link_diff");
 
     // Folders to write this run:
     //   - source_folders whose fingerprint changed (CSV/OFX/manual edits)
@@ -2377,6 +2360,17 @@ pub fn run_pipeline(config: &PipelineConfig) -> Result<PipelineResult, String> {
         .collect();
     changed_folders.extend(force_rewrite_folders);
     changed_folders.extend(auto_link_modified_folders);
+    if !scoped {
+        // A summary from before it listed the folder's accounts is rewritten
+        // now, while the folder's rows are loaded, so a later run can be
+        // scoped (the ledger's text is unchanged and is skipped by hash).
+        changed_folders.extend(
+            intact_folders
+                .iter()
+                .filter(|f| summary_accounts(&config.generated_dir, f).is_none())
+                .cloned(),
+        );
+    }
     let mut changed_folders_sorted: Vec<String> = changed_folders.iter().cloned().collect();
     changed_folders_sorted.sort();
     if !changed_folders_sorted.is_empty() {
@@ -2512,11 +2506,322 @@ pub fn run_pipeline(config: &PipelineConfig) -> Result<PipelineResult, String> {
         output_files_written,
         output_files_skipped,
         changed_folders: changed_folders_sorted,
-        in_memory: Some(Box::new(PipelineInMemory {
-            tagged_txns: state.tagged_txns,
-            accounts_text_by_set,
-        })),
+        scoped,
+        // A scoped run holds only the changed folders' rows: no set is
+        // complete in memory, so a reader loads from disk.
+        in_memory: (!scoped).then(|| {
+            Box::new(PipelineInMemory {
+                tagged_txns: state.tagged_txns,
+                accounts_text_by_set,
+            })
+        }),
     })
+}
+
+/// Register a source folder's derived account in the run's maps: its set
+/// owns the account, the folder backs it, and the set's accounts file
+/// declares it.
+fn register_folder(state: &mut PipelineState, folder_rel: &str) {
+    let Some(owner) = extract_account_set(folder_rel) else {
+        return;
+    };
+    let account_name = folder_to_account_name(folder_rel);
+    state
+        .owner_accounts
+        .entry(owner.clone())
+        .or_default()
+        .push(account_name.clone());
+    state
+        .account_folders
+        .entry(owner.clone())
+        .or_default()
+        .insert(account_name.clone(), folder_rel.to_string());
+    state.auto_accounts.entry(owner).or_default().insert(account_name);
+}
+
+/// Read the folder caches a full run needs: every source folder's, or with a
+/// hint the affected sets' only.
+fn hydrate_folders(
+    cache: &mut BuildCache,
+    config: &PipelineConfig,
+    source_folders: &[String],
+    affected_sets: Option<&HashSet<String>>,
+) {
+    for folder_rel in source_folders {
+        let in_scope = affected_sets
+            .is_none_or(|sets| extract_account_set(folder_rel).is_some_and(|s| sets.contains(&s)));
+        if in_scope {
+            hydrate_folder_cache(cache, &config.generated_dir, folder_rel);
+        }
+    }
+}
+
+/// Load the unchanged folders' transactions for a full run: from each
+/// folder's ledger when it is what the pipeline last wrote (intact: the file
+/// carries the linker's annotations and every other late mutation), else
+/// from the cache (diverged: the file was clobbered or is missing; the folder
+/// is rewritten and the linker re-annotates it). With a hint, folders outside
+/// the affected sets are registered by name and not loaded.
+#[allow(clippy::too_many_arguments)]
+fn load_unchanged_folders(
+    state: &mut PipelineState,
+    unchanged_folders: &HashSet<String>,
+    affected_sets: Option<&HashSet<String>>,
+    config: &PipelineConfig,
+    cache: &BuildCache,
+    ignored_ids: &HashSet<String>,
+    declared_accounts: &[String],
+    intact_folders: &mut HashSet<String>,
+    force_rewrite_folders: &mut HashSet<String>,
+) -> Result<(), String> {
+    for folder_rel in unchanged_folders {
+        register_folder(state, folder_rel);
+        let account_set = extract_account_set(folder_rel);
+        if let Some(sets) = affected_sets {
+            if !account_set.as_ref().is_some_and(|s| sets.contains(s)) {
+                continue;
+            }
+        }
+
+        let ledger_path = config.generated_dir.join(folder_rel).join(FILE_LEDGER);
+        let on_disk_text = fs::read_to_string(&ledger_path).ok();
+        let ledger_rel_key = format!("{folder_rel}/{FILE_LEDGER}");
+        let on_disk_intact = match (&on_disk_text, cache.output_hashes.get(&ledger_rel_key)) {
+            (Some(t), Some(expected)) => &string_hash(t) == expected,
+            _ => false,
+        };
+
+        if on_disk_intact {
+            let text = on_disk_text.expect("intact implies Some(text)");
+            let result = parse_transactions(&text);
+            let count = result.transactions.len();
+            intact_folders.insert(folder_rel.clone());
+            // The folder is fingerprint-unchanged but its ledger includes a
+            // now-ignored txn: rewrite it. tagged_txns is filtered with the
+            // same `has_ignored_id` (`filter_ignored`), so the rewrite omits
+            // them automatically.
+            let folder_has_ignored = !ignored_ids.is_empty()
+                && result
+                    .transactions
+                    .iter()
+                    .any(|t| has_ignored_id(t.meta.as_deref(), ignored_ids));
+            if folder_has_ignored {
+                force_rewrite_folders.insert(folder_rel.clone());
+            }
+            for txn in result.transactions {
+                state
+                    .tagged_txns
+                    .push((account_set.clone(), Some(folder_rel.clone()), txn));
+            }
+            state.csv_cached += count;
+        } else {
+            // Manual transactions are deliberately excluded here: they are
+            // re-parsed from sources/.../manual.transactions, so loading them
+            // from the cache too would double-count.
+            let folder_prefix = format!("{folder_rel}/");
+            let mut entries_for_folder: Vec<(&String, &CacheEntry)> = cache
+                .entries
+                .iter()
+                .filter(|(k, _)| !folder_rel.is_empty() && k.starts_with(&folder_prefix))
+                .collect();
+            entries_for_folder.sort_by(|a, b| a.0.cmp(b.0));
+            let mut count = 0usize;
+            for (path, entry) in &entries_for_folder {
+                let txns =
+                    categorise_cached_file(path, &entry.transactions, config, declared_accounts)?;
+                for txn in txns {
+                    state
+                        .tagged_txns
+                        .push((account_set.clone(), Some(folder_rel.clone()), txn));
+                    count += 1;
+                }
+            }
+            // The ledger is rewritten whatever the folder holds: a manual-only
+            // folder has no cache entries, and its rows come from the manual
+            // loop below.
+            force_rewrite_folders.insert(folder_rel.clone());
+            state.csv_cached += count;
+        }
+    }
+    Ok(())
+}
+
+/// Why a run loads every folder of the affected sets instead of only the
+/// changed ones. A scoped run writes the changed folders from their own
+/// sources and leaves the rest on disk, which gives the same output as a
+/// full run only when:
+///
+/// - the run is not forced;
+/// - the ignored list is unchanged: a new id can hide a row in any folder;
+/// - there is no root-level manual.transactions: its rows belong to no folder;
+/// - every changed folder belongs to an account set;
+/// - no changed folder held a trade (its old ledger has no equity:trading
+///   leg or swap reference): the swap linker pairs legs across the whole set.
+///   A trade the change introduces is found after the transform, and the run
+///   loads the set then;
+/// - every unchanged folder's ledger and summary are what the pipeline last
+///   wrote (their recorded size and mtime, else the recovery path rewrites
+///   them), and the summary carries the accounts list the owner-account map
+///   is rebuilt from.
+///
+/// A self-transfer between folders needs no other folder's rows: it matches
+/// on declared account names.
+fn full_run_blockers(
+    config: &PipelineConfig,
+    changed: &[String],
+    unchanged: &HashSet<String>,
+    cache: &BuildCache,
+    manifest: Option<&CacheManifest>,
+) -> Vec<String> {
+    if config.force {
+        return vec!["forced".to_string()];
+    }
+    let mut blockers = Vec::new();
+    if ignored_list_changed(&config.sources_dir, cache) {
+        blockers.push("the ignored list changed".to_string());
+    }
+    if config.sources_dir.join(FILE_MANUAL).exists() {
+        blockers.push("a root-level manual.transactions".to_string());
+    }
+    for folder_rel in changed {
+        if extract_account_set(folder_rel).is_none() {
+            blockers.push(format!("{folder_rel} belongs to no account set"));
+        }
+        let ledger = config.generated_dir.join(folder_rel).join(FILE_LEDGER);
+        let held_trades = fs::read_to_string(&ledger)
+            .map(|text| parse_transactions(&text).transactions.iter().any(is_trade))
+            .unwrap_or(false);
+        if held_trades {
+            blockers.push(format!("{folder_rel} held trades"));
+        }
+    }
+    let mut unchanged_sorted: Vec<&String> = unchanged.iter().collect();
+    unchanged_sorted.sort();
+    for folder_rel in unchanged_sorted {
+        let intact = [FILE_LEDGER, FILE_SUMMARY].iter().all(|file| {
+            let rel_key = format!("{folder_rel}/{file}");
+            let recorded = manifest.and_then(|m| m.output_stats.get(&rel_key));
+            let now = file_stat(&config.generated_dir.join(folder_rel).join(file));
+            matches!((recorded, now), (Some(r), Some(n)) if r == &n)
+        });
+        if !intact {
+            blockers.push(format!("{folder_rel}'s outputs are not what the pipeline last wrote"));
+        } else if summary_accounts(&config.generated_dir, folder_rel).is_none() {
+            blockers.push(format!("{folder_rel}'s summary predates the accounts list"));
+        }
+    }
+    blockers
+}
+
+/// Has sources/_ignored.txt changed since the cache recorded it?
+fn ignored_list_changed(sources_dir: &Path, cache: &BuildCache) -> bool {
+    let path = sources_dir.join(FILE_IGNORED);
+    let current = if path.exists() { file_hash(&path).ok() } else { None };
+    current != cache.ignored_hash
+}
+
+/// The accounts a folder's summary lists, None when the summary is missing or
+/// predates the list.
+fn summary_accounts(generated_dir: &Path, folder_rel: &str) -> Option<Vec<String>> {
+    let text = fs::read_to_string(generated_dir.join(folder_rel).join(FILE_SUMMARY)).ok()?;
+    serde_json::from_str::<FolderSummary>(&text).ok()?.accounts
+}
+
+/// What `rebuild_owner_accounts` derives from the unchanged folders' postings,
+/// read from their summaries instead (a scoped run did not load them).
+fn add_owner_accounts_from_summaries(
+    owner_accounts: &mut HashMap<String, Vec<String>>,
+    unchanged_folders: &HashSet<String>,
+    generated_dir: &Path,
+) -> Result<(), String> {
+    for folder_rel in unchanged_folders {
+        let Some(owner) = extract_account_set(folder_rel) else {
+            continue;
+        };
+        let accounts = summary_accounts(generated_dir, folder_rel).ok_or_else(|| {
+            format!("{folder_rel}/{FILE_SUMMARY} lists no accounts; rebuild the vault")
+        })?;
+        owner_accounts.entry(owner).or_default().extend(accounts);
+    }
+    for accounts in owner_accounts.values_mut() {
+        accounts.sort();
+        accounts.dedup();
+    }
+    Ok(())
+}
+
+/// The rows of one source file as the vault categorises them today: the
+/// labels and rules that apply to the file over its cached raw rows, then,
+/// for a row still on the default expense account, the self-transfer pass
+/// against the declared accounts (CSV only: `declared_accounts` is empty for
+/// OFX). The cache holds the raw rows — the transform's output before any
+/// rule — so a rule or label change re-runs only this pass, never the
+/// transform, and a cache hit and a miss go through the same code.
+fn categorise_rows(
+    raw: &[CachedTransaction],
+    labels: &LabelsFile,
+    rules: &RulesFile,
+    default_expense_account: &str,
+    declared_accounts: &[String],
+) -> Vec<Transaction> {
+    let mut txns: Vec<Transaction> = raw
+        .iter()
+        .filter_map(|ct| match ct.txn.as_ref() {
+            Some(t) => Some(t.clone()),
+            None => parse_transactions(&ct.text).transactions.into_iter().next(),
+        })
+        .collect();
+    apply_labels_and_rules_to_all(&mut txns, labels, rules);
+    if !declared_accounts.is_empty() {
+        for txn in &mut txns {
+            if txn.postings.len() >= 2 && txn.postings[1].account == default_expense_account {
+                apply_rules_with_accounts(txn, &RulesFile::default(), declared_accounts);
+            }
+        }
+    }
+    txns
+}
+
+/// [`categorise_rows`] for the cache entry of the source file `relative`,
+/// with the labels and rules that apply to it today — for the recovery path,
+/// which has no transform chain in hand.
+fn categorise_cached_file(
+    relative: &str,
+    raw: &[CachedTransaction],
+    config: &PipelineConfig,
+    declared_accounts: &[String],
+) -> Result<Vec<Transaction>, String> {
+    let path = config.sources_dir.join(relative);
+    if relative.ends_with(".csv") {
+        let chain = resolve_transform(&path, &config.sources_dir)?;
+        return Ok(categorise_rows(
+            raw,
+            &chain.labels,
+            &chain.rules,
+            &config.default_expense_account,
+            declared_accounts,
+        ));
+    }
+    let dir = path.parent().unwrap_or(Path::new(""));
+    let labels = gather_labels_chain(dir, &config.sources_dir);
+    let rules = gather_rules_chain(dir, &config.sources_dir);
+    Ok(categorise_rows(
+        raw,
+        &labels,
+        &rules,
+        &config.default_expense_account,
+        &[],
+    ))
+}
+
+/// The raw rows of a source file as the cache stores them.
+fn cached_rows(txns: &[Transaction]) -> Vec<CachedTransaction> {
+    txns.iter()
+        .map(|t| CachedTransaction {
+            text: transaction_to_text(t),
+            txn: Some(t.clone()),
+        })
+        .collect()
 }
 
 fn process_csv_files(
@@ -2585,35 +2890,30 @@ fn process_csv_files(
             }
         }
 
-        if let Some(cached) = lookup(cache, &relative, &content_h, &chain.combined_hash) {
+        let folder_opt: Option<String> = if folder_relative.is_empty() {
+            None
+        } else {
+            Some(folder_relative.clone())
+        };
+
+        if let Some(cached) = lookup(cache, &relative, &content_h, &chain.raw_hash) {
             state.csv_cached += 1;
-            let folder_acct = if !folder_relative.is_empty() {
-                Some(folder_to_account_name(&folder_relative))
-            } else {
-                None
-            };
-            let folder_opt: Option<String> = if folder_relative.is_empty() {
-                None
-            } else {
-                Some(folder_relative.clone())
-            };
-            for ct in cached {
-                let mut txn = if let Some(t) = ct.txn.clone() {
-                    t
-                } else {
-                    let result = parse_transactions(&ct.text);
-                    match result.transactions.into_iter().next() {
-                        Some(t) => t,
-                        None => continue,
-                    }
-                };
-                if let Some(ref acct) = folder_acct {
-                    for posting in &mut txn.postings {
-                        if posting.account == FALLBACK_ASSET_ACCOUNT {
-                            posting.account = acct.clone();
-                        }
+            let mut txns = categorise_rows(
+                cached,
+                &chain.labels,
+                &chain.rules,
+                &config.default_expense_account,
+                declared_accounts,
+            );
+            if !folder_relative.is_empty() {
+                let acct = folder_to_account_name(&folder_relative);
+                for posting in txns.iter_mut().flat_map(|txn| txn.postings.iter_mut()) {
+                    if posting.account == FALLBACK_ASSET_ACCOUNT {
+                        posting.account = acct.clone();
                     }
                 }
+            }
+            for txn in txns {
                 state
                     .tagged_txns
                     .push((account_set.clone(), folder_opt.clone(), txn));
@@ -2621,45 +2921,28 @@ fn process_csv_files(
             continue;
         }
 
-        let mut txns = transform_csv_with_default(
+        let raw = cached_rows(&transform_csv_raw(
             csv_path,
             &config.sources_dir,
-            &chain,
+            &chain.script,
             &config.default_expense_account,
-        )?;
+        )?);
         state.csv_transformed += 1;
-
-        // Auto self-transfer: for transactions not matched by rules, check if
-        // the transaction text mentions a declared account identifier
-        for txn in &mut txns {
-            if txn.postings.len() >= 2 && txn.postings[1].account == config.default_expense_account
-            {
-                apply_rules_with_accounts(txn, &RulesFile::default(), declared_accounts);
-            }
-        }
-
-        let cached_txns: Vec<CachedTransaction> = txns
-            .iter()
-            .map(|t| CachedTransaction {
-                text: transaction_to_text(t),
-                txn: Some(t.clone()),
-            })
-            .collect();
-
+        let txns = categorise_rows(
+            &raw,
+            &chain.labels,
+            &chain.rules,
+            &config.default_expense_account,
+            declared_accounts,
+        );
         cache.entries.insert(
             relative,
             CacheEntry {
                 content_hash: content_h,
-                transform_hash: chain.combined_hash,
-                transactions: cached_txns,
+                transform_hash: chain.raw_hash,
+                transactions: raw,
             },
         );
-
-        let folder_opt: Option<String> = if folder_relative.is_empty() {
-            None
-        } else {
-            Some(folder_relative.clone())
-        };
         for txn in txns {
             state
                 .tagged_txns
@@ -2677,6 +2960,7 @@ fn process_ofx_files(
     unchanged_folders: &std::collections::HashSet<String>,
     declared_accounts: &[String],
 ) -> Result<(), String> {
+    let mut folder_chains: HashMap<String, (LabelsFile, RulesFile)> = HashMap::new();
     for ofx_path in ofx_files {
         let relative = ofx_path
             .strip_prefix(&config.sources_dir)
@@ -2730,41 +3014,40 @@ fn process_ofx_files(
             None
         };
 
-        // Load labels + rules for OFX cache key (both affect output, must be in cache key)
+        // The labels and rules are applied over the cached raw rows, so they
+        // are not part of the cache key: only the matcher version is. Every
+        // OFX file in a folder shares the folder's chain, read once.
         let ofx_dir = ofx_path.parent().unwrap_or(Path::new(""));
-        let rules = gather_rules_chain(ofx_dir, &config.sources_dir);
-        let labels = gather_labels_chain(ofx_dir, &config.sources_dir);
-        let ofx_transform_h =
-            string_hash(&format!("{content_h}{}{}", labels.hash(), rules.hash()));
+        let (labels, rules) = folder_chains
+            .entry(ofx_folder_rel.clone())
+            .or_insert_with(|| {
+                (
+                    gather_labels_chain(ofx_dir, &config.sources_dir),
+                    gather_rules_chain(ofx_dir, &config.sources_dir),
+                )
+            });
+        let ofx_raw_h = string_hash(&format!("ofx:m={}", crate::rules::MATCHER_VERSION));
+        let folder_opt: Option<String> = if ofx_folder_rel.is_empty() {
+            None
+        } else {
+            Some(ofx_folder_rel.clone())
+        };
 
-        // Use cache for OFX files too — transform_hash includes content + rules
-        if let Some(cached) = lookup(cache, &cache_key, &content_h, &ofx_transform_h) {
+        if let Some(cached) = lookup(cache, &cache_key, &content_h, &ofx_raw_h) {
             state.ofx_cached += 1;
-            let folder_opt: Option<String> = if ofx_folder_rel.is_empty() {
-                None
-            } else {
-                Some(ofx_folder_rel.clone())
-            };
-            for ct in cached {
-                let mut txn = if let Some(t) = ct.txn.clone() {
-                    t
-                } else {
-                    let result = parse_transactions(&ct.text);
-                    match result.transactions.into_iter().next() {
-                        Some(t) => t,
-                        None => continue,
-                    }
-                };
-                // Fix up stale account names from old cache entries
-                if let Some(ref acct) = ofx_account {
-                    for posting in &mut txn.postings {
-                        if posting.account == FALLBACK_ASSET_ACCOUNT
-                            || posting.account.starts_with("unknown:")
-                        {
-                            posting.account = acct.clone();
-                        }
+            let mut txns =
+                categorise_rows(cached, labels, rules, &config.default_expense_account, &[]);
+            // Fix up stale account names from old cache entries
+            if let Some(ref acct) = ofx_account {
+                for posting in txns.iter_mut().flat_map(|txn| txn.postings.iter_mut()) {
+                    if posting.account == FALLBACK_ASSET_ACCOUNT
+                        || posting.account.starts_with("unknown:")
+                    {
+                        posting.account = acct.clone();
                     }
                 }
+            }
+            for txn in txns {
                 state
                     .tagged_txns
                     .push((account_set.clone(), folder_opt.clone(), txn));
@@ -2781,39 +3064,22 @@ fn process_ofx_files(
             .clone()
             .unwrap_or_else(|| FALLBACK_ASSET_ACCOUNT.to_string());
 
-        // labels + rules already loaded above for cache key
-        let txns = ofx_to_transactions_with_default(
+        let raw = cached_rows(&ofx_to_raw_transactions(
             &ofx,
             &account_name,
             &relative,
-            &labels,
-            &rules,
             &config.default_expense_account,
-        )?;
+        )?);
         state.ofx_transformed += 1;
-
-        let cached_txns: Vec<CachedTransaction> = txns
-            .iter()
-            .map(|t| CachedTransaction {
-                text: transaction_to_text(t),
-                txn: Some(t.clone()),
-            })
-            .collect();
-
+        let txns = categorise_rows(&raw, labels, rules, &config.default_expense_account, &[]);
         cache.entries.insert(
             cache_key,
             CacheEntry {
                 content_hash: content_h,
-                transform_hash: ofx_transform_h,
-                transactions: cached_txns,
+                transform_hash: ofx_raw_h,
+                transactions: raw,
             },
         );
-
-        let folder_opt: Option<String> = if ofx_folder_rel.is_empty() {
-            None
-        } else {
-            Some(ofx_folder_rel.clone())
-        };
         for txn in txns {
             state
                 .tagged_txns
@@ -2988,7 +3254,9 @@ fn write_pipeline_output(
 
     for folder_rel in changed_folders {
         let txns = per_folder.remove(folder_rel.as_str()).unwrap_or_default();
-        total_written += write_folder_ledger(config, folder_rel, &txns, &mut tracker)?;
+        let accounts_text = folder_accounts.get(folder_rel).map(String::as_str);
+        total_written +=
+            write_folder_ledger(config, folder_rel, &txns, accounts_text, &mut tracker)?;
     }
 
     mark_live_outputs(config, source_folders, changed_folders, &mut tracker);
@@ -3027,12 +3295,15 @@ fn partition_txns_by_folder<'a>(
     per_folder
 }
 
-/// Write the ledger and summary.json for one folder. Returns the number of
-/// transactions written.
+/// Write the ledger and summary.json for one folder. `accounts_text` is the
+/// folder's own accounts.transactions: its openings are declared, never
+/// posted, so they are folded into the summary's totals here. Returns the
+/// number of transactions written.
 fn write_folder_ledger(
     config: &PipelineConfig,
     folder_rel: &str,
     txns: &[&Transaction],
+    accounts_text: Option<&str>,
     tracker: &mut OutputTracker,
 ) -> Result<usize, String> {
     let folder_dir = config.generated_dir.join(folder_rel);
@@ -3058,18 +3329,27 @@ fn write_folder_ledger(
 
     tracker.write_if_changed(&folder_dir.join(FILE_LEDGER), &normalize_blank_lines(&text))?;
 
+    let openings = accounts_text
+        .map(|text| parse_transactions(text).opening_balances)
+        .unwrap_or_default();
+    add_account_balances(&mut balances_map, &openings, 1.0);
+
+    // The accounts the owner-account map is rebuilt from (see
+    // `rebuild_owner_accounts`): the folder-root accounts the rows post to.
+    let mut accounts: Vec<String> = txns
+        .iter()
+        .flat_map(|txn| txn.postings.iter())
+        .filter(|p| under_folder_root(&p.account))
+        .map(|p| p.account.clone())
+        .collect();
+    accounts.sort();
+    accounts.dedup();
+
     let summary = FolderSummary {
         transaction_count: txns.len(),
-        balances: balances_map
-            .into_iter()
-            .map(|(account, by_commodity)| AccountBalance {
-                account,
-                totals: by_commodity
-                    .into_iter()
-                    .map(|(commodity, amount)| CommodityAmount { commodity, amount })
-                    .collect(),
-            })
-            .collect(),
+        balances: account_balances_from_map(balances_map),
+        openings,
+        accounts: Some(accounts),
     };
     let summary_json = serde_json::to_string_pretty(&summary).map_err(|e| e.to_string())?;
     tracker.write_if_changed(&folder_dir.join(FILE_SUMMARY), &summary_json)?;
@@ -3328,10 +3608,11 @@ pub fn append_hide_rule(
     let match_field = Some("meta".to_string());
     let amount_account = Some(HIDE_AMOUNT_ACCOUNT.to_string());
 
-    let already = rules
-        .rules
-        .iter()
-        .any(|r| r.pattern == pattern && r.match_field == match_field);
+    // Only a hide counts: a category rule anchored on the same txn id (an
+    // inline re-categorise of a row without a `leg:` id) is not one.
+    let already = rules.rules.iter().any(|r| {
+        r.pattern == pattern && r.match_field == match_field && r.amount_account == amount_account
+    });
     if already {
         return Ok(false);
     }
@@ -3353,6 +3634,44 @@ pub fn append_hide_rule(
     });
     rules.save(&folder)?;
     Ok(true)
+}
+
+/// Undo `append_hide_rule`: remove the hide rule for `txn_id` from every
+/// folder's `_rules.json` under `sources_dir`. The UI unhides a row it shows
+/// under `ignore:hidden`, where both legs carry the hidden account, so it
+/// cannot tell which folder hid it — hence the walk. Only the exact rule
+/// `append_hide_rule` writes is removed; any other rule naming the txn stays.
+/// Errors when no folder held one, so the UI can say the unhide did not apply.
+pub fn remove_hide_rule(sources_dir: &Path, txn_id: &str) -> Result<(), String> {
+    let is_hide_rule = |r: &Rule| {
+        r.pattern == txn_id
+            && r.match_field.as_deref() == Some("meta")
+            && r.amount_account.as_deref() == Some(HIDE_AMOUNT_ACCOUNT)
+    };
+    let mut removed = false;
+    for entry in walkdir::WalkDir::new(sources_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if !path.is_file() || path.file_name().and_then(|n| n.to_str()) != Some("_rules.json") {
+            continue;
+        }
+        let Some(folder) = path.parent() else { continue };
+        // A file the pipeline cannot parse hides nothing; leave it untouched.
+        let Ok(mut rules) = RulesFile::try_load(folder) else { continue };
+        let before = rules.rules.len();
+        rules.rules.retain(|r| !is_hide_rule(r));
+        if rules.rules.len() != before {
+            rules.save(folder)?;
+            removed = true;
+        }
+    }
+    if removed {
+        Ok(())
+    } else {
+        Err(format!("{txn_id} is not hidden: no hide rule names it"))
+    }
 }
 
 /// Append a txn ID to _ignored.txt in the sources directory. Each write
@@ -4809,6 +5128,51 @@ mod append_hide_rule_tests {
     }
 
     #[test]
+    fn hiding_a_row_already_recategorised_by_its_txn_id_still_hides_it() {
+        // A category-cell edit on a row without a `leg:` id writes a rule
+        // anchored on the same `txn:` id; that rule is not a hide.
+        let sources = tmp();
+        let folder_rel = "alex/bank";
+        let folder = sources.join(folder_rel);
+        fs::create_dir_all(&folder).unwrap();
+        append_hide_rule(&sources, folder_rel, "txn:abc123").unwrap();
+        let mut rules = RulesFile::load(&folder);
+        rules.rules[0].amount_account = Some("expenses:food".to_string());
+        rules.save(&folder).unwrap();
+
+        let added = append_hide_rule(&sources, folder_rel, "txn:abc123").unwrap();
+
+        assert!(added, "the category rule must not count as a hide");
+        let rules = RulesFile::load(&folder);
+        assert_eq!(rules.rules.len(), 2);
+        assert_eq!(rules.rules[0].amount_account.as_deref(), Some(HIDE_AMOUNT_ACCOUNT));
+    }
+
+    #[test]
+    fn unhide_removes_only_the_hide_rule_in_whichever_folder_holds_it() {
+        let sources = tmp();
+        let folder_rel = "alex/solana/abc";
+        let folder = sources.join(folder_rel);
+        fs::create_dir_all(&folder).unwrap();
+        append_hide_rule(&sources, folder_rel, "txn:abc123").unwrap();
+        // The user's own rule on the same txn is not the hide rule.
+        let mut rules = RulesFile::load(&folder);
+        let mut own = rules.rules[0].clone();
+        own.id = "own".to_string();
+        own.amount_account = Some("expenses:food".to_string());
+        rules.rules.push(own);
+        rules.save(&folder).unwrap();
+
+        remove_hide_rule(&sources, "txn:abc123").unwrap();
+
+        let left = RulesFile::load(&folder);
+        assert_eq!(left.rules.len(), 1);
+        assert_eq!(left.rules[0].amount_account.as_deref(), Some("expenses:food"));
+        let err = remove_hide_rule(&sources, "txn:abc123").unwrap_err();
+        assert!(err.contains("not hidden"), "{err}");
+    }
+
+    #[test]
     fn second_call_with_same_id_is_a_noop() {
         let sources = tmp();
         let folder_rel = "alex/solana/abc";
@@ -5126,7 +5490,8 @@ mod append_hide_rule_tests {
         );
 
         // Run 2: change folder B (a manual is added there) to defeat the
-        // global early-exit. Folder A stays unchanged-intact.
+        // global early-exit. Folder A stays unchanged-intact: a scoped run
+        // leaves it on disk unread, and no set is complete in memory.
         fs::write(
             sources.join(folder_b).join("manual.transactions"),
             "2026-01-21 * \"Manual B\" \"manual entry b\"\n    assets:bank:test  50 AUD\n    income:other  -50 AUD\n",
@@ -5142,21 +5507,23 @@ mod append_hide_rule_tests {
             parsed2.transactions.len(),
             text2
         );
-        let tagged2 = result2
-            .in_memory
-            .as_ref()
-            .expect("in_memory result2")
-            .tagged_txns
-            .len();
-        assert_eq!(
-            tagged2, 4,
-            "after run 2 expected 4 tagged_txns (no double-count of folder_a manual); got {tagged2}"
+        assert!(result2.scoped, "run 2 changed only folder_b and should be scoped");
+        assert!(
+            result2.in_memory.is_none(),
+            "a scoped run holds only the changed folders' rows, so no set is complete in memory"
         );
 
-        // Run 3: change folder B again to defeat early-exit. Folder A stays unchanged-intact.
+        // Run 3: change folder B again, and add a root-level manual.transactions,
+        // which a scoped run cannot place: a full run loads folder A from its
+        // intact ledger, and the manual loop must not push its manual a second time.
         fs::write(
             sources.join(folder_b).join("manual.transactions"),
             "2026-01-22 * \"Manual B v2\" \"manual entry b v2\"\n    assets:bank:test  60 AUD\n    income:other  -60 AUD\n",
+        )
+        .unwrap();
+        fs::write(
+            sources.join("manual.transactions"),
+            "2026-01-23 * \"Root\" \"root entry\"\n    assets:bank:test  70 AUD\n    income:other  -70 AUD\n",
         )
         .unwrap();
         let result3 = run_pipeline(&config).expect("run 3");
@@ -5169,6 +5536,7 @@ mod append_hide_rule_tests {
             parsed3.transactions.len(),
             text3
         );
+        assert!(!result3.scoped, "a root-level manual.transactions forces a full run");
         let tagged3 = result3
             .in_memory
             .as_ref()
@@ -5176,8 +5544,8 @@ mod append_hide_rule_tests {
             .tagged_txns
             .len();
         assert_eq!(
-            tagged3, 4,
-            "after run 3 expected 4 tagged_txns (no double-count of folder_a manual); got {tagged3}"
+            tagged3, 5,
+            "after run 3 expected 5 tagged_txns (folder_a CSV + manual, folder_b CSV + manual, root manual; no double-count of folder_a manual); got {tagged3}"
         );
     }
 }
@@ -5337,6 +5705,55 @@ mod auto_link_equity_swaps_tests {
 
     fn meta_value(meta: &Option<String>, prefix: &str) -> Option<String> {
         meta_tag_value(meta, prefix).map(String::from)
+    }
+
+    /// A bank row: an asset posting against an expense, no trading leg.
+    fn mk_bank_row(datetime: &str, account: &str, amount: f64) -> Transaction {
+        let mut txn = mk_pre_suffixed_leg(datetime, account, amount, "AUD", "buy", "bank1");
+        txn.postings[1].account = "expenses:food".into();
+        txn
+    }
+
+    fn tagged_rows() -> Vec<(Option<String>, Option<String>, Transaction)> {
+        let dt = "2025-03-01 10:00:00";
+        vec![
+            (
+                Some("alex".into()),
+                Some("alex/cash/bank".into()),
+                mk_bank_row(dt, "assets:cash:bank", -4.5),
+            ),
+            (
+                Some("alex".into()),
+                Some("alex/equity/broker".into()),
+                mk_pre_suffixed_leg(dt, "assets:equity:broker", 1.0, "BHP", "buy", "0x1"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn the_linker_runs_only_for_a_changed_folder_that_holds_a_trade() {
+        let tagged = tagged_rows();
+        // The bank folder changed and the broker folder did not: no trade changed.
+        let unchanged: std::collections::HashSet<String> = ["alex/equity/broker".to_string()].into();
+        assert!(changed_folder_trade(&tagged, &unchanged).is_none());
+        // The broker folder changed: its trade makes the linker run.
+        let unchanged: std::collections::HashSet<String> = ["alex/cash/bank".to_string()].into();
+        let trigger = changed_folder_trade(&tagged, &unchanged).expect("the broker trade");
+        assert_eq!(trigger.1.as_deref(), Some("alex/equity/broker"));
+    }
+
+    #[test]
+    fn trades_by_folder_holds_only_the_rows_the_linker_can_rewrite() {
+        let mut tagged = tagged_rows();
+        // A row already carrying a swap reference is one the linker prices.
+        let mut referenced = mk_bank_row("2025-03-02 10:00:00", "assets:crypto:wallet", 2.0);
+        referenced.meta = Some("txn:0x2, swap:txn:0x3".into());
+        tagged.push((Some("alex".into()), Some("alex/crypto/wallet".into()), referenced));
+
+        let by_folder = trades_by_folder(&tagged);
+        assert!(!by_folder.contains_key("alex/cash/bank"));
+        assert_eq!(by_folder["alex/equity/broker"].len(), 1);
+        assert_eq!(by_folder["alex/crypto/wallet"].len(), 1);
     }
 
     fn leg(idx: usize, commodity: &str, amount: f64) -> SwapLeg {

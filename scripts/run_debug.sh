@@ -10,9 +10,9 @@
 # changing transform or matching code bump MATCHER_VERSION or pass --fresh.
 #
 # EMUACC_INSTANCE (env) suffixes the window title so several vaults are
-# distinguishable in the OS window list. A per-vault wrapper is a one-line
-# script that exports it and execs this one with the vault:
-#   EMUACC_INSTANCE=work exec scripts/run_debug.sh "$@" ~/vault
+# distinguishable in the OS window list. A per-vault wrapper exports it and
+# execs this one with its vault, which EMUACC_<INSTANCE>_VAULT overrides:
+#   EMUACC_INSTANCE=work exec scripts/run_debug.sh "$@" "${EMUACC_WORK_VAULT:-$HOME/vault}"
 # scripts/run_fresh.sh launches a throwaway profile that starts on the vault picker.
 #
 # An explicit vault is applied through EMUACC_SOURCES_DIR/EMUACC_GENERATED_DIR
@@ -20,7 +20,14 @@
 # sidebar's "Data Folder" label still shows the configured root, not this one.
 set -euo pipefail
 
-APP_DATA="$HOME/Library/Application Support/com.emusoftware.emuaccounts"
+APP_ID="com.emusoftware.emuaccounts"
+
+# The platform app-data folder holding config.json (root_config.rs).
+case "$(uname -s)" in
+  Darwin) APP_DATA="$HOME/Library/Application Support/$APP_ID" ;;
+  Linux)  APP_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/$APP_ID" ;;
+  *)      APP_DATA="$APPDATA/$APP_ID" ;;
+esac
 CONFIG_FILE="$APP_DATA/config.json"
 
 FRESH=0

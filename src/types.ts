@@ -181,11 +181,11 @@ export type BalancesReport = {
   warnings: string[];
 };
 
-/** Base-currency value of every account rolled up to each ancestor, from the
- * same computation as the Balances report (backend `load_tree_base_totals`).
- * `primary` = primary-accounts scope (sidebar rows + folder header; its
- * `assets` entry is the Balances report total); `all` = every account (the
- * Categories pane). */
+/** Base-currency value of every account rolled up to each ancestor (backend
+ * `load_tree_base_totals`). `primary` = the Balances report's computation over
+ * the primary-accounts scope (sidebar rows + folder header; its `assets` entry
+ * is the Balances report total); `all` = every account valued by its own
+ * balance (the Categories rows and the holdings "Show all holdings" reveals). */
 export type TreeBaseTotals = {
   asOfDate: string;
   baseCurrency: string;

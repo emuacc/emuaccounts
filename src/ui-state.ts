@@ -154,9 +154,13 @@ export function resetVaultScopedState(state: Record<string, unknown>): void {
   state.selectedAccountSet = undefined;
   state.accountSetMap = {};
   state.allAccounts = [];
+  state.pendingAccounts = [];
+  state.hiddenAccounts = [];
   state.accountFoldersMap = {};
   state.accountPropertiesMap = {};
   state.accountsWithOpening = [];
+  state.clearingAccounts = undefined;
+  state.clearingAccountsDraft = undefined;
   state.displayConfig = undefined;
   state.showBaseCurrencySetup = undefined;
   state.baseCurrencyCandidates = undefined;
@@ -224,7 +228,8 @@ export function resetVaultScopedState(state: Record<string, unknown>): void {
   state.reportPageSize = 50;
   // Optimistic mutation state
   state.pendingMutations = 0;
-  state.pendingDeletes = new Set<string>();
+  state.pendingEdits = [];
+  state.rowFlashes = undefined;
   state.pendingAdds = [];
   state.justAddedTxnIds = undefined;
   state.pipelineWarnings = [];

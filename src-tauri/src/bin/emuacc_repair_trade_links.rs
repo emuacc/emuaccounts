@@ -11,26 +11,17 @@
 //! pre-TASK-133 metadata document it reads them from there. `--write` first
 //! migrates them to the trade-link file, as the app does.
 
-use std::path::PathBuf;
-
-use emuaccounts::root_config::{self, platform_app_data_dir};
+use emuaccounts::root_config::CliVault;
 use emuaccounts::trade_link_repair::{load_per_folder_ledgers, repair_links};
 use emuaccounts::trade_links::{self, METADATA_FILE, TRADE_LINKS_FILE};
 
-fn resolve_dirs() -> (PathBuf, PathBuf) {
-    let sources_override = std::env::var("EMUACC_SOURCES_DIR").ok();
-    let generated_override = std::env::var("EMUACC_GENERATED_DIR").ok();
-    let app_dir = platform_app_data_dir();
-    let config = root_config::load_root_config(&app_dir);
-    (
-        root_config::resolve_sources(sources_override.as_deref(), &config, &app_dir),
-        root_config::resolve_generated(generated_override.as_deref(), &config, &app_dir),
-    )
-}
-
 fn main() -> Result<(), String> {
     let write = std::env::args().any(|a| a == "--write");
-    let (sources_dir, generated_dir) = resolve_dirs();
+    let CliVault {
+        sources_dir,
+        generated_dir,
+        ..
+    } = CliVault::load();
     println!("sources:   {}", sources_dir.display());
     println!("generated: {}", generated_dir.display());
     println!("mode:      {}", if write { "WRITE" } else { "dry-run" });

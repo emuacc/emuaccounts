@@ -47,6 +47,22 @@ Feature: Incremental pipeline — only regenerate what changed
     And I run the pipeline with changed folder hint "bank/savings"
     Then the ledger at "bank/savings/ledger.transactions" should contain "Local Cafe"
 
+  # The build cache holds the transform's raw rows; labels and rules are a
+  # pass over them. So a rule change (what saving a category from the table
+  # does) re-categorises the folder's cached rows and never re-runs its
+  # transform scripts.
+  Scenario: A rule change re-categorises the cached rows without re-running the transform
+    Given a CSV "bank/savings/2025-01.csv":
+      | Date       | Description | Amount |
+      | 2025-01-15 | Coffee Shop | -4.50  |
+    And a transform at "bank/savings/_transform.rhai" that maps Date/Description/Amount to AUD
+    When I run the pipeline
+    Then the pipeline should have transformed 1 CSV
+    When I add a rule to "bank/savings" matching "Coffee" with payee "Local Cafe"
+    And I run the pipeline again
+    Then the pipeline should have transformed 0 CSV
+    And the ledger at "bank/savings/ledger.transactions" should contain "Local Cafe"
+
   Scenario: Hinted run does not flag unchanged sibling folders with pre-existing price annotations
     # Two sibling wallets; auto_link prices both during the baseline run.
     Given USD price data for "SOL" and "ETH"

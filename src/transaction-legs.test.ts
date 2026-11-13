@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
-  categoryLabel, contraLeg, displayLegs, feeLeg, inScopeLegs, isTradeShaped, representativeLegs, valuationLegs,
+  categoryLabel, contraLeg, displayLegs, feeLeg, flowAmount, inScopeLegs, isTradeShaped, representativeLegs,
+  subAccountLabel, valuationLegs,
 } from "./transaction-legs";
 import type { Transaction } from "./types";
 
@@ -275,5 +276,44 @@ describe("feeLeg", () => {
 
   it("is undefined when the transaction books no fee", () => {
     expect(feeLeg(property)).toBeUndefined();
+  });
+});
+
+describe("subAccountLabel", () => {
+  it("is the posting's account relative to the selected account", () => {
+    expect(subAccountLabel("income:interest:cba", "income")).toBe("interest:cba");
+  });
+
+  it("is empty for a posting on the selected account itself", () => {
+    expect(subAccountLabel("income", "income")).toBe("");
+  });
+
+  it("is empty for a posting outside the selected account", () => {
+    // The bank leg an `expenses:tax:income` row falls back to under `income`:
+    // slicing `income:`.length off it read `cash:bank:cba:smartaccess`.
+    expect(subAccountLabel("assets:cash:bank:cba:smartaccess", "income")).toBe("");
+    expect(subAccountLabel("incomes:other", "income")).toBe("");
+  });
+
+  it("is empty when no account is selected", () => {
+    expect(subAccountLabel("income:interest", undefined)).toBe("");
+  });
+});
+
+describe("flowAmount", () => {
+  it("keeps a leg's sign outside income: negative is out, positive in", () => {
+    expect(flowAmount(-50, "assets:cash:bank")).toBe(-50);
+    expect(flowAmount(50, "expenses:food")).toBe(50);
+    expect(flowAmount(-50, undefined)).toBe(-50);
+  });
+
+  it("flips under income: income earned (a credit) is in, a loss (a debit) out", () => {
+    expect(flowAmount(-10409.94, "income")).toBe(10409.94);
+    expect(flowAmount(-12.5, "income:interest")).toBe(12.5);
+    expect(flowAmount(3, "income:forex")).toBe(-3);
+  });
+
+  it("does not flip an account that only contains income", () => {
+    expect(flowAmount(400, "expenses:tax:income")).toBe(400);
   });
 });

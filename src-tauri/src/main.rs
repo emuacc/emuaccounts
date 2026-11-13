@@ -16,7 +16,7 @@ use emuaccounts::ledger_parser::{
 };
 use emuaccounts::plugins;
 use emuaccounts::processing_pipeline::{
-    append_account_and_rebuild, append_hide_rule, append_manual_and_rebuild,
+    append_account_and_rebuild, append_hide_rule, append_manual_and_rebuild, remove_hide_rule,
     auto_link_equity_swaps,
     delete_account_folder_and_rebuild, delete_manual_transaction_and_rebuild, detect_account_gaps,
     import_prices_file, process_all_imports, process_imports, rename_account_folder_and_rebuild,
@@ -37,7 +37,9 @@ use emuaccounts::rules::{
     remove_trade_link_rules, AccountConfig, LabelsFile, Rule, RulesFile,
 };
 use emuaccounts::sources_state;
-use emuaccounts::trade_link_repair::{load_per_folder_ledgers, plan_trade_link_rules};
+use emuaccounts::trade_link_repair::{
+    load_per_folder_ledgers, plan_trade_link_rules, write_trade_link,
+};
 use emuaccounts::trade_links::{self, suggest_trade_links, trade_link_id, TradeLink, TradeSuggestion};
 use std::env;
 use std::path::PathBuf;
@@ -316,6 +318,8 @@ async fn rebuild_pipeline(
     let _suppress = app.state::<WatcherSuppressFlag>().suppress();
     let config = make_pipeline_config(&app, &now_yyyymm)?;
     let result = run_pipeline(&config)?;
+    // An explicit full rebuild refreshes the report files; a table edit does
+    // not (the Reports view computes a stale report live, see cached_report).
     spawn_report_generation(&app, &config, &result);
     let set_dir = resolve_set_dir(&config.generated_dir, &account_set);
     build_pipeline_response(&app, result, &set_dir, &account_set)
@@ -336,7 +340,6 @@ async fn add_manual_transaction(
     // Mark before the write so the file-watcher skips its redundant rebuild.
     app.state::<LastCommandRebuild>().mark();
     let result = append_manual_and_rebuild(&config, &input, &account_folder)?;
-    spawn_report_generation(&app, &config, &result);
     Ok(build_mutation_response(&app, &result))
 }
 
@@ -359,7 +362,6 @@ async fn add_account_declaration(
         &account_set,
         account_folder.as_deref(),
     )?;
-    spawn_report_generation(&app, &config, &result);
     let set_dir = resolve_set_dir(&config.generated_dir, &account_set);
     build_pipeline_response(&app, result, &set_dir, &account_set)
 }
@@ -374,7 +376,6 @@ async fn rename_account_folder(
 ) -> Result<PipelineResponse, String> {
     let config = make_pipeline_config(&app, &now_yyyymm)?;
     let result = rename_account_folder_and_rebuild(&config, &old_folder, &new_folder)?;
-    spawn_report_generation(&app, &config, &result);
     let set_dir = resolve_set_dir(&config.generated_dir, &account_set);
     build_pipeline_response(&app, result, &set_dir, &account_set)
 }
@@ -388,7 +389,6 @@ async fn delete_account_folder(
 ) -> Result<PipelineResponse, String> {
     let config = make_pipeline_config(&app, &now_yyyymm)?;
     let result = delete_account_folder_and_rebuild(&config, &folder)?;
-    spawn_report_generation(&app, &config, &result);
     let set_dir = resolve_set_dir(&config.generated_dir, &account_set);
     build_pipeline_response(&app, result, &set_dir, &account_set)
 }
@@ -415,7 +415,6 @@ async fn import_csv_to_account(
     std::fs::copy(source, &imports_dest).map_err(|e| format!("failed to copy to imports: {e}"))?;
 
     let (_import_result, result) = process_imports(&config, &account_folder)?;
-    spawn_report_generation(&app, &config, &result);
     Ok(build_mutation_response(&app, &result))
 }
 
@@ -446,7 +445,6 @@ async fn import_csv_files_to_account(
     }
 
     let (_import_result, result) = process_imports(&config, &account_folder)?;
-    spawn_report_generation(&app, &config, &result);
     Ok(build_mutation_response(&app, &result))
 }
 
@@ -557,8 +555,7 @@ async fn confirm_ai_import(
     match suggestion {
         None => {
             let (_import_result, result) = process_imports(&config, &account_folder)?;
-            spawn_report_generation(&app, &config, &result);
-            Ok(ConfirmAiImportResponse {
+                    Ok(ConfirmAiImportResponse {
                 imported: true,
                 needs_transform: false,
                 csv_path: staged.csv_path.to_string_lossy().to_string(),
@@ -594,7 +591,6 @@ async fn process_imports_cmd(
 ) -> Result<ProcessImportsResponse, String> {
     let config = make_pipeline_config(&app, &now_yyyymm)?;
     let (import_result, pipeline_result) = process_all_imports(&config)?;
-    spawn_report_generation(&app, &config, &pipeline_result);
     let set_dir = resolve_set_dir(&config.generated_dir, &account_set);
     Ok(ProcessImportsResponse {
         import_result,
@@ -628,7 +624,27 @@ async fn hide_transaction(
     let _suppress = app.state::<WatcherSuppressFlag>().suppress();
     append_hide_rule(&config.sources_dir, &account_folder, &txn_id)?;
     let result = run_pipeline(&config)?;
-    spawn_report_generation(&app, &config, &result);
+    Ok(MutationResponse {
+        ok: true,
+        warnings: result.warnings.clone(),
+        output_files_written: result.output_files_written,
+    })
+}
+
+/// Undo `hide_transaction`: remove the txn's hide rule (wherever it lives)
+/// and rebuild. Errors when the txn is not hidden by one. Slim response and
+/// `async` for the same reasons as `hide_transaction`.
+#[tauri::command]
+async fn unhide_transaction(
+    app: tauri::AppHandle,
+    now_yyyymm: String,
+    txn_id: String,
+    _account_set: String,
+) -> Result<MutationResponse, String> {
+    let config = make_pipeline_config(&app, &now_yyyymm)?;
+    let _suppress = app.state::<WatcherSuppressFlag>().suppress();
+    remove_hide_rule(&config.sources_dir, &txn_id)?;
+    let result = run_pipeline(&config)?;
     Ok(MutationResponse {
         ok: true,
         warnings: result.warnings.clone(),
@@ -656,7 +672,6 @@ async fn delete_manual_transaction(
         &narration,
         &account_folder,
     )?;
-    spawn_report_generation(&app, &config, &result);
     let set_dir = resolve_set_dir(&config.generated_dir, &account_set);
     build_pipeline_response(&app, result, &set_dir, &account_set)
 }
@@ -757,7 +772,6 @@ async fn save_transform_and_rebuild_cmd(
         &account_folder,
         &script,
     )?;
-    spawn_report_generation(&app, &config, &result);
     Ok(build_mutation_response(&app, &result))
 }
 
@@ -802,7 +816,10 @@ async fn save_rule(
         );
     }
     validate_rename_target(commodity.as_deref())?;
-    let config = make_pipeline_config(&app, &now_yyyymm)?;
+    let mut config = make_pipeline_config(&app, &now_yyyymm)?;
+    // The rule lands in this folder's _rules.json: that folder and its
+    // subfolders are the change.
+    config.changed_folder_hint = Some(vec![account_folder.clone()]);
     let folder = config.sources_dir.join(&account_folder);
 
     let mut rules = RulesFile::try_load(&folder)?;
@@ -844,11 +861,12 @@ async fn save_rule(
         };
         rules.insert_rule(rule);
     }
+    // Mark before the write so the file-watcher skips its redundant rebuild.
+    app.state::<LastCommandRebuild>().mark();
     let _suppress = app.state::<WatcherSuppressFlag>().suppress();
     rules.save(&folder)?;
 
     let result = run_pipeline(&config)?;
-    spawn_report_generation(&app, &config, &result);
     Ok(MutationResponse {
         ok: true,
         warnings: result.warnings.clone(),
@@ -872,7 +890,11 @@ async fn save_label(
         return Err("Cannot save a label with an empty pattern".into());
     }
     validate_rename_target(commodity.as_deref())?;
-    let config = make_pipeline_config(&app, &now_yyyymm)?;
+    let mut config = make_pipeline_config(&app, &now_yyyymm)?;
+    // The label lands in this folder's _labels.json: that folder and its
+    // subfolders are the change.
+    config.changed_folder_hint = Some(vec![account_folder.clone()]);
+    app.state::<LastCommandRebuild>().mark();
     let _suppress = app.state::<WatcherSuppressFlag>().suppress();
     apply_label_upsert(
         &config.sources_dir,
@@ -884,7 +906,6 @@ async fn save_label(
     )?;
 
     let result = run_pipeline(&config)?;
-    spawn_report_generation(&app, &config, &result);
     Ok(MutationResponse {
         ok: true,
         warnings: result.warnings.clone(),
@@ -1240,7 +1261,6 @@ async fn update_rule(
     )?;
 
     let result = run_pipeline(&config)?;
-    spawn_report_generation(&app, &config, &result);
     Ok(MutationResponse {
         ok: true,
         warnings: result.warnings.clone(),
@@ -1268,7 +1288,6 @@ async fn delete_rule(
     rules.save(&rule_folder)?;
 
     let result = run_pipeline(&config)?;
-    spawn_report_generation(&app, &config, &result);
     Ok(MutationResponse {
         ok: true,
         warnings: result.warnings.clone(),
@@ -1345,7 +1364,6 @@ async fn update_label(
     )?;
 
     let result = run_pipeline(&config)?;
-    spawn_report_generation(&app, &config, &result);
     Ok(MutationResponse {
         ok: true,
         warnings: result.warnings.clone(),
@@ -1366,7 +1384,6 @@ async fn delete_label(
     apply_label_delete(&config.sources_dir, &folder, &label_id)?;
 
     let result = run_pipeline(&config)?;
-    spawn_report_generation(&app, &config, &result);
     Ok(MutationResponse {
         ok: true,
         warnings: result.warnings.clone(),
@@ -1382,7 +1399,10 @@ async fn import_rules_csv(
     account_folder: String,
     account_set: String,
 ) -> Result<PipelineResponse, String> {
-    let config = make_pipeline_config(&app, &now_yyyymm)?;
+    let mut config = make_pipeline_config(&app, &now_yyyymm)?;
+    // The imported rules land in this folder's _rules.json: that folder and
+    // its subfolders are the change.
+    config.changed_folder_hint = Some(vec![account_folder.clone()]);
     let folder = config.sources_dir.join(&account_folder);
 
     // Read CSV (pattern, payee, posting, comment columns)
@@ -1431,12 +1451,12 @@ async fn import_rules_csv(
     // Append to existing rules; txn-anchored entries promote to top.
     let mut rules_file = RulesFile::try_load(&folder)?;
     rules_file.insert_rules(new_rules);
+    app.state::<LastCommandRebuild>().mark();
     let _suppress = app.state::<WatcherSuppressFlag>().suppress();
     rules_file.save(&folder)?;
 
     // Rebuild pipeline once
     let result = run_pipeline(&config)?;
-    spawn_report_generation(&app, &config, &result);
     let set_dir = resolve_set_dir(&config.generated_dir, &account_set);
     build_pipeline_response(&app, result, &set_dir, &account_set)
 }
@@ -1615,14 +1635,21 @@ fn collect_issues_cmd(
         account,
     };
     // The full scan (account=None — the startup/issues-panel refresh, ~9.5s on
-    // a large vault) is cached keyed on the sources fingerprint: generated/ is
-    // derived from sources, so an unchanged fingerprint means unchanged issues.
-    // Account-scoped calls stay live (narrow and cheap).
+    // a large vault) is cached keyed on what it reads: the pipeline's outputs
+    // and the price files (outputs_fingerprint), the pipeline warnings, the
+    // trade links, and the clearing list from the vault config. A rule save
+    // whose rebuild rewrites no output is a hit. Account-scoped calls stay
+    // live (narrow and cheap).
     if filter.account.is_none() {
         let key = format!(
-            "v{}:{}",
+            "v{}:{}:{}:{}:{}",
             emuaccounts::issues::COLLECT_VERSION,
-            emuaccounts::build_cache::dir_fingerprint(&sources_dir)?
+            display_config::vault_clearing_accounts(&generated_dir)?.join(","),
+            emuaccounts::derived_cache::outputs_fingerprint(&sources_dir, &generated_dir)?,
+            emuaccounts::derived_cache::file_fingerprint(
+                &generated_dir.join(emuaccounts::issues::PipelineWarningsFile::FILE_NAME)
+            ),
+            emuaccounts::derived_cache::file_fingerprint(&sources_dir.join("_trade_links.json"))
         );
         return emuaccounts::derived_cache::get_or_compute(
             &generated_dir.join(".cache").join("issues.json"),
@@ -1755,6 +1782,25 @@ fn set_vault_base_currency(app: tauri::AppHandle, currency: String) -> Result<()
     display_config::set_vault_base_currency(&generated_dir, &currency)
 }
 
+/// The vault's clearing accounts (`assets:transfer` when none are declared).
+#[tauri::command(async)]
+fn get_clearing_accounts(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+    let generated_dir = resolve_generated_dir(&app)?;
+    display_config::vault_clearing_accounts(&generated_dir)
+}
+
+/// Declare the vault's clearing accounts and return the list now in force.
+/// The issues cache is keyed on it, so the next `collect_issues_cmd` rescans.
+#[tauri::command(async)]
+fn set_clearing_accounts(
+    app: tauri::AppHandle,
+    accounts: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let generated_dir = resolve_generated_dir(&app)?;
+    display_config::set_vault_clearing_accounts(&generated_dir, &accounts)?;
+    display_config::vault_clearing_accounts(&generated_dir)
+}
+
 #[tauri::command(async)]
 fn list_base_currency_candidates(app: tauri::AppHandle) -> Result<Vec<String>, String> {
     let generated_dir = resolve_generated_dir(&app)?;
@@ -1818,6 +1864,15 @@ fn set_show_hidden(app: tauri::AppHandle, show: bool) {
 #[tauri::command(async)]
 fn get_show_hidden(app: tauri::AppHandle) -> bool {
     app.state::<ShowHiddenState>().0.load(Ordering::Relaxed)
+}
+
+/// The account prefixes the set's `config.json` hides while "Show Ignored"
+/// is off (`hidden_accounts`, as every query filters them), so turning it
+/// off can drop those rows from the table before the re-query lands.
+#[tauri::command(async)]
+fn get_hidden_accounts(app: tauri::AppHandle, account_set: String) -> Result<Vec<String>, String> {
+    let generated_dir = resolve_generated_dir(&app)?;
+    Ok(load_hidden_accounts(&resolve_set_dir(&generated_dir, &account_set)))
 }
 
 #[tauri::command(async)]
@@ -1903,40 +1958,23 @@ async fn save_trade_link(
     account_set: String,
 ) -> Result<PipelineResponse, String> {
     let sources_dir = resolve_sources_dir(&app)?;
-    trade_links::save(&sources_dir, &[(txn_id_a.as_str(), txn_id_b.as_str())])?;
-    let id = trade_link_id(&txn_id_a, &txn_id_b);
-
-    // Generate rules in _rules.json. For an on-chain swap (both legs share a
-    // txn id) the rule must be leg-anchored and co-located in the leaf folder
-    // that owns the legs, or a pre-existing per-leg categorisation would
-    // outrank it; plan_trade_link_rules resolves that from the built ledgers.
     let generated_dir = resolve_generated_dir(&app)?;
-    let by_folder = load_per_folder_ledgers(&generated_dir, &sources_dir);
-    let (sell_txn, buy_txn) = if is_a_sell {
-        (txn_id_a.as_str(), txn_id_b.as_str())
-    } else {
-        (txn_id_b.as_str(), txn_id_a.as_str())
-    };
-    let (target_folder, link_rules) =
-        plan_trade_link_rules(&id, sell_txn, buy_txn, &account_folder, &by_folder);
-    let folder = sources_dir.join(&target_folder);
-    let mut rules = RulesFile::try_load(&folder)?;
-    let rule_count_before = rules.rules.len();
-    rules.insert_rules(link_rules);
     // Suppress watcher while we modify source files and run pipeline ourselves
+    app.state::<LastCommandRebuild>().mark();
     let _suppress = app.state::<WatcherSuppressFlag>().suppress();
-    rules.save(&folder)?;
-    eprintln!(
-        "[trade-link] wrote {rule_count_before} -> {} rules to {}",
-        rules.rules.len(),
-        folder.join("_rules.json").display()
-    );
+    let target_folder = write_trade_link(
+        &sources_dir,
+        &generated_dir,
+        &txn_id_a,
+        &txn_id_b,
+        &account_folder,
+        is_a_sell,
+    )?;
 
     // Rebuild pipeline for just the affected folder
     let mut config = make_pipeline_config(&app, &now_yyyymm)?;
-    config.changed_folder_hint = Some(vec![target_folder.clone()]);
+    config.changed_folder_hint = Some(vec![target_folder]);
     let result = run_pipeline(&config)?;
-    spawn_report_generation(&app, &config, &result);
     let set_dir = resolve_set_dir(&config.generated_dir, &account_set);
     build_pipeline_response(&app, result, &set_dir, &account_set)
 }
@@ -1963,6 +2001,7 @@ async fn save_trade_links_bulk(
     let sources_dir = resolve_sources_dir(&app)?;
     let generated_dir = resolve_generated_dir(&app)?;
     let by_folder = load_per_folder_ledgers(&generated_dir, &sources_dir);
+    app.state::<LastCommandRebuild>().mark();
     let _suppress = app.state::<WatcherSuppressFlag>().suppress();
 
     // Group links by the resolved target folder so we only load/save each rules
@@ -2012,7 +2051,6 @@ async fn save_trade_links_bulk(
     let mut config = make_pipeline_config(&app, &now_yyyymm)?;
     config.changed_folder_hint = Some(changed_folders);
     let result = run_pipeline(&config)?;
-    spawn_report_generation(&app, &config, &result);
     let set_dir = resolve_set_dir(&config.generated_dir, &account_set);
     build_pipeline_response(&app, result, &set_dir, &account_set)
 }
@@ -2029,6 +2067,7 @@ async fn delete_trade_link(
     trade_links::delete(&sources_dir, &link_id)?;
 
     // Suppress watcher while we modify source files and run pipeline ourselves
+    app.state::<LastCommandRebuild>().mark();
     let _suppress = app.state::<WatcherSuppressFlag>().suppress();
 
     // Remove trade link rules from _rules.json
@@ -2041,7 +2080,6 @@ async fn delete_trade_link(
     let mut config = make_pipeline_config(&app, &now_yyyymm)?;
     config.changed_folder_hint = Some(vec![account_folder.clone()]);
     let result = run_pipeline(&config)?;
-    spawn_report_generation(&app, &config, &result);
     let set_dir = resolve_set_dir(&config.generated_dir, &account_set);
     build_pipeline_response(&app, result, &set_dir, &account_set)
 }
@@ -2064,16 +2102,18 @@ async fn suggest_trade_links_cmd(
     let sources_dir = resolve_sources_dir(&app)?;
     let existing = trade_links::load(&sources_dir)?;
 
-    // Cache key: sources fingerprint (the ledger is derived from sources), the
-    // current link ids (a new link must drop its pair from the suggestions),
-    // the base currency (changes the value-sanity filter), and the matcher
-    // version. On a hit this skips the full active-ledger parse AND the scan.
+    // Cache key: the pipeline's outputs and the price files
+    // (outputs_fingerprint — a rule save whose rebuild rewrites no output is a
+    // hit), the current link ids (a new link must drop its pair from the
+    // suggestions), the base currency (changes the value-sanity filter), and
+    // the matcher version. On a hit this skips the full active-ledger parse
+    // AND the scan.
     let mut link_ids: Vec<&str> = existing.iter().map(|l| l.id.as_str()).collect();
     link_ids.sort_unstable();
     let key = format!(
         "v{}:{}:{}:{}",
         trade_links::SUGGEST_VERSION,
-        emuaccounts::build_cache::dir_fingerprint(&sources_dir)?,
+        emuaccounts::derived_cache::outputs_fingerprint(&sources_dir, &generated_dir)?,
         emuaccounts::derived_cache::value_hash(&link_ids),
         base_currency.as_deref().unwrap_or("")
     );
@@ -2144,9 +2184,29 @@ async fn save_tax_config(
 //
 // `base_account_scope.is_some()` always falls through: cached snapshots are
 // the unscoped form.
-fn read_cached_report<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Option<T> {
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str::<T>(&text).ok()
+/// A set's cached FY report at `path`, only while the set's report files are
+/// current for what the set holds now (`report_templates::cached_report`);
+/// None means compute it live.
+fn cached_report<T: serde::de::DeserializeOwned>(
+    app: &tauri::AppHandle,
+    set_dir: &std::path::Path,
+    path: &std::path::Path,
+) -> Option<T> {
+    let generated_dir = resolve_generated_dir(app).ok()?;
+    let sources_dir = resolve_sources_dir(app).ok()?;
+    let extra_prefixes = app
+        .state::<RootConfigState>()
+        .0
+        .lock()
+        .extra_primary_account_prefixes
+        .clone();
+    emuaccounts::report_templates::cached_report(
+        &generated_dir,
+        set_dir,
+        &sources_dir,
+        &extra_prefixes,
+        path,
+    )
 }
 
 #[tauri::command]
@@ -2162,7 +2222,7 @@ async fn generate_cgt_report_cmd(
     if base_account_scope.is_none() {
         let json_path =
             emuaccounts::report_templates::cgt_json_path(&set_dir, &financial_year);
-        if let Some(report) = read_cached_report::<CgtReport>(&json_path) {
+        if let Some(report) = cached_report::<CgtReport>(&app, &set_dir, &json_path) {
             return Ok(report);
         }
     }
@@ -2199,7 +2259,7 @@ async fn generate_income_report_cmd(
     if base_account_scope.is_none() {
         let json_path =
             emuaccounts::report_templates::income_json_path(&set_dir, &financial_year);
-        if let Some(report) = read_cached_report::<IncomeTaxReport>(&json_path) {
+        if let Some(report) = cached_report::<IncomeTaxReport>(&app, &set_dir, &json_path) {
             return Ok(report);
         }
     }
@@ -2289,20 +2349,13 @@ async fn generate_balances_report_cmd(
 ) -> Result<BalancesReport, String> {
     let generated_dir = resolve_generated_dir(&app)?;
     let set_dir = resolve_set_dir(&generated_dir, &account_set);
-    // Skip the cached FY-balances snapshot when extra primary-account prefixes
-    // are configured: the cache is keyed only by FY, so a non-empty prefix list
-    // must recompute live (mirrors the `base_account_scope` bypass).
-    if base_account_scope.is_none()
-        && app
-            .state::<RootConfigState>()
-            .0
-            .lock()
-            .extra_primary_account_prefixes
-            .is_empty()
-    {
+    // The cached snapshot was computed with the extra primary-account prefixes
+    // of its time; they are part of the reports' stamp, so a changed list is
+    // a stale cache and recomputes live.
+    if base_account_scope.is_none() {
         let json_path =
             emuaccounts::report_templates::balances_json_path(&set_dir, &financial_year);
-        if let Some(report) = read_cached_report::<BalancesReport>(&json_path) {
+        if let Some(report) = cached_report::<BalancesReport>(&app, &set_dir, &json_path) {
             return Ok(report);
         }
     }
@@ -2849,13 +2902,15 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// Timestamp (epoch millis) of the most recent command-driven pipeline rebuild
-/// — manual add, import, transform-save, delete. The file-watcher consults this
-/// to skip the redundant rebuild its ~500ms debounce would otherwise fire right
-/// after a command wrote to `sources/` and already rebuilt that change. A scoped
-/// rebuild finishes before the debounce elapses, so the RAII WatcherSuppressFlag
-/// guard alone can't cover the window; the command marks the time *before* its
-/// write so the watcher (waking ~500ms after the write) sees it as recent.
+/// Timestamp (epoch millis) of the most recent pipeline rebuild by a command
+/// that passes a `changed_folder_hint`. Such a run records no sources
+/// fingerprint, so the file-watcher's next run cannot take the early exit. The
+/// watcher consults this instead, to skip the redundant rebuild its ~500ms
+/// debounce would otherwise fire right after a command wrote to `sources/` and
+/// already rebuilt that change. A scoped rebuild finishes before the debounce
+/// elapses, so the RAII WatcherSuppressFlag guard alone can't cover the window;
+/// the command marks the time *before* its write so the watcher (waking ~500ms
+/// after the write) sees it as recent.
 struct LastCommandRebuild(AtomicU64);
 
 impl LastCommandRebuild {
@@ -3202,6 +3257,29 @@ fn set_update_prices_on_startup(
     root_config::save_root_config(&app_dir, &config)
 }
 
+#[tauri::command(async)]
+fn get_show_all_holdings(state: tauri::State<RootConfigState>) -> bool {
+    state.0.lock().show_all_holdings
+}
+
+#[tauri::command(async)]
+fn set_show_all_holdings(
+    app: tauri::AppHandle,
+    state: tauri::State<RootConfigState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let app_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("failed to resolve app data dir: {e}"))?;
+    let config = {
+        let mut guard = state.0.lock();
+        guard.show_all_holdings = enabled;
+        guard.clone()
+    };
+    root_config::save_root_config(&app_dir, &config)
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct AiSettings {
     api_url: String,
@@ -3419,6 +3497,7 @@ macro_rules! app_handler {
             update_label,
             delete_label,
             hide_transaction,
+            unhide_transaction,
             delete_manual_transaction,
             list_account_sets,
             get_account_gaps,
@@ -3432,6 +3511,8 @@ macro_rules! app_handler {
             get_display_config,
             get_vault_base_currency,
             set_vault_base_currency,
+            get_clearing_accounts,
+            set_clearing_accounts,
             list_base_currency_candidates,
             open_display_config,
             convert_to_base_currency,
@@ -3472,6 +3553,8 @@ macro_rules! app_handler {
             run_daily_plugins_cmd,
             get_update_prices_on_startup,
             set_update_prices_on_startup,
+            get_show_all_holdings,
+            set_show_all_holdings,
             get_ai_settings,
             set_ai_settings,
             get_extra_primary_account_prefixes,
@@ -3490,6 +3573,7 @@ macro_rules! app_handler {
             get_account_config,
             set_show_hidden,
             get_show_hidden,
+            get_hidden_accounts,
             open_url
             $($sync)*
         ]
@@ -3497,6 +3581,13 @@ macro_rules! app_handler {
 }
 
 fn main() {
+    let context = tauri::generate_context!();
+
+    // Before the window opens: a Wayland dock looks up the window's desktop
+    // entry when the window appears (TASK-140).
+    #[cfg(target_os = "linux")]
+    emuaccounts::appimage_integration::install_from_env(&context.package_info().name);
+
     #[allow(unused_mut)]
     let mut builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
 
@@ -3571,7 +3662,7 @@ fn main() {
         .invoke_handler(sync_commands::with_sync_commands!(app_handler));
 
     builder
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }
 
@@ -3605,6 +3696,7 @@ mod tests {
             output_files_written: 0,
             output_files_skipped: 0,
             changed_folders: vec![],
+            scoped: false,
             in_memory: None,
         };
 

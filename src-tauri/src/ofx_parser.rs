@@ -1,4 +1,4 @@
-use crate::csv_transform::apply_labels_and_rules;
+use crate::csv_transform::apply_labels_and_rules_to_all;
 use crate::ledger_parser::{Posting, Transaction};
 use crate::rules::{LabelsFile, RulesFile};
 use crate::{parse_date_to_iso, FALLBACK_EXPENSE_ACCOUNT};
@@ -153,6 +153,20 @@ pub fn ofx_to_transactions_with_default(
     rules: &RulesFile,
     default_expense_account: &str,
 ) -> Result<Vec<Transaction>, String> {
+    let mut transactions =
+        ofx_to_raw_transactions(ofx, account_name, relative_path, default_expense_account)?;
+    apply_labels_and_rules_to_all(&mut transactions, labels, rules);
+    Ok(transactions)
+}
+
+/// The OFX transactions as ledger rows before any label or rule: what the
+/// build cache stores, so a rule change re-runs only the rules pass.
+pub fn ofx_to_raw_transactions(
+    ofx: &OfxFile,
+    account_name: &str,
+    relative_path: &str,
+    default_expense_account: &str,
+) -> Result<Vec<Transaction>, String> {
     let mut transactions = Vec::new();
 
     for otxn in &ofx.transactions {
@@ -167,7 +181,7 @@ pub fn ofx_to_transactions_with_default(
         let meta = format!("txn:{txn_id}");
         let neg_amount = -amount;
 
-        let mut txn = Transaction {
+        let txn = Transaction {
             date: date.clone(),
             datetime: date,
             status: Some('*'),
@@ -205,8 +219,6 @@ pub fn ofx_to_transactions_with_default(
             fee: None,
             fee_commodity: None,
         };
-
-        apply_labels_and_rules(&mut txn, labels, rules);
         transactions.push(txn);
     }
 

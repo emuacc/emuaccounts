@@ -1,0 +1,20 @@
+; Bank account with uncategorised card purchases (expenses:unknown), a
+; categorised salary credit and a bakery purchase (so expenses:food is an
+; account the category autocomplete offers). Drives the optimistic-UI
+; scenarios: re-categorise, rename the party, hide and unhide a row, Show Ignored.
+
+2026-02-01T09:00:00Z * "Coffee Club" "Card purchase COFFEE CLUB" ; txn:unc-coffee-01
+    assets:bank:everyday   -4.50 AUD
+    expenses:unknown        4.50 AUD
+
+2026-02-02T09:00:00Z * "Grocer" "Card purchase GROCER" ; txn:unc-grocer-01
+    assets:bank:everyday  -52.10 AUD
+    expenses:unknown       52.10 AUD
+
+2026-02-03T09:00:00Z * "Employer" "Salary" ; txn:unc-salary-01
+    assets:bank:everyday  2000.00 AUD
+    income:salary        -2000.00 AUD
+
+2026-02-04T09:00:00Z * "Bakery" "Card purchase BAKERY" ; txn:unc-bakery-01
+    assets:bank:everyday   -7.20 AUD
+    expenses:food           7.20 AUD

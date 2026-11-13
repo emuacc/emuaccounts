@@ -1,9 +1,10 @@
 use crate::ledger_parser::{
-    parse_transactions, AccountBalance, CommodityAmount, Diagnostic, ParseResult, Posting,
+    account_balances_from_map, add_account_balances, parse_transactions, AccountBalance,
+    CommodityAmount, Diagnostic, ParseResult, Posting,
 };
 use crate::processing_pipeline::{folder_to_account_name, txn_sort_key, PipelineMetadata};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
@@ -519,29 +520,23 @@ pub fn load_active_ledger(base_dir: &Path) -> Result<ParseResult, String> {
 
 /// Load account tree from per-folder summary.json files.
 /// Returns aggregated balances without parsing any transactions.
+///
+/// The set-root accounts.transactions holds every opening once, and a folder's
+/// summary already counts the openings its own accounts.transactions declares
+/// (listed under `openings`). So the tree is the summaries plus the openings no
+/// summary holds — an account declared in a folder with no ledger, or in a
+/// parent folder — and an opening is never counted twice.
 pub fn load_account_tree(set_dir: &Path) -> Result<Vec<AccountBalance>, String> {
-    let mut all_balances: std::collections::BTreeMap<
-        String,
-        std::collections::BTreeMap<String, f64>,
-    > = std::collections::BTreeMap::new();
+    let mut tree = BTreeMap::new();
+    let mut unheld_openings = BTreeMap::new();
 
-    // Also load account declarations for accounts_with_opening info
-    let accounts_path = set_dir.join("accounts.transactions");
-    if accounts_path.exists() {
-        if let Ok(text) = fs::read_to_string(&accounts_path) {
-            let parsed = parse_transactions(&text);
-            for b in &parsed.balances {
-                // Ensure declared accounts with no transactions still appear
-                all_balances.entry(b.account.clone()).or_default();
-                for t in &b.totals {
-                    *all_balances
-                        .entry(b.account.clone())
-                        .or_default()
-                        .entry(t.commodity.clone())
-                        .or_insert(0.0) += t.amount;
-                }
-            }
+    if let Ok(text) = fs::read_to_string(set_dir.join("accounts.transactions")) {
+        let declared = parse_transactions(&text).balances;
+        // Declared accounts appear even with no transactions.
+        for b in &declared {
+            tree.entry(b.account.clone()).or_default();
         }
+        add_account_balances(&mut unheld_openings, &declared, 1.0);
     }
 
     // Per-folder summaries, for the folders the pipeline wrote only: an orphan
@@ -554,29 +549,14 @@ pub fn load_account_tree(set_dir: &Path) -> Result<Vec<AccountBalance>, String> 
             if let Ok(summary) =
                 serde_json::from_str::<crate::processing_pipeline::FolderSummary>(&text)
             {
-                for b in &summary.balances {
-                    for t in &b.totals {
-                        *all_balances
-                            .entry(b.account.clone())
-                            .or_default()
-                            .entry(t.commodity.clone())
-                            .or_insert(0.0) += t.amount;
-                    }
-                }
+                add_account_balances(&mut tree, &summary.balances, 1.0);
+                add_account_balances(&mut unheld_openings, &summary.openings, -1.0);
             }
         }
     }
 
-    Ok(all_balances
-        .into_iter()
-        .map(|(account, by_commodity)| AccountBalance {
-            account,
-            totals: by_commodity
-                .into_iter()
-                .map(|(commodity, amount)| CommodityAmount { commodity, amount })
-                .collect(),
-        })
-        .collect())
+    add_account_balances(&mut tree, &account_balances_from_map(unheld_openings), 1.0);
+    Ok(account_balances_from_map(tree))
 }
 
 /// Load transactions from per-folder files scoped to an account prefix.
@@ -673,10 +653,7 @@ pub fn filter_hidden_accounts(parse: &mut ParseResult, prefixes: &[String]) {
     parse.opening_balances.retain(|b| !is_hidden(&b.account));
     parse.accounts_with_opening.retain(|a| !is_hidden(a));
 
-    let mut balances_map: std::collections::BTreeMap<
-        String,
-        std::collections::BTreeMap<String, f64>,
-    > = std::collections::BTreeMap::new();
+    let mut balances_map: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
     for txn in &parse.transactions {
         for posting in &txn.postings {
             *balances_map
@@ -686,16 +663,8 @@ pub fn filter_hidden_accounts(parse: &mut ParseResult, prefixes: &[String]) {
                 .or_insert(0.0) += posting.amount;
         }
     }
-    for opening in &parse.opening_balances {
-        for t in &opening.totals {
-            *balances_map
-                .entry(opening.account.clone())
-                .or_default()
-                .entry(t.commodity.clone())
-                .or_insert(0.0) += t.amount;
-        }
-    }
-    parse.balances = crate::ledger_parser::account_balances_from_map(balances_map);
+    add_account_balances(&mut balances_map, &parse.opening_balances, 1.0);
+    parse.balances = account_balances_from_map(balances_map);
 }
 
 /// Extract the first `account:` prefix from a search string. Used to scope
@@ -1227,6 +1196,23 @@ mod tests {
             staking.amount
         );
 
+        // The account header asks for the balance alone: `limit: 0` with the
+        // segment-anchored subtree term the frontend sends for a non-folder
+        // selection still aggregates over every matching row.
+        let header = global_query(
+            &set_dir,
+            "account:(?-i)^assets:staking(:|$)",
+            false,
+            None,
+            None,
+            None,
+            Some(0),
+        )
+        .expect("global_query limit 0");
+        assert!(header.transactions.is_empty());
+        assert_eq!(header.transaction_count, 1);
+        assert_eq!(header.aggregated_balance, global.aggregated_balance);
+
         let _ = fs::remove_dir_all(&set_dir);
     }
 
@@ -1377,6 +1363,65 @@ mod tests {
             ]
         );
         assert!(load_openings(&set_dir, "assets:cash:cba:bt", false).is_empty());
+        let _ = fs::remove_dir_all(&set_dir);
+    }
+
+    /// Each opening counts once in the tree whatever its summary holds: one the
+    /// summary folded in, one an older pipeline left out (no `openings` field),
+    /// one edited since the summary was written, and one with no folder at all.
+    #[test]
+    fn load_account_tree_counts_each_opening_once() {
+        let set_dir = tmp_set_dir("tree-openings");
+        fs::write(
+            set_dir.join("accounts.transactions"),
+            "account assets:cash:cba:bta AUD\n    opening 1,823.92 AUD\n\
+             account assets:cash:cba:older AUD\n    opening 500 AUD\n\
+             account assets:cash:cba:edited AUD\n    opening 300 AUD\n\
+             account assets:cash:cba:goalsaver AUD\n    opening 40 AUD\n",
+        )
+        .unwrap();
+        let summary = |folder: &str, json: &str| {
+            write_ledger(&set_dir, folder, "");
+            fs::write(set_dir.join(folder).join("summary.json"), json).unwrap();
+        };
+        let entry = |account: &str, amount: f64| {
+            format!(r#"[{{"account": "{account}", "totals": [{{"commodity": "AUD", "amount": {amount}}}]}}]"#)
+        };
+        summary(
+            "cash/cba/bta",
+            &format!(
+                r#"{{"transaction_count": 2, "balances": {}, "openings": {}}}"#,
+                entry("assets:cash:cba:bta", 2504.02),
+                entry("assets:cash:cba:bta", 1823.92)
+            ),
+        );
+        summary(
+            "cash/cba/older",
+            &format!(
+                r#"{{"transaction_count": 1, "balances": {}}}"#,
+                entry("assets:cash:cba:older", -20.0)
+            ),
+        );
+        summary(
+            "cash/cba/edited",
+            &format!(
+                r#"{{"transaction_count": 1, "balances": {}, "openings": {}}}"#,
+                entry("assets:cash:cba:edited", 150.0),
+                entry("assets:cash:cba:edited", 100.0)
+            ),
+        );
+
+        let tree = load_account_tree(&set_dir).unwrap();
+        let total = |account: &str| {
+            tree.iter()
+                .find(|b| b.account == account)
+                .and_then(|b| b.totals.iter().find(|t| t.commodity == "AUD"))
+                .map(|t| t.amount)
+        };
+        assert_eq!(total("assets:cash:cba:bta"), Some(2504.02));
+        assert_eq!(total("assets:cash:cba:older"), Some(480.0));
+        assert_eq!(total("assets:cash:cba:edited"), Some(350.0));
+        assert_eq!(total("assets:cash:cba:goalsaver"), Some(40.0));
         let _ = fs::remove_dir_all(&set_dir);
     }
 

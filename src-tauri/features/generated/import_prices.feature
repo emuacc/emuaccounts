@@ -137,7 +137,7 @@ Feature: Import prices file
       P 2026-01-15 ETH 3200.00 USD
       P 2026-01-16 ETH 3250.50 USD
       """
-    When I look up the price for "ETH" at "2026-01-16"
+    When I look up the price for "ETH" in "USD" at "2026-01-16"
     Then the lookup result should be "3250.50" "USD"
 
   Scenario: Nearest earlier date lookup
@@ -147,12 +147,12 @@ Feature: Import prices file
       P 2026-01-15 ETH 3200.00 USD
       P 2026-01-20 ETH 3300.00 USD
       """
-    When I look up the price for "ETH" at "2026-01-18"
+    When I look up the price for "ETH" in "USD" at "2026-01-18"
     Then the lookup result should be "3200.00" "USD"
 
   Scenario: No prices file for commodity returns empty
     Given a clean sources directory
-    When I look up the price for "DOGE" at "2026-01-15"
+    When I look up the price for "DOGE" in "USD" at "2026-01-15"
     Then the lookup result should be empty
 
   Scenario: Target before all available prices returns earliest as fallback
@@ -162,8 +162,30 @@ Feature: Import prices file
       P 2026-03-01 ETH 3500.00 USD
       P 2026-03-15 ETH 3600.00 USD
       """
-    When I look up the price for "ETH" at "2026-01-01"
+    When I look up the price for "ETH" in "USD" at "2026-01-01"
     Then the lookup result should be "3500.00" "USD"
+
+  Scenario: Lookup takes the requested currency's quote on a date quoted in two currencies
+    Given a clean sources directory
+    And a prices file at "_prices/HNT.txt" in sources with content:
+      """
+      P 2024-06-15 HNT 4.00 AUD
+      P 2024-06-15 HNT 2.70 USD
+      """
+    When I look up the price for "HNT" in "AUD" at "2024-06-16"
+    Then the lookup result should be "4.00" "AUD"
+    When I look up the price for "HNT" in "USD" at "2024-06-16"
+    Then the lookup result should be "2.70" "USD"
+
+  Scenario: Lookup in a currency the date is not quoted in reports the quote it found
+    Given a clean sources directory
+    And a prices file at "_prices/HNT.txt" in sources with content:
+      """
+      P 2024-06-14 HNT 4.00 AUD
+      P 2024-06-15 HNT 2.70 USD
+      """
+    When I look up the price for "HNT" in "AUD" at "2024-06-15"
+    Then the lookup result should be "2.70" "USD"
 
   # ':' is illegal in Windows filenames (NTFS alternate data streams) and is
   # shown as '/' by Finder, so the file name percent-encodes it. The P line
@@ -178,5 +200,5 @@ Feature: Import prices file
     Then the prices import should succeed with 1 directives
     And the prices import should include commodity "xyz:WTIOIL"
     And the file "_prices/xyz%3AWTIOIL.txt" should exist in sources
-    When I look up the price for "xyz:WTIOIL" at "2026-01-20"
+    When I look up the price for "xyz:WTIOIL" in "USD" at "2026-01-20"
     Then the lookup result should be "94.09" "USD"

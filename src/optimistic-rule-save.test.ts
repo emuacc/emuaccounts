@@ -158,7 +158,7 @@ describe("optimistic Apply Rule end-to-end", () => {
     expect(state.sidebarView).toBe("accounts");
     expect(state.ruleEditorDraft).toBeUndefined();
 
-    // Even after refreshSearch landed and the queue drained.
+    // Even after the refresh landed and the queue drained.
     state.status = "Rule saved";
     expect(state.sidebarView).toBe("accounts");
     expect(state.ruleEditorDraft).toBeUndefined();

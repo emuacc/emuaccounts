@@ -110,6 +110,20 @@ Feature: Root folder configuration
     Then the root should be "/tmp/legacy-root"
     And update prices on startup should be false
 
+  # --- show_all_holdings setting (TASK-141) ---
+  # App-wide, like update_prices_on_startup: whether the Accounts pane also
+  # lists holdings that have no source folder.
+
+  Scenario: Show all holdings is off by default
+    Given no root config file exists
+    When I resolve the root directory
+    Then show all holdings should be false
+
+  Scenario: Show all holdings persists across save and reload
+    Given a root config file with show all holdings enabled
+    When I resolve the root directory
+    Then show all holdings should be true
+
   # --- generated/.gitignore ---
   # The ignore-all file is for a generated/ the app just created. A vault that
   # already tracks generated/ in git must not get one: it hid untracked

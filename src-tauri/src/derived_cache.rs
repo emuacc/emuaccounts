@@ -8,6 +8,7 @@
 //! command.
 
 use serde::{de::DeserializeOwned, Serialize};
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -39,6 +40,27 @@ where
         let _ = std::fs::write(path, json);
     }
     Ok(env.data)
+}
+
+/// What the derived scans read of the vault: the pipeline's outputs, by the
+/// hash of each generated file the cache manifest recorded, and the price
+/// files under sources. A rule save whose rebuild rewrites no output leaves
+/// it unchanged, so the scans stay cached; a source edit reaches it through
+/// the outputs the rebuild rewrote. The sources fingerprint it replaces
+/// changed on every rule save, which recomputed every scan.
+pub fn outputs_fingerprint(sources_dir: &Path, generated_dir: &Path) -> Result<String, String> {
+    let manifest = crate::build_cache::load_cache_filtered(generated_dir, Some(&HashSet::new()));
+    let outputs: BTreeMap<String, String> = manifest.output_hashes.into_iter().collect();
+    Ok(format!(
+        "{}:{}",
+        value_hash(&outputs),
+        crate::build_cache::dir_fingerprint(&sources_dir.join("_prices"))?
+    ))
+}
+
+/// The content hash of one file, or empty when it cannot be read.
+pub fn file_fingerprint(path: &Path) -> String {
+    crate::build_cache::file_hash(path).unwrap_or_default()
 }
 
 /// Stable hex digest of any serializable value — used to fold secondary
@@ -122,6 +144,64 @@ mod tests {
         let err = get_or_compute::<Vec<i32>, _>(&path, "k1", || Err("boom".to_string()));
         assert_eq!(err.unwrap_err(), "boom");
         assert!(!path.exists());
+    }
+
+    /// A vault whose pipeline has run: a manifest recording `outputs` as the
+    /// generated files, a price file and a rules file under sources.
+    fn vault_with_outputs(root: &Path, outputs: &[(&str, &str)]) -> (std::path::PathBuf, std::path::PathBuf) {
+        let sources = root.join("sources");
+        let generated = root.join("generated");
+        std::fs::create_dir_all(sources.join("_prices")).unwrap();
+        std::fs::create_dir_all(sources.join("bank")).unwrap();
+        std::fs::write(sources.join("_prices/AUD.csv"), "2025-01-01,1\n").unwrap();
+        std::fs::write(sources.join("bank/_rules.json"), r#"{"rules":[]}"#).unwrap();
+        let cache = crate::build_cache::BuildCache {
+            output_hashes: outputs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..Default::default()
+        };
+        crate::build_cache::save_cache(&generated, &cache, None).unwrap();
+        (sources, generated)
+    }
+
+    #[test]
+    fn outputs_fingerprint_ignores_a_rule_save_that_rewrites_no_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sources, generated) = vault_with_outputs(dir.path(), &[("bank/ledger.transactions", "h1")]);
+        let before = outputs_fingerprint(&sources, &generated).unwrap();
+        std::fs::write(sources.join("bank/_rules.json"), r#"{"rules":[{"id":"r","pattern":"*x*"}]}"#).unwrap();
+        assert_eq!(outputs_fingerprint(&sources, &generated).unwrap(), before);
+    }
+
+    #[test]
+    fn outputs_fingerprint_changes_with_a_rewritten_output_or_a_price_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sources, generated) = vault_with_outputs(dir.path(), &[("bank/ledger.transactions", "h1")]);
+        let before = outputs_fingerprint(&sources, &generated).unwrap();
+
+        let cache = crate::build_cache::BuildCache {
+            output_hashes: [("bank/ledger.transactions".to_string(), "h2".to_string())].into(),
+            ..Default::default()
+        };
+        crate::build_cache::save_cache(&generated, &cache, None).unwrap();
+        let rewritten = outputs_fingerprint(&sources, &generated).unwrap();
+        assert_ne!(rewritten, before);
+
+        std::fs::write(sources.join("_prices/BTC.csv"), "2025-01-01,100000\n").unwrap();
+        assert_ne!(outputs_fingerprint(&sources, &generated).unwrap(), rewritten);
+    }
+
+    #[test]
+    fn file_fingerprint_is_empty_for_a_missing_file_and_tracks_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("_trade_links.json");
+        assert_eq!(file_fingerprint(&path), "");
+        std::fs::write(&path, "[]").unwrap();
+        let empty = file_fingerprint(&path);
+        std::fs::write(&path, r#"[{"id":"l1"}]"#).unwrap();
+        assert_ne!(file_fingerprint(&path), empty);
     }
 
     #[test]

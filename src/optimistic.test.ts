@@ -1,62 +1,49 @@
 import { describe, it, expect } from "vitest";
 import {
-  filterPendingDeletes,
   pruneExpandedKeysForTxn,
   resetSearchPaging,
   buildOptimisticTransaction,
   pendingAddsForView,
   applyPendingBalanceDelta,
   nextOptimisticTempId,
+  searchWindowFetch,
+  windowStartAfterReplace,
 } from "./optimistic";
 import type { BuiltPosting } from "./account-utils";
 import type { Transaction } from "./types";
 
-type T = { meta?: string | null; payee: string };
-
-describe("filterPendingDeletes", () => {
-  it("returns the input array unchanged when the set is empty", () => {
-    const txns: T[] = [
-      { meta: "txn:a", payee: "x" },
-      { meta: "txn:b", payee: "y" },
-    ];
-    expect(filterPendingDeletes(txns, new Set())).toBe(txns);
+describe("searchWindowFetch", () => {
+  it("fetches the first page when nothing is scrolled", () => {
+    expect(searchWindowFetch(0, 500, false)).toEqual({ offset: 0, limit: 500, append: false });
   });
 
-  it("removes txns whose id is in the pending set", () => {
-    const txns: T[] = [
-      { meta: "txn:a", payee: "x" },
-      { meta: "txn:b", payee: "y" },
-      { meta: "txn:c", payee: "z" },
-    ];
-    const out = filterPendingDeletes(txns, new Set(["txn:b"]));
-    expect(out).toHaveLength(2);
-    expect(out.map((t) => t.payee)).toEqual(["x", "z"]);
+  it("re-fetches the whole loaded span from the top on a refresh", () => {
+    // Two pages loaded (txWindowStart = 500): a rebuild must replace both
+    // pages in one fetch — appending a fresh page to stale ones is the
+    // "rows keep their pre-mutation values" bug.
+    expect(searchWindowFetch(500, 500, false)).toEqual({ offset: 0, limit: 1000, append: false });
   });
 
-  it("keeps txns whose meta does not contain a txn id", () => {
-    const txns: T[] = [
-      { meta: "no-id-here", payee: "x" },
-      { meta: null, payee: "y" },
-      { meta: undefined, payee: "z" },
-    ];
-    expect(filterPendingDeletes(txns, new Set(["txn:abc"]))).toHaveLength(3);
+  it("appends only the next page for infinite scroll", () => {
+    expect(searchWindowFetch(1000, 500, true)).toEqual({ offset: 1000, limit: 500, append: true });
   });
 
-  it("matches when txn:id is buried in a comma-separated meta string", () => {
-    const txns: T[] = [
-      { meta: "ofx_id:foo, txn:abc, payee:Bar", payee: "x" },
-    ];
-    expect(filterPendingDeletes(txns, new Set(["txn:abc"]))).toHaveLength(0);
+  it("treats an append at the top as a plain first-page fetch", () => {
+    expect(searchWindowFetch(0, 500, true)).toEqual({ offset: 0, limit: 500, append: false });
+  });
+});
+
+describe("windowStartAfterReplace", () => {
+  it("puts the next append right after the rows the refresh loaded", () => {
+    // Two pages refetched in place: the next append fetches from 1000.
+    expect(windowStartAfterReplace(1000, 500) + 500).toBe(1000);
+    // A short last page: the next append still starts at the end.
+    expect(windowStartAfterReplace(1234, 500) + 500).toBe(1234);
   });
 
-  it("removes multiple matching txns in one pass", () => {
-    const txns: T[] = [
-      { meta: "txn:a", payee: "x" },
-      { meta: "txn:b", payee: "y" },
-      { meta: "txn:c", payee: "z" },
-    ];
-    const out = filterPendingDeletes(txns, new Set(["txn:a", "txn:c"]));
-    expect(out.map((t) => t.payee)).toEqual(["y"]);
+  it("is 0 for a single page or less", () => {
+    expect(windowStartAfterReplace(500, 500)).toBe(0);
+    expect(windowStartAfterReplace(12, 500)).toBe(0);
   });
 });
 

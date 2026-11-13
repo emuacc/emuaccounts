@@ -15,6 +15,9 @@ identical everywhere.
 
 - Install: `cargo install tauri-driver --locked`
 - Wraps the platform WebView driver (WebKitWebDriver / Edge WebDriver).
+- On Linux, `WebKitWebDriver` has to be on `PATH`. Install Xvfb too (Arch:
+  `xorg-server-xvfb`, Debian and Ubuntu: `xvfb`), or the app's window opens on
+  your desktop and takes focus while the suite runs.
 
 ### macOS — `tauri-wd`
 
@@ -37,10 +40,35 @@ the `tauri-automation` MCP and `scripts/record_demos.mjs` already use.
 - `npm run e2e` — runs the suite, auto-selecting the backend for the current OS
   (`tauri-driver` on Linux/Windows, `tauri-wd` on macOS). Skips with a hint if
   the backend isn't installed.
-- `npm run test:bdd:ui` — bare `cucumber-js`; same auto-selected backend.
+- `npm run test:bdd:ui` — bare `cucumber-js`; same auto-selected backend, but it
+  also runs the `@wip` and `@appium` scenarios.
 - `npm run e2e:wd` — macOS DOM suite, explicitly forcing the `tauri-wd` backend
   (the non-skipping counterpart to `npm run e2e`).
 - Force a backend with `E2E_BACKEND=tauri-wd|tauri-driver|appium-mac2`.
+
+### Linux
+
+`npm run e2e` needs no environment variables and no separate build. For one
+feature, name it:
+
+```
+npx cucumber-js features/ui/parse_display.feature
+```
+
+Each run rebuilds the app first, so it tests the current tree with the E2E hooks.
+If the build fails, the suite stops with the build's error and runs nothing.
+
+The app runs on its own Xvfb display, so nothing shows on your desktop. The suite
+starts and stops that display itself, on the first free number from `:99`, and it
+prints a warning if Xvfb isn't installed. Then the window opens on your desktop
+instead, which needs an X server (Xwayland on a Wayland desktop).
+
+If you start Xvfb by hand, name the display (`Xvfb :99`). With `-displayfd` alone it
+ignores lock files and can take `:0`, cutting a Wayland desktop off from Xwayland.
+
+Either way the app runs under X11 at scale 1 (`GDK_BACKEND=x11`, `GDK_SCALE=1`, set
+on the driver server). Under a fractional Wayland scale WebKitGTK reports a
+`devicePixelRatio` like 1.18 and WebDriver clicks land on the wrong element.
 
 ### macOS — Appium mac2 (native-AX smoke, separate)
 
@@ -51,10 +79,14 @@ feature files above run. Requires Xcode + `./scripts/setup_appium_mac2.sh`.
 
 ## How it works
 
-The driver lifecycle lives in `parse_display.steps.js` (`BeforeAll` / `AfterAll`),
-keyed on `selectedBackend()`:
+The driver lifecycle lives in `parse_display.steps.js` (`BeforeAll` / `Before` /
+`AfterAll`), keyed on `selectedBackend()`. Every scenario gets a fresh app on an
+empty vault with its base currency set, so a scenario sets up what it needs (usually
+`I parse the transactions file ...`) and nothing it leaves behind reaches the next
+one. Relaunching costs a few seconds a scenario. Run one suite at a time: the ports
+(4444, and 4445 for the native driver) are fixed.
 
-1. **Build.** `tauri-driver` → `tauri build --debug --bundles none`.
+1. **Build.** `tauri-driver` → `tauri build --debug --no-bundle`.
    `tauri-wd` → `npm run build` then
    `cargo build --bin emuaccounts --features "webdriver tauri/custom-protocol"`
    into the isolated `~/.cache/emuacc-target-mcp` target dir. The `webdriver`

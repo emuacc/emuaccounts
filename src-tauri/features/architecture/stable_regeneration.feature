@@ -41,6 +41,33 @@ Feature: Regeneration changes only what a data change affects
     And I rebuild from scratch into a fresh generated directory
     Then every generated file should be byte-identical between the two builds
 
+  # A change to one folder rebuilds that folder from its own sources and
+  # leaves every other folder on disk unread (a scoped run), and the tree it
+  # leaves is the one a rebuild from scratch produces. The cases that still
+  # need the whole set are listed on `full_run_blockers` in
+  # processing_pipeline.rs: a forced run, a changed ignored list, a root-level
+  # manual.transactions, a changed folder with no set or one that held trades,
+  # an unchanged folder whose outputs moved or whose summary predates the
+  # accounts list; and a trade the change introduces, found after the
+  # transform. tests/scoped_rebuild_equivalence.rs proves each against a
+  # forced full rebuild, byte for byte.
+  Scenario: A rule change rebuilds one folder and matches a rebuild from scratch
+    When I run the pipeline
+    And a rules file is added to "alex/bank/savings/_rules.json" matching "Salary" with payee "Employer"
+    And I run the pipeline again
+    Then the last rebuild should have been scoped
+    And the ledger at "alex/bank/savings/ledger.transactions" should contain "Employer"
+    When I rebuild from scratch into a fresh generated directory
+    Then every generated file should be byte-identical between the two builds
+
+  Scenario: A change that brings a trade into a bank folder reads the whole set
+    When I run the pipeline
+    Given a swap CSV at "alex/bank/savings/2026-02.csv" trading "USDC" for "SOL"
+    When I run the pipeline again
+    Then the last rebuild should have been a full run
+    When I rebuild from scratch into a fresh generated directory
+    Then every generated file should be byte-identical between the two builds
+
   Scenario: Adding one bank transaction changes only that account's ledger and the reports downstream of it
     When I run the pipeline
     And I snapshot the generated directory
@@ -51,6 +78,7 @@ Feature: Regeneration changes only what a data change affects
     Then the generated files that changed should be exactly:
       | alex/bank/savings/ledger.transactions |
       | alex/bank/savings/summary.json        |
+      | alex/reports/.stamp                   |
       | alex/reports/balances-2026.csv        |
       | alex/reports/balances-2026.json       |
       | alex/reports/income-2026.csv          |

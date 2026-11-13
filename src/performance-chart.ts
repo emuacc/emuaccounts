@@ -126,6 +126,13 @@ export const syncPerformanceGrowthChart: ChartSync = createChartController(
   (report) => report.account_breakdown.length > 0,
 );
 
+/** A typography token from the stylesheet's :root (src/style.css), so the
+ *  chart's SVG text follows the app's font and type scale. ApexCharts writes
+ *  these into SVG attributes, where var() does not resolve. */
+function cssToken(name: string): string {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
 function buildOptions(report: PerformanceReport): ApexOptions {
   const points = report.points;
   const value = points.map((p) => ({ x: p.date, y: round2(p.portfolio_value) }));
@@ -134,8 +141,7 @@ function buildOptions(report: PerformanceReport): ApexOptions {
     chart: {
       type: "area",
       height: 300,
-      fontFamily:
-        "ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif",
+      fontFamily: cssToken("--font-ui"),
       toolbar: { show: false },
       zoom: { enabled: false },
       animations: { enabled: true, speed: 260 },
@@ -156,7 +162,7 @@ function buildOptions(report: PerformanceReport): ApexOptions {
     grid: { borderColor: "#eef2f7", strokeDashArray: 3, padding: { left: 8, right: 8 } },
     xaxis: {
       type: "datetime",
-      labels: { style: { colors: "#6b7280", fontSize: "12px" } },
+      labels: { style: { colors: "#6b7280", fontSize: cssToken("--text-sm") } },
       axisBorder: { show: false },
       axisTicks: { show: false },
       crosshairs: { stroke: { color: "#c7d2fe", width: 1, dashArray: 0 } },
@@ -164,7 +170,7 @@ function buildOptions(report: PerformanceReport): ApexOptions {
     },
     yaxis: {
       labels: {
-        style: { colors: "#6b7280", fontSize: "12px" },
+        style: { colors: "#6b7280", fontSize: cssToken("--text-sm") },
         formatter: (v: number) => abbreviate(v),
       },
     },
@@ -234,8 +240,7 @@ function buildGrowthOptions(report: PerformanceReport): ApexOptions {
     chart: {
       type: "line",
       height: 320,
-      fontFamily:
-        "ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif",
+      fontFamily: cssToken("--font-ui"),
       toolbar: { show: false },
       zoom: { enabled: false },
       animations: { enabled: !prefersReducedMotion(), speed: 260 },
@@ -249,7 +254,7 @@ function buildGrowthOptions(report: PerformanceReport): ApexOptions {
     grid: { borderColor: "#eef2f7", strokeDashArray: 3, padding: { left: 8, right: 8 } },
     xaxis: {
       type: "datetime",
-      labels: { style: { colors: "#6b7280", fontSize: "12px" } },
+      labels: { style: { colors: "#6b7280", fontSize: cssToken("--text-sm") } },
       axisBorder: { show: false },
       axisTicks: { show: false },
       crosshairs: { stroke: { color: "#c7d2fe", width: 1, dashArray: 0 } },
@@ -257,7 +262,7 @@ function buildGrowthOptions(report: PerformanceReport): ApexOptions {
     },
     yaxis: {
       labels: {
-        style: { colors: "#6b7280", fontSize: "12px" },
+        style: { colors: "#6b7280", fontSize: cssToken("--text-sm") },
         formatter: (v: number) => `${v >= 0 ? "+" : ""}${v.toFixed(0)}%`,
       },
     },
@@ -273,7 +278,7 @@ function buildGrowthOptions(report: PerformanceReport): ApexOptions {
           label: {
             text: "start",
             position: "left",
-            style: { color: "#9ca3af", background: "transparent", fontSize: "11px" },
+            style: { color: "#9ca3af", background: "transparent", fontSize: cssToken("--text-xs") },
           },
         },
       ],

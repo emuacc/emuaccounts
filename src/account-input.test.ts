@@ -315,3 +315,111 @@ describe("attachAccountInput — controller", () => {
     expect(document.body.querySelectorAll(".accountInput-dropdown").length).toBe(0);
   });
 });
+
+describe("attachAccountInput — the dropdown goes away with its field", () => {
+  // A MutationObserver reports on a microtask, not synchronously.
+  const flushMutations = () => vi.advanceTimersByTimeAsync(0);
+
+  it("closes when the input leaves the page while the dropdown is open", async () => {
+    const { input } = setup("", { suggestions: SUGGESTIONS, allowCreate: true });
+    input.focus();
+    typeInto(input, "exp");
+    expect(dropdown()).not.toBeNull();
+    input.remove();
+    await flushMutations();
+    expect(dropdown()).toBeNull();
+  });
+
+  it("closes when an ancestor of the input is removed", async () => {
+    document.body.innerHTML = "";
+    const editor = document.createElement("div");
+    const input = document.createElement("input");
+    editor.appendChild(input);
+    document.body.appendChild(editor);
+    attachAccountInput(input, { suggestions: SUGGESTIONS }, () => {});
+    input.focus();
+    typeInto(input, "exp");
+    expect(dropdown()).not.toBeNull();
+    editor.remove();
+    await flushMutations();
+    expect(dropdown()).toBeNull();
+  });
+
+  it("keeps the dropdown open when a render only moves the input", async () => {
+    // morphdom reorders keyed rows by re-inserting them, which detaches the
+    // input for an instant inside one synchronous pass.
+    const { input } = setup("", { suggestions: SUGGESTIONS });
+    input.focus();
+    typeInto(input, "exp");
+    const parent = input.parentElement!;
+    input.remove();
+    parent.appendChild(input);
+    await flushMutations();
+    expect(dropdown()).not.toBeNull();
+  });
+});
+
+describe("attachAccountInput — a dropdown reopened on a settled field", () => {
+  function pickThenRefocus(typed: string, pick: string): Ctx {
+    const ctx = setup("", { suggestions: SUGGESTIONS, allowCreate: true });
+    ctx.input.focus();
+    typeInto(ctx.input, typed);
+    mousedown(items().find((el) => el.dataset.value === pick)!);
+    expect(dropdown()).toBeNull();
+    ctx.input.dispatchEvent(new Event("blur"));
+    vi.runAllTimers();
+    ctx.input.dispatchEvent(new Event("focus"));
+    expect(dropdown()).not.toBeNull();
+    return ctx;
+  }
+
+  it("closes on blur without committing again", () => {
+    const { input, commits } = pickThenRefocus("rent", "expenses:rent");
+    input.dispatchEvent(new Event("blur"));
+    vi.runAllTimers();
+    expect(dropdown()).toBeNull();
+    expect(input.value).toBe("expenses:rent");
+    expect(commits).toEqual([{ value: "expenses:rent", kind: "existing" }]);
+  });
+
+  it("closes on Escape and keeps the chosen value", () => {
+    const { input, commits } = pickThenRefocus("rent", "expenses:rent");
+    press(input, "Escape");
+    expect(dropdown()).toBeNull();
+    expect(input.value).toBe("expenses:rent");
+    expect(commits).toEqual([{ value: "expenses:rent", kind: "existing" }]);
+  });
+
+  it("closes on Enter without committing the same value again", () => {
+    const { input, commits } = pickThenRefocus("rent", "expenses:rent");
+    press(input, "Enter");
+    expect(dropdown()).toBeNull();
+    expect(commits).toEqual([{ value: "expenses:rent", kind: "existing" }]);
+  });
+
+  it("commits a different suggestion picked from it", () => {
+    const suggestions = ["expenses:food", "expenses:food:coffee"];
+    const ctx = setup("", { suggestions });
+    ctx.input.focus();
+    typeInto(ctx.input, "food");
+    mousedown(items().find((el) => el.dataset.value === "expenses:food")!);
+    ctx.input.dispatchEvent(new Event("focus"));
+    mousedown(items().find((el) => el.dataset.value === "expenses:food:coffee")!);
+    expect(dropdown()).toBeNull();
+    expect(ctx.input.value).toBe("expenses:food:coffee");
+    expect(ctx.commits.at(-1)).toEqual({ value: "expenses:food:coffee", kind: "existing" });
+  });
+
+  it('keeps a value chosen with "+ Add" when the field is revisited and left', () => {
+    const { input, commits } = setup("", { suggestions: SUGGESTIONS, allowCreate: true });
+    input.focus();
+    typeInto(input, "expenses:pets");
+    mousedown(items().find((el) => el.dataset.kind === "new")!);
+    input.dispatchEvent(new Event("focus"));
+    input.dispatchEvent(new Event("blur"));
+    vi.runAllTimers();
+    expect(dropdown()).toBeNull();
+    expect(input.value).toBe("expenses:pets");
+    expect(commits).toEqual([{ value: "expenses:pets", kind: "new" }]);
+  });
+});

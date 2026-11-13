@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   calculateWindow,
   computeRenderWindow,
+  hasMoreRowsToLoad,
   shouldAttachVirtualScroll,
   spacerRow,
   TX_WINDOW,
@@ -98,5 +99,33 @@ describe("calculateWindow", () => {
     expect(range.start).toBeGreaterThanOrEqual(0);
     expect(range.end).toBeLessThanOrEqual(10000);
     expect(range.end - range.start).toBeLessThanOrEqual(TX_WINDOW);
+  });
+});
+
+describe("hasMoreRowsToLoad", () => {
+  const partlyLoaded = { searchFilteredTransactions: new Array(TX_WINDOW), searchFilteredCount: TX_WINDOW * 10 };
+
+  it.each(["accounts", "categories"])("%s pages while rows are left to fetch", (sidebarView) => {
+    expect(hasMoreRowsToLoad({ sidebarView, ...partlyLoaded })).toBe(true);
+  });
+
+  // These panes keep the window the selection loaded but show none of its rows,
+  // so paging from them fetches rows nothing shows.
+  it.each(["reports", "plugins", "rule-editor", "label-editor"])("%s never pages", (sidebarView) => {
+    expect(hasMoreRowsToLoad({ sidebarView, ...partlyLoaded })).toBe(false);
+  });
+
+  it("stops once every row has loaded", () => {
+    const all = new Array(TX_WINDOW);
+    expect(
+      hasMoreRowsToLoad({ sidebarView: "accounts", searchFilteredTransactions: all, searchFilteredCount: TX_WINDOW }),
+    ).toBe(false);
+  });
+
+  it("does not page an empty or unqueried window", () => {
+    expect(hasMoreRowsToLoad({ sidebarView: "accounts" })).toBe(false);
+    expect(hasMoreRowsToLoad({ sidebarView: "accounts", searchFilteredTransactions: [], searchFilteredCount: 5 })).toBe(
+      false,
+    );
   });
 });

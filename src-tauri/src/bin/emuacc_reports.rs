@@ -3,21 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use emuaccounts::report_templates::{self, ReportFormat, ALL_FORMATS};
-use emuaccounts::root_config::{self, platform_app_data_dir};
-
-fn resolve_sources_dir() -> PathBuf {
-    let env_override = std::env::var("EMUACC_SOURCES_DIR").ok();
-    let app_dir = platform_app_data_dir();
-    let config = root_config::load_root_config(&app_dir);
-    root_config::resolve_sources(env_override.as_deref(), &config, &app_dir)
-}
-
-fn resolve_generated_dir() -> PathBuf {
-    let env_override = std::env::var("EMUACC_GENERATED_DIR").ok();
-    let app_dir = platform_app_data_dir();
-    let config = root_config::load_root_config(&app_dir);
-    root_config::resolve_generated(env_override.as_deref(), &config, &app_dir)
-}
+use emuaccounts::root_config::CliVault;
 
 /// Scan `generated_dir` for top-level subdirs that look like account sets —
 /// anything containing at least one `ledger.transactions` file at any depth.
@@ -154,8 +140,9 @@ fn main() {
         i += 1;
     }
 
-    let sources = sources_dir.unwrap_or_else(resolve_sources_dir);
-    let generated = generated_dir.unwrap_or_else(resolve_generated_dir);
+    let vault = CliVault::load();
+    let sources = sources_dir.unwrap_or(vault.sources_dir);
+    let generated = generated_dir.unwrap_or(vault.generated_dir);
 
     let sets = if !explicit_sets.is_empty() {
         explicit_sets
@@ -169,13 +156,12 @@ fn main() {
         formats.as_slice()
     };
 
-    let root_cfg = root_config::load_root_config(&platform_app_data_dir());
     if let Err(e) = report_templates::generate_all_reports(
         &sources,
         &generated,
         &sets,
         formats,
-        &root_cfg.extra_primary_account_prefixes,
+        &vault.config.extra_primary_account_prefixes,
     ) {
         eprintln!("Error: {e}");
         std::process::exit(1);

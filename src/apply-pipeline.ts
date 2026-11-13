@@ -22,19 +22,17 @@ export interface ApplyTarget {
   accountsWithOpening: string[];
   pipelineWarnings: string[];
   reportsBuilding?: boolean;
+  /** After a pipeline response, whose parse carries the account tree: re-read
+   *  the rest — the vault-wide account pool, the header and the window. */
   refreshView?: () => Promise<void>;
-  txWindowStart?: number;
-  searchFilteredTransactions?: Transaction[];
-  searchFilteredCount?: number;
-  searchFilteredOffset?: number;
+  /** The main refresh, after a slim mutation response that carries nothing:
+   *  re-read the account lists (sidebar tree, vault-wide pool, pipeline
+   *  metadata), the header and the window, and schedule the heavy totals. */
+  refreshLedger?: () => Promise<void>;
   /** Set of txn ids that appeared in this pipeline rebuild but were NOT
    *  in the previous parse. The renderer reads this once to add a
    *  fade-in class, then it's cleared. */
   justAddedTxnIds?: Set<string>;
-  /** Lighter-weight refresh used by mutations: only re-fetches the
-   *  visible search window (small, paged), not the prefix query or
-   *  issues cache. Falls back to refreshView if not provided. */
-  refreshSearch?: () => Promise<void>;
 }
 
 function collectTxnIds(transactions: Transaction[] | undefined): Set<string> {
@@ -63,53 +61,48 @@ export function applyParse(state: ApplyTarget, response: ParseResponse): void {
   }
 }
 
-// Any mutation that affects which transactions are visible (pipeline rebuild,
-// hide, manual delete) invalidates every previously-loaded page of the search
-// window. Callers MUST use this after applyParse so refreshView re-fetches
-// from offset 0 and replaces the list rather than appending to stale pages.
-export async function invalidateSearchWindowAndRefresh(state: ApplyTarget): Promise<void> {
-  state.txWindowStart = 0;
-  state.searchFilteredTransactions = undefined;
-  state.searchFilteredCount = undefined;
-  state.searchFilteredOffset = undefined;
-  try { await refreshIssuesCache(); } catch { /* ignore */ }
-  await state.refreshView?.();
+/** The main refresh after a slim mutation: a rule, a label, an import or a
+ *  hide can add, rename or empty an account, so the account lists (sidebar,
+ *  dropdowns) are re-read along with the header and the transaction window.
+ *  The window refreshes IN PLACE — runSearchFilter re-fetches the whole loaded
+ *  span from offset 0 (see `searchWindowFetch`) and swaps the rows only once
+ *  the new ones arrive — so the table never empties, keeps the pages the user
+ *  scrolled to, and morphdom updates just the rows that changed. The issues
+ *  cache is part of the heavy tail the main refresh schedules (a full-vault
+ *  scan when it misses), so it is not refreshed here. */
+export async function refreshAfterRebuild(state: ApplyTarget): Promise<void> {
+  await state.refreshLedger?.();
 }
 
 /** Slim mutation response — backend confirmed the write succeeded but
- *  didn't re-send the full ledger. Used by hide_transaction (and any
- *  future mutation that doesn't need a full refresh) to avoid the
- *  multi-second main-thread JSON deserialize stall on large vaults.
- *  state.parse is left as-is; the visible search window is refreshed
- *  via the paged query API. */
+ *  didn't re-send the full ledger, avoiding the multi-second main-thread
+ *  JSON deserialize stall on large vaults. Everything the change can alter is
+ *  re-read from disk instead, by the main refresh. */
 export interface MutationResponse {
   ok: boolean;
   warnings: string[];
   output_files_written: number;
 }
 
+/** Record a slim mutation's outcome (warnings) without refreshing — the
+ *  optimistic flow refreshes through settleOptimisticEdit. A mutation never
+ *  rebuilds the report files: the Reports view computes a report live when
+ *  its cached file is stale. */
+export function noteMutationResponse(state: ApplyTarget, response: MutationResponse): void {
+  state.pipelineWarnings = response.warnings ?? [];
+}
+
 export async function applyMutationResponse(
   state: ApplyTarget,
   response: MutationResponse,
 ): Promise<void> {
-  state.pipelineWarnings = response.warnings ?? [];
-  if (response.output_files_written > 0) {
-    state.reportsBuilding = true;
-  }
-  // Reset paged scroll so the next refresh re-fetches from offset 0.
-  state.txWindowStart = 0;
-  state.searchFilteredTransactions = undefined;
-  state.searchFilteredCount = undefined;
-  state.searchFilteredOffset = undefined;
-  // Refresh the visible window and the account header balance. The prefix
-  // (balance) query is now balances-only and cheap, so this no longer ships the
-  // full transaction list. The issues cache is refreshed in the background.
-  await (state.refreshView ?? state.refreshSearch)?.();
-  // Background, fire-and-forget refresh of the issues cache.
-  void refreshIssuesCache().catch(() => { /* ignore */ });
+  noteMutationResponse(state, response);
+  await refreshAfterRebuild(state);
 }
 
-export async function applyPipelineResponse(state: ApplyTarget, response: PipelineResponse): Promise<void> {
+/** Record a full pipeline response (parse, account maps, warnings) without
+ *  refreshing the window — see `noteMutationResponse`. */
+export function notePipelineResponse(state: ApplyTarget, response: PipelineResponse): void {
   // Snapshot the prev set BEFORE applyParse mutates state.parse so we can
   // diff against the new transactions and surface a fade-in for the rows
   // that genuinely arrived in this rebuild.
@@ -134,8 +127,12 @@ export async function applyPipelineResponse(state: ApplyTarget, response: Pipeli
   if (response.result.account_properties) {
     state.accountPropertiesMap = response.result.account_properties;
   }
-  if (response.result.output_files_written > 0) {
-    state.reportsBuilding = true;
-  }
-  await invalidateSearchWindowAndRefresh(state);
+}
+
+export async function applyPipelineResponse(state: ApplyTarget, response: PipelineResponse): Promise<void> {
+  notePipelineResponse(state, response);
+  // A full rebuild can change which issues exist; refresh them before the
+  // window so the render that follows shows both.
+  try { await refreshIssuesCache(); } catch { /* ignore */ }
+  await state.refreshView?.();
 }

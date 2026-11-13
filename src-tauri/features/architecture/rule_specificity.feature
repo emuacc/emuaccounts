@@ -29,6 +29,9 @@ Feature: Rule matching prioritizes specificity over folder depth
   specificity, copy the rule into the leaf folder with at least
   matching specificity.
 
+  Background:
+    Given a clean sources directory
+
   Scenario: Payee rule beats earlier narration rule in same file
     Given a narration rule "narr" with pattern "coffee" routes to "expenses:food"
     And a payee-conditioned rule "pay" with payee "Starbucks" routes to "expenses:coffee"
@@ -47,8 +50,18 @@ Feature: Rule matching prioritizes specificity over folder depth
     When a transaction with payee "Starbucks" is matched in "alex/wallet"
     Then it routes to "expenses:leaf"
 
+  # A CSV row's chain comes from resolve_transform. An OFX row's comes from
+  # gather_rules_chain, which manual transactions share, so its order needs its
+  # own scenario.
+  Scenario: Leaf payee rule beats root payee rule for an OFX row
+    Given a payee rule with payee "Starbucks" routes to "expenses:root" in root
+    And a payee rule with payee "Starbucks" routes to "expenses:leaf" in "alex/wallet"
+    When an OFX row with memo "Starbucks" is matched in "alex/wallet"
+    Then it routes to "expenses:leaf"
+
+  # Every CSV row carries a generated id, txn:csv-<hash>.
   Scenario: Meta rule beats payee rule across folders
     Given a payee-conditioned rule with payee "Foo" routes to "expenses:foo" in "alex/wallet"
     And a meta rule with pattern "txn:csv-*" routes to "equity:trading:sell" in root
-    When a transaction with payee "Foo" and meta "txn:csv-001" is matched in "alex/wallet"
+    When a transaction with payee "Foo" is matched in "alex/wallet"
     Then it routes to "equity:trading:sell"

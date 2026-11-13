@@ -25,6 +25,13 @@ fn unknown_command_is_rejected() {
 }
 
 #[test]
+fn clearing_accounts_default_to_assets_transfer() {
+    let (_tmp, ctx) = empty_ctx();
+    let v = dispatch(&ctx, "get_clearing_accounts", &json!({})).unwrap();
+    assert_eq!(v, json!(["assets:transfer"]));
+}
+
+#[test]
 fn list_account_sets_empty_vault() {
     let (_tmp, ctx) = empty_ctx();
     let v = dispatch(&ctx, "list_account_sets", &json!({})).unwrap();

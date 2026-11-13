@@ -62,3 +62,107 @@ export function morphInPlace(target: Element, html: string): void {
     },
   });
 }
+
+/** Highlight colours for `playRowFlashes`: a row the rebuild changed fades
+ *  from a soft blue; a row whose change did not apply flashes amber. */
+const ROW_FLASH = {
+  changed: { color: "59, 130, 246", alpha: 0.18, ms: 900 },
+  reverted: { color: "245, 158, 11", alpha: 0.4, ms: 1800 },
+} as const;
+
+/** Fade the transaction rows keyed (`data-expand-key`) in `flashes`. Web
+ *  Animations rather than a CSS class: the animation lives outside the
+ *  markup, so a render that lands mid-fade (morphdom reconciling the row's
+ *  class attribute) cannot cut it short. An inset box-shadow overlays the
+ *  cell's own background (uncategorised rows are tinted) and ends fully
+ *  transparent, so nothing jumps when the animation finishes. */
+export function playRowFlashes(
+  root: ParentNode,
+  flashes: { changed: Set<string>; reverted: Set<string> } | undefined,
+): void {
+  if (!flashes || (flashes.changed.size === 0 && flashes.reverted.size === 0)) return;
+  if (globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+  // Rows outside the rendered window, or inside a collapsed group, are skipped.
+  const rows = new Map<string, Element>();
+  for (const row of Array.from(root.querySelectorAll("tr[data-expand-key]"))) {
+    rows.set(row.getAttribute("data-expand-key") ?? "", row);
+  }
+  for (const kind of ["changed", "reverted"] as const) {
+    const { color, alpha, ms } = ROW_FLASH[kind];
+    for (const key of flashes[kind]) {
+      const row = rows.get(key);
+      if (!row) continue;
+      for (const cell of Array.from(row.children)) {
+        if (typeof (cell as HTMLElement).animate !== "function") continue;
+        (cell as HTMLElement).animate(
+          [
+            { boxShadow: `inset 0 0 0 9999px rgba(${color}, ${alpha})` },
+            { boxShadow: `inset 0 0 0 9999px rgba(${color}, 0)` },
+          ],
+          { duration: ms, easing: "ease-out" },
+        );
+      }
+    }
+  }
+}
+
+type InputField = HTMLInputElement | HTMLTextAreaElement;
+
+function isInputField(el: Element | null): el is InputField {
+  return el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement;
+}
+
+/** Run `update` (a render) without taking the caret from the user.
+ *
+ *  The focused field and its selection are read immediately before the
+ *  update, never earlier: keys typed and caret moves made while a debounce
+ *  or a backend query was pending belong to the user, and restoring a caret
+ *  captured back then puts the next keys into the middle of the word
+ *  (TASK-150). morphInPlace leaves a focused field alone, so normally there
+ *  is nothing to restore. Only when the update replaced or moved the field,
+ *  dropping the focus, does the field now carrying its id get the focus and
+ *  the selection back; a focus the update moved on purpose is kept. */
+export function preserveFocus(update: () => void): void {
+  const field = document.activeElement;
+  if (!isInputField(field) || !field.id) {
+    update();
+    return;
+  }
+  const { id, selectionStart, selectionEnd, selectionDirection } = field;
+  update();
+  const active = document.activeElement;
+  if (active && active !== document.body) return;
+  const next = document.getElementById(id);
+  if (!isInputField(next)) return;
+  next.focus();
+  if (selectionStart === null || selectionEnd === null) return;
+  const length = next.value.length;
+  next.setSelectionRange(
+    Math.min(selectionStart, length),
+    Math.min(selectionEnd, length),
+    selectionDirection ?? undefined,
+  );
+}
+
+/** A debounced "load, then render" for a field that every render
+ *  re-attaches, such as a search bar. Each call replaces the pending one;
+ *  `delayMs` after the last call, `load` runs (a backend query) and then
+ *  `render`, inside preserveFocus.
+ *
+ *  Create one per field at module scope, not in the render closure: the
+ *  pending timer has to outlive the render that scheduled it, or the next
+ *  render (a landing search's own) orphans it and it still fires, a second
+ *  query mid-typing. */
+export function debouncedRender(
+  delayMs: number,
+): (load: () => Promise<void> | void, render: () => void) => void {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return (load, render) => {
+    if (timer !== undefined) clearTimeout(timer);
+    timer = setTimeout(async () => {
+      timer = undefined;
+      await load();
+      preserveFocus(render);
+    }, delayMs);
+  };
+}

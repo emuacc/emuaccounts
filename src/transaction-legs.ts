@@ -71,6 +71,24 @@ export function valuationLegs(t: Transaction, account: string | undefined): Post
   return sameSide.length === legs.length ? legs : sameSide;
 }
 
+/** The sub-account a row labels under its category: the posting's account
+ *  relative to the selected `account`, or "" for the account itself and for a
+ *  posting outside it (the fallback leg {@link displayLegs} shows). */
+export function subAccountLabel(postingAccount: string, account: string | undefined): string {
+  if (!account || postingAccount === account || !matchesPrefix(postingAccount, account)) return "";
+  return postingAccount.slice(account.length + 1);
+}
+
+/**
+ * A leg's `amount` signed as a flow for the viewed `account`: positive in,
+ * negative out. That is the leg's own sign everywhere but under `income`, which
+ * is credit-normal — income earned is booked as a credit (negative) and a loss,
+ * such as an FX loss on `income:forex`, as a debit — so there the sign flips.
+ */
+export function flowAmount(amount: number, account: string | undefined): number {
+  return account !== undefined && matchesPrefix(account, "income") ? -amount : amount;
+}
+
 /** Fee accounts a row surfaces on the `fee …` line under its amount: the
  *  exchange trading fee and the broker commission. */
 const FEE_ACCOUNTS: ReadonlySet<string> = new Set(["expenses:fees:trading", "expenses:fees:brokerage"]);

@@ -2,6 +2,9 @@
 
 pub const FALLBACK_ASSET_ACCOUNT: &str = "assets:unknown";
 pub const FALLBACK_EXPENSE_ACCOUNT: &str = "expenses:unknown";
+/// The contra an auto-detected self-transfer is booked to, and so the vault's
+/// clearing account when none are declared (`display_config::vault_clearing_accounts`).
+pub const SELF_TRANSFER_ACCOUNT: &str = "assets:transfer";
 
 /// Validate and normalize a date string to YYYY-MM-DD.
 /// Accepts YYYY-MM-DD (with optional trailing content) or YYYYMMDD formats.
@@ -43,6 +46,7 @@ pub fn to_sorted_json_pretty(value: &impl serde::Serialize) -> Result<String, se
 }
 
 pub mod ai_client;
+pub mod appimage_integration;
 pub mod ai_import;
 pub mod ai_suggest;
 pub mod build_cache;

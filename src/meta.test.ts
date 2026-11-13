@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  accountSubtreeTerm,
   extractRuleId,
   legIdFromMeta,
   matchesPrefix,
@@ -21,6 +22,21 @@ describe("matchesPrefix", () => {
   });
   it("does not match unrelated accounts", () => {
     expect(matchesPrefix("expenses:food", "assets:cash")).toBe(false);
+  });
+});
+
+describe("accountSubtreeTerm", () => {
+  // The term reaches the Rust query engine, which compiles `account:` patterns
+  // as `(?i)<pattern>`; category_account_scope.feature runs these exact terms.
+  it("anchors the account at a segment boundary, case-sensitively", () => {
+    expect(accountSubtreeTerm("income")).toBe("account:(?-i)^income(:|$)");
+    expect(accountSubtreeTerm("income:interest")).toBe("account:(?-i)^income:interest(:|$)");
+  });
+
+  it("escapes regex metacharacters in the account name", () => {
+    expect(accountSubtreeTerm("assets:crypto:eth.wallet(1)")).toBe(
+      String.raw`account:(?-i)^assets:crypto:eth\.wallet\(1\)(:|$)`,
+    );
   });
 });
 

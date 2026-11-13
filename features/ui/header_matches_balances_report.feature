@@ -8,7 +8,7 @@ Feature: Accounts header equals the Balances report
 
   Scenario: The root folder header total equals the Balances report total
     Given the app is running
-    When I parse the transactions file "sample-data/example.transactions"
+    When I parse the transactions file "src-tauri/features/fixtures/example.transactions"
     And I open the root folder view
     And I note the folder header total
     And I open the Balances report

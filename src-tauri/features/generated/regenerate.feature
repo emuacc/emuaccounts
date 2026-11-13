@@ -45,6 +45,26 @@ Feature: Pipeline regeneration and file-change detection
     And I regenerate the pipeline
     Then the per-folder ledger for "bank" should include payee "CSV Entry"
 
+  # The early exit decides from the cache manifest alone: it trusts an output
+  # file whose size and mtime are what the pipeline recorded, and re-hashes
+  # one that moved. A rewrite with the same bytes (a touch, a checkout of the
+  # same content) keeps the early exit; a clobber defeats it, so the full
+  # pipeline restores the file.
+  Scenario: A generated ledger rewritten with its own content keeps the early exit
+    Given a clean sources directory with a CSV and transform
+    When I run the pipeline
+    And the per-folder ledger for "bank" is rewritten with its own content
+    And I run the pipeline again
+    Then the pipeline should have early-exited
+
+  Scenario: An externally clobbered generated ledger defeats the early exit
+    Given a clean sources directory with a CSV and transform
+    When I run the pipeline
+    And the per-folder ledger for "bank" is externally clobbered
+    And I run the pipeline again
+    Then the pipeline should have early-exited is false
+    And the per-folder ledger for "bank" should include payee "CSV Entry"
+
   # When a folder has BOTH a CSV and a manual.transactions, an incremental
   # regenerate must NOT silently drop the CSV-derived transactions. A previous
   # bug truncated the on-disk ledger to "manual entries only" because:

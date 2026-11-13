@@ -19,9 +19,17 @@ const tauriWdPath = path.resolve(os.homedir(), ".cargo", "bin", "tauri-wd");
 const mcpTargetDir = path.join(os.homedir(), ".cache", "emuacc-target-mcp");
 
 let driverServer; // spawned tauri-driver (Linux/Windows) or tauri-wd (macOS)
+let virtualDisplay; // spawned Xvfb (Linux, when installed)
+let displayName; // its name, e.g. ":99"
 let driver;
 let generatedDir;
 let sourcesDir;
+
+// A failed BeforeAll exits without running AfterAll; don't leave these behind.
+process.once("exit", () => {
+  if (driverServer) driverServer.kill();
+  if (virtualDisplay) virtualDisplay.kill();
+});
 
 // WebDriver backend that drives the suite:
 //   - "tauri-driver": Tauri's WebDriver intermediary (Linux/Windows), DOM-level.
@@ -128,15 +136,50 @@ function buildApp(backend) {
     return;
   }
 
-  spawnSync("npx", ["tauri", "build", "--debug", "--bundles", "none"], {
+  const app = spawnSync("npx", ["tauri", "build", "--debug", "--no-bundle"], {
     cwd: repoRoot,
     stdio: "inherit",
     shell: true,
     env: { ...process.env, VITE_E2E: "1" },
   });
+  // Stop here: carrying on would test whatever binary a previous build left.
+  if (app.status !== 0) throw new Error("App build failed (tauri build --debug --no-bundle).");
 }
 
-function startDriverServer(backend) {
+function freeDisplayNumber() {
+  let number = 99;
+  while (fs.existsSync(`/tmp/.X${number}-lock`) || fs.existsSync(`/tmp/.X11-unix/X${number}`)) number += 1;
+  return number;
+}
+
+// Linux runs the app on a virtual display where Xvfb is installed, so its window
+// never shows on the desktop or takes focus. -displayfd reports when the display
+// is ready. Always name the display: left to choose, Xvfb skips the lock check and
+// takes the first number it can bind, even :0, replacing a Wayland desktop's
+// Xwayland socket and deleting it on exit. -noreset because the app relaunches for
+// every scenario: by default the server resets as its last client leaves, and a
+// launch landing in that moment can't open the display.
+function startVirtualDisplay() {
+  return new Promise((resolve, reject) => {
+    const xvfb = spawn("Xvfb", [`:${freeDisplayNumber()}`, "-displayfd", "3", "-screen", "0", "1920x1080x24", "-noreset"], {
+      stdio: ["ignore", "ignore", "ignore", "pipe"],
+    });
+    xvfb.once("error", () => {
+      console.warn(
+        "Xvfb is not installed, so the app's window opens on your desktop and takes focus. " +
+          "To keep it off screen, install it (Arch: xorg-server-xvfb, Debian and Ubuntu: xvfb).",
+      );
+      resolve(undefined);
+    });
+    xvfb.once("exit", (code) => reject(new Error(`Xvfb exited (${code}) before its display was ready.`)));
+    xvfb.stdio[3].once("data", (data) => {
+      virtualDisplay = xvfb;
+      resolve(`:${String(data).trim()}`);
+    });
+  });
+}
+
+function startDriverServer(backend, display) {
   if (backend === "tauri-wd") {
     if (!fs.existsSync(tauriWdPath)) {
       throw new Error(
@@ -163,9 +206,19 @@ function startDriverServer(backend) {
         `tauri-driver is not installed at ${tauriDriverPath}. Install with: cargo install tauri-driver --locked`,
       );
     }
+    // X11 at scale 1 whatever the session uses: under a fractional Wayland scale
+    // WebKitGTK reports a devicePixelRatio like 1.18 and a WebDriver click lands
+    // at the target's coordinates divided by it, on some other element.
     driverServer = spawn(tauriDriverPath, [], {
       stdio: [null, process.stdout, process.stderr],
-      env: { ...process.env, EMUACC_GENERATED_DIR: generatedDir, EMUACC_SOURCES_DIR: sourcesDir },
+      env: {
+        ...process.env,
+        EMUACC_GENERATED_DIR: generatedDir,
+        EMUACC_SOURCES_DIR: sourcesDir,
+        GDK_BACKEND: "x11",
+        GDK_SCALE: "1",
+        ...(display && { DISPLAY: display, WAYLAND_DISPLAY: undefined }),
+      },
     });
   }
 }
@@ -188,30 +241,80 @@ async function selectWebviewWindow(timeoutMs) {
   await driver.switchTo().window(handles[0]);
 }
 
-async function startWebdriverSession() {
+async function startDriver() {
   const backend = selectedBackend();
 
   buildApp(backend);
 
   generatedDir = mkTempDir("emuaccounts-e2e-generated");
   sourcesDir = mkTempDir("emuaccounts-e2e-sources");
+  displayName = backend === "tauri-driver" && process.platform === "linux" ? await startVirtualDisplay() : undefined;
+  startDriverServer(backend, displayName);
+  await waitForPort("127.0.0.1", 4444, 30_000);
+}
+
+async function restartDriverServer(backend) {
+  if (driverServer.exitCode === null) {
+    const exited = new Promise((resolve) => driverServer.once("exit", resolve));
+    driverServer.kill();
+    await exited;
+  }
+  startDriverServer(backend, displayName);
+  await waitForPort("127.0.0.1", 4444, 30_000);
+}
+
+function newSession(capabilities) {
+  return new Builder()
+    .withCapabilities(capabilities)
+    .usingServer("http://127.0.0.1:4444/")
+    .build();
+}
+
+function emptyVault() {
+  for (const dir of [generatedDir, sourcesDir]) {
+    for (const entry of fs.readdirSync(dir)) fs.rmSync(path.join(dir, entry), { recursive: true, force: true });
+  }
   // A vault with no base currency is gated behind the first-run setup screen
   // (base_currency_setup.feature covers that). Every other scenario expects
   // the main page, so seed the vault config the way a set-up vault has it.
   fs.writeFileSync(path.join(generatedDir, "config.json"), JSON.stringify({ base_currency: "AUD" }, null, 2));
-  startDriverServer(backend);
-  await waitForPort("127.0.0.1", 4444, 30_000);
+}
+
+// A fresh app on an empty vault for every scenario, so one scenario's data,
+// selection or leftover modal can't fail the ones after it.
+async function launchApp() {
+  const backend = selectedBackend();
+
+  // Forget the old session first, and don't mind if it's already gone (the app
+  // crashed): one failed launch must not fail every scenario after it.
+  const previous = driver;
+  driver = undefined;
+  await previous?.quit().catch(() => {});
+  emptyVault();
 
   const capabilities = new Capabilities();
   capabilities.set("tauri:options", { application: resolveAppBinaryPath(backend) });
   capabilities.setBrowserName("wry");
 
-  driver = await new Builder()
-    .withCapabilities(capabilities)
-    .usingServer("http://127.0.0.1:4444/")
-    .build();
+  try {
+    driver = await newSession(capabilities);
+  } catch (err) {
+    // The native WebDriver can die with a session, and every launch after it would
+    // then fail. Start the server over once; a second failure is the scenario's.
+    console.warn(`App launch failed, restarting the WebDriver server: ${err.message}`);
+    await restartDriverServer(backend);
+    driver = await newSession(capabilities);
+  }
 
   if (backend === "tauri-wd") await selectWebviewWindow(20_000);
+
+  if (virtualDisplay) {
+    // Xvfb has no window manager to give the window focus, and an unfocused page
+    // fires no focus or blur events, which the account dropdown and inline editors
+    // rely on. Setting the window's rect focuses it, and the size fits every column.
+    await driver.manage().window().setRect({ x: 0, y: 0, width: 1600, height: 1000 });
+    await driver.wait(() => driver.executeScript("return document.hasFocus()"), 5_000, "app window never got focus on Xvfb");
+  }
 
   await driver.wait(until.elementLocated(By.css('[data-testid="app-ready"]')), 30_000);
 }
@@ -221,6 +324,7 @@ async function stopWebdriverSession() {
     if (driver) await driver.quit();
   } finally {
     if (driverServer) driverServer.kill();
+    if (virtualDisplay) virtualDisplay.kill();
     if (generatedDir) {
       try {
         fs.rmSync(generatedDir, { recursive: true, force: true });
@@ -236,7 +340,7 @@ async function stopWebdriverSession() {
 
 BeforeAll(async () => {
   if (selectedBackend() === "appium-mac2") return; // appium_macos.steps.js owns that path
-  await startWebdriverSession();
+  await startDriver();
 });
 
 AfterAll(async () => {
@@ -247,8 +351,9 @@ AfterAll(async () => {
 // Bridge the driver onto the cucumber World so step files can use `this.driver`
 // (the convention in categories/edit_rule/hide_transaction/…) alongside the
 // module-level `driver` used by this file's own steps.
-Before(function () {
+Before(async function () {
   if (selectedBackend() !== "appium-mac2") {
+    await launchApp();
     this.driver = driver;
     this.generatedDir = generatedDir;
     this.sourcesDir = sourcesDir;
@@ -297,30 +402,34 @@ When('I stage the transactions file {string} in the source folder {string}', asy
   await stageFixtureAndRebuild(fixturePath, folder, account, commodity);
 });
 
+When('I stage the account declarations {string}', async (relativePath) => {
+  const fixturePath = path.resolve(repoRoot, relativePath);
+  assert.ok(fs.existsSync(fixturePath), `fixture file missing: ${fixturePath}`);
+  const declared = /^account\s+assets:(\S+)/m.exec(fs.readFileSync(fixturePath, "utf8"));
+  assert.ok(declared, `fixture declares no assets account: ${fixturePath}`);
+  const folder = path.join(sourcesDir, "e2e", ...declared[1].split(":"));
+  fs.mkdirSync(folder, { recursive: true });
+  fs.copyFileSync(fixturePath, path.join(folder, "accounts.transactions"));
+  await rebuildVault();
+});
+
 /** Stage `fixturePath` as `<folder>/manual.transactions` (plus the account's
- *  declaration) in the harness vault, rebuild through the in-app e2e hook,
- *  then re-run vault startup so the "e2e" set is discovered and selected. */
+ *  declaration) in the harness vault and rebuild. */
 async function stageFixtureAndRebuild(fixturePath, folder, account, commodity) {
-  // A previous scenario may have ended inside the rule/party editor view
-  // (which replaces the main pane — no status line, no txn table) or with a
-  // modal open (whose overlay intercepts clicks). Dismiss modals and
-  // navigate back to the accounts view first; both are no-ops when clean.
-  await driver.executeScript(
-    `document.querySelectorAll('.modalOverlay').forEach((o) => o.click());
-     document.querySelector('.sidebarNav__item[data-view="accounts"]')?.click();`,
-  );
+  fs.mkdirSync(folder, { recursive: true });
+  fs.copyFileSync(fixturePath, path.join(folder, "manual.transactions"));
+  fs.writeFileSync(path.join(folder, "accounts.transactions"), `account ${account} ${commodity}\n`);
+  await rebuildVault();
+}
+
+/** Rebuild through the in-app e2e hook, then re-run vault startup so the "e2e"
+ *  set is discovered and selected. */
+async function rebuildVault() {
   await driver.wait(until.elementLocated(By.css('[data-testid="parse-status"]')), 10_000);
 
   // The in-app e2e hook rebuilds the pipeline over the harness vault — it no
   // longer parses a typed path (that flow died when #e2e-parse-run switched
   // to rebuildPipeline).
-  fs.mkdirSync(folder, { recursive: true });
-  fs.copyFileSync(fixturePath, path.join(folder, "manual.transactions"));
-  const accountsPath = path.join(folder, "accounts.transactions");
-  const declaration = `account ${account} ${commodity}\n`;
-  const existing = fs.existsSync(accountsPath) ? fs.readFileSync(accountsPath, "utf8") : "";
-  if (!existing.includes(declaration)) fs.appendFileSync(accountsPath, declaration);
-
   const run = await driver.findElement(By.css("#e2e-parse-run"));
   await run.click();
 
@@ -339,22 +448,33 @@ async function stageFixtureAndRebuild(fixturePath, folder, account, commodity) {
   const restart = await driver.findElement(By.css("#e2e-restart-vault"));
   await restart.click();
   await driver.wait(until.elementLocated(By.css('[data-testid="app-ready"]')), 30_000);
+  // app-ready is already there while startup runs, and a click landing in that
+  // time can be undone by its renders, so the next step waits for it to finish.
+  await driver.wait(
+    () => driver.executeScript("return window.__diag().vaultReopensInFlight === 0"),
+    30_000,
+    "vault reopen never finished",
+  );
+}
 
-  // Stale scenarios (add_account) can create and switch to other account
-  // sets; every staged fixture lives in the "e2e" set — switch back when a
-  // set picker is present and pointing elsewhere.
-  await driver.executeScript(
-    `const sel = document.querySelector('#accountSetSelect');
-     if (sel && sel.value !== 'e2e' && Array.from(sel.options).some((o) => o.value === 'e2e')) {
-       sel.value = 'e2e';
-       sel.dispatchEvent(new Event('change', { bubbles: true }));
-     }`,
+/** The sidebar's rows and the status line, for a failure message. */
+function sidebarDump() {
+  return driver.executeScript(
+    `return JSON.stringify({
+       drill: Array.from(document.querySelectorAll('[data-testid="drilldown-item"]')).map(e => e.getAttribute('data-group')),
+       items: Array.from(document.querySelectorAll('[data-testid="account-item"]')).map(e => e.getAttribute('data-account')),
+       status: document.querySelector('[data-testid="parse-status"]')?.textContent?.trim(),
+     });`,
   );
 }
 
 Then('the sidebar should include the account {string}', async (account) => {
   const selector = `[data-testid="account-item"][data-account="${account}"]`;
-  await driver.wait(until.elementLocated(By.css(selector)), 10_000);
+  try {
+    await driver.wait(until.elementLocated(By.css(selector)), 10_000);
+  } catch {
+    assert.fail(`account item ${account} never rendered — DOM: ${await sidebarDump()}`);
+  }
 });
 
 // Account groups are the drill-down's group rows (data-group = the group's
@@ -371,10 +491,13 @@ Then('the sidebar should not include the account group {string}', async (group) 
 });
 
 Then('the account {string} should show an amount of {string}', async (account, amount) => {
-  const selector = `[data-testid="account-item"][data-account="${account}"]`;
-  const item = await driver.findElement(By.css(selector));
-  const amt = await item.findElement(By.css(".account__amt"));
-  assert.equal(await amt.getText(), amount);
+  const selector = `[data-testid="account-item"][data-account="${account}"] .account__amt`;
+  // Totals land after the row does, and renders replace it, so re-query and poll.
+  let shown;
+  await driver.wait(async () => {
+    shown = await driver.executeScript(`return document.querySelector(arguments[0])?.textContent.trim();`, selector);
+    return shown === amount;
+  }, 10_000, () => `Expected ${account} to show "${amount}" but got "${shown}"`);
 });
 
 When('I select the account {string}', async (account) => {
@@ -429,16 +552,7 @@ When('I select the account {string}', async (account) => {
     }
     await driver.sleep(150);
   }
-  if (!found) {
-    const dump = await driver.executeScript(
-      `return JSON.stringify({
-         drill: Array.from(document.querySelectorAll('[data-testid="drilldown-item"]')).map(e => e.getAttribute('data-group')),
-         items: Array.from(document.querySelectorAll('[data-testid="account-item"]')).map(e => e.getAttribute('data-account')),
-         status: document.querySelector('[data-testid="parse-status"]')?.textContent?.trim(),
-       });`,
-    );
-    assert.fail(`account item ${account} never rendered after drilling — DOM: ${dump}`);
-  }
+  if (!found) assert.fail(`account item ${account} never rendered after drilling — DOM: ${await sidebarDump()}`);
   const item = await driver.wait(until.elementLocated(By.css(selector)), 5_000);
   await item.click();
 
@@ -458,9 +572,16 @@ When('I select the account {string}', async (account) => {
 });
 
 Then('I should see a transaction row for payee {string}', async (payee) => {
-  const row = await driver.findElement(By.css('[data-testid="txn-row"]'));
-  const cell = await row.findElement(By.css('[data-testid="txn-payee"]'));
-  assert.equal(await cell.getText(), payee);
+  // Rows load after the selection and renders replace them, so re-query and poll.
+  await driver.wait(
+    () => driver.executeScript(
+      `return Array.from(document.querySelectorAll('[data-testid="txn-row"] [data-testid="txn-payee"]'))
+         .some((cell) => cell.textContent.trim() === arguments[0]);`,
+      payee,
+    ),
+    10_000,
+    `no transaction row for payee "${payee}"`,
+  );
 });
 
 Then('I should see a notes value of {string}', async (notes) => {
@@ -469,11 +590,21 @@ Then('I should see a notes value of {string}', async (notes) => {
   assert.equal(await cell.getText(), notes);
 });
 
-Then('that transaction row should show a deposit of {string}', async (amount) => {
+Then('that transaction row should show an amount of {string}', async (amount) => {
   const row = await driver.findElement(By.css('[data-testid="txn-row"]'));
-  const deposit = await row.findElement(By.css('[data-testid="txn-deposit"]'));
-  assert.equal(await deposit.getText(), amount);
+  const shown = await row.findElement(By.css('[data-testid="txn-amount"]')).getText();
+  assert.ok(shown.includes(amount), `Expected the amount cell to show "${amount}" but got "${shown}"`);
 });
+
+/** sendKeys returns before the keys have all landed, so a click straight after it
+ *  can submit a half-typed value ("assets:bank:savings" saved as "assets:ban"). */
+function waitForValue(selector, value) {
+  return driver.wait(
+    () => driver.executeScript(`return document.querySelector(arguments[0])?.value === arguments[1];`, selector, value),
+    5_000,
+    `${selector} never held "${value}"`,
+  );
+}
 
 When('I add a manual transaction with payee {string} and notes {string}', async (payee, notes) => {
   const addNew = await driver.findElement(By.css("#addNew"));
@@ -496,11 +627,16 @@ When('I add a manual transaction with payee {string} and notes {string}', async 
   const contra = await driver.findElement(By.css("#manualContraAccount-0"));
   await contra.clear();
   await contra.sendKeys("expenses:coffee");
+  await waitForValue("#manualContraAccount-0", "expenses:coffee");
 
   const save = await driver.findElement(By.css("#manualSave"));
   await save.click();
 
-  await driver.wait(until.elementTextContains(driver.findElement(By.css('[data-testid="parse-status"]')), "added manual"), 30_000);
+  await driver.wait(
+    async () => (await driver.findElements(By.css('[data-testid="manual-txn-modal"]'))).length === 0,
+    30_000,
+    "manual transaction modal never closed",
+  );
 });
 
 When('I click the "Add New" button', async () => {
@@ -526,18 +662,12 @@ When('I enter account name {string}', async (accountName) => {
   const input = await driver.findElement(By.css('#newAccountName'));
   await input.clear();
   await input.sendKeys(accountName);
+  await waitForValue("#newAccountName", accountName);
 });
 
-Then('the entity select should show the current account set', async () => {
-  const current = await driver.executeScript(
-    `return { entity: document.querySelector('#newAccountEntity')?.value,
-              set: localStorage.getItem('emuacc_selectedAccountSet') };`,
-  );
-  assert.ok(current.entity, 'entity select should be present');
-  if (current.set) {
-    assert.strictEqual(current.entity, current.set,
-      `entity select should default to ${current.set}, got ${current.entity}`);
-  }
+Then('the entity select should show the account set {string}', async (accountSet) => {
+  const entity = await driver.executeScript(`return document.querySelector('#newAccountEntity')?.value;`);
+  assert.strictEqual(entity, accountSet);
 });
 
 When('I choose to create entity {string}', async (entityName) => {
@@ -550,6 +680,7 @@ When('I choose to create entity {string}', async (entityName) => {
   const input = await driver.findElement(By.css('#newAccountEntityName'));
   await input.clear();
   await input.sendKeys(entityName);
+  await waitForValue("#newAccountEntityName", entityName);
 });
 
 When('I select wallet chain {string}', async (chain) => {
@@ -569,6 +700,7 @@ When('I enter wallet address {string}', async (address) => {
   const input = await driver.findElement(By.css('#newWalletAddress'));
   await input.clear();
   await input.sendKeys(address);
+  await waitForValue("#newWalletAddress", address);
 });
 
 When('I select account type {string}', async (accountType) => {
@@ -595,18 +727,10 @@ When('I submit the new account form', async () => {
   }, 10_000);
 });
 
-// An empty vault: nothing under sources/, so there is no account set to pick
-// from. The base currency stays set, so the main page renders. Re-runs vault
-// startup through the e2e hook (never location.reload(): it poisons the
-// webdriver plugin's lock).
-Given('the vault has no account sets', async () => {
-  for (const entry of fs.readdirSync(sourcesDir)) {
-    fs.rmSync(path.join(sourcesDir, entry), { recursive: true, force: true });
-  }
-  await driver.executeScript(`document.querySelectorAll('.modalOverlay').forEach((o) => o.click());`);
-  const restart = await driver.findElement(By.css("#e2e-restart-vault"));
-  await restart.click();
-  await driver.wait(until.elementLocated(By.css('[data-testid="app-ready"]')), 30_000);
+// Every scenario starts here: nothing under sources/, so there is no account set
+// to pick from. The base currency is set, so the main page renders.
+Given('the vault has no account sets', () => {
+  assert.deepEqual(fs.readdirSync(sourcesDir), []);
 });
 
 // Regression: with no account sets the entity select holds only "New entity…"

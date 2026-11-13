@@ -42,6 +42,31 @@ pub struct FolderCacheFile {
 
 // --- Lightweight global manifest (always loaded) ---
 
+/// What `fs::metadata` said about an output file right after the pipeline
+/// wrote it. A file whose size and mtime still match is taken as unchanged
+/// without being read; one that moved is re-hashed against `output_hashes`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputStat {
+    pub size: u64,
+    /// Modification time in nanoseconds since the Unix epoch.
+    pub mtime_ns: u64,
+}
+
+/// The size and mtime of `path`, or None when it cannot be read.
+pub fn file_stat(path: &Path) -> Option<OutputStat> {
+    let meta = fs::metadata(path).ok()?;
+    let mtime_ns = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as u64;
+    Some(OutputStat {
+        size: meta.len(),
+        mtime_ns,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CacheManifest {
     pub inputs_hash: Option<String>,
@@ -51,6 +76,10 @@ pub struct CacheManifest {
     /// Layer 4: SHA256 of each generated output file
     #[serde(default)]
     pub output_hashes: HashMap<String, String>,
+    /// Size and mtime of each output file as the pipeline last wrote it, so
+    /// the early exit can trust an unchanged file without re-hashing it.
+    #[serde(default)]
+    pub output_stats: HashMap<String, OutputStat>,
     /// Root-level _ignored.txt
     #[serde(default)]
     pub ignored_hash: Option<String>,
@@ -137,6 +166,75 @@ pub fn load_cache_filtered(
         return serde_json::from_str(&contents).unwrap_or_default();
     }
     BuildCache::default()
+}
+
+/// The manifest alone, without any folder cache: enough to decide the early
+/// exit. None when there is no readable manifest (a first run, or a legacy
+/// build-cache.json a full load still has to migrate).
+pub fn load_manifest(generated_dir: &Path) -> Option<CacheManifest> {
+    let text = fs::read_to_string(manifest_path(generated_dir)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Does every output file in `manifest.output_hashes` still hold what the
+/// pipeline last wrote? Without this check an externally modified generated
+/// file (git checkout, manual edit, another tool) would be invisible: the
+/// sources fingerprint matches, the pipeline returns at once and never writes
+/// the corrected file. A file whose size and mtime match `output_stats` is
+/// trusted without being read; one that moved, or has no recorded stat, is
+/// re-hashed; a missing file is a divergence.
+pub fn outputs_intact(generated_dir: &Path, manifest: &CacheManifest) -> bool {
+    manifest.output_hashes.iter().all(|(rel_key, expected)| {
+        let path = generated_dir.join(rel_key);
+        if let (Some(recorded), Some(now)) = (manifest.output_stats.get(rel_key), file_stat(&path))
+        {
+            if recorded == &now {
+                return true;
+            }
+        }
+        match fs::read_to_string(&path) {
+            Ok(text) => &string_hash(&text) == expected,
+            Err(_) => false,
+        }
+    })
+}
+
+/// The size and mtime of each of `rel_keys` under `generated_dir`, for those
+/// that can be read.
+fn output_stats<'a>(
+    generated_dir: &Path,
+    rel_keys: impl Iterator<Item = &'a String>,
+) -> HashMap<String, OutputStat> {
+    rel_keys
+        .filter_map(|rel_key| {
+            file_stat(&generated_dir.join(rel_key)).map(|stat| (rel_key.clone(), stat))
+        })
+        .collect()
+}
+
+fn save_manifest(generated_dir: &Path, manifest: &CacheManifest) -> Result<(), String> {
+    fs::create_dir_all(cache_dir(generated_dir)).map_err(|e| e.to_string())?;
+    let json = crate::to_sorted_json_pretty(manifest).map_err(|e| e.to_string())?;
+    fs::write(manifest_path(generated_dir), json).map_err(|e| e.to_string())
+}
+
+/// Record the size and mtime of every output file whose stat the manifest
+/// lacks and write the manifest back, so a manifest saved before stats
+/// existed takes the fast path from its next run. Nothing is written when
+/// every output already has a stat.
+pub fn complete_output_stats(
+    generated_dir: &Path,
+    manifest: &mut CacheManifest,
+) -> Result<(), String> {
+    if manifest
+        .output_hashes
+        .keys()
+        .all(|rel_key| manifest.output_stats.contains_key(rel_key))
+    {
+        return Ok(());
+    }
+    manifest.output_stats = output_stats(generated_dir, manifest.output_hashes.keys());
+    save_manifest(generated_dir, manifest)
 }
 
 fn load_from_folder_cache(
@@ -248,14 +346,13 @@ pub fn save_cache(
         inputs_hash: cache.inputs_hash.clone(),
         folder_fingerprints: cache.folder_hashes.clone(),
         output_hashes: cache.output_hashes.clone(),
+        output_stats: output_stats(generated_dir, cache.output_hashes.keys()),
         ignored_hash: cache.ignored_hash.clone(),
         ignored_ids: cache.ignored_ids.clone(),
         root_accounts_hash: cache.accounts_hashes.get("").cloned(),
         root_accounts_text: cache.accounts_cached.get("").cloned(),
     };
-
-    let manifest_json = crate::to_sorted_json_pretty(&manifest).map_err(|e| e.to_string())?;
-    fs::write(manifest_path(generated_dir), manifest_json).map_err(|e| e.to_string())?;
+    save_manifest(generated_dir, &manifest)?;
 
     // Determine which folders to write
     let folders_to_write: HashSet<String> = match changed_folders {
@@ -464,4 +561,111 @@ fn fingerprint_where(dir: &Path, include: impl Fn(&Path) -> bool) -> Result<Stri
         hasher.update(size.to_le_bytes());
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    /// A manifest recording `content` at `rel` as the pipeline wrote it.
+    fn manifest_for(generated: &Path, rel: &str, content: &str) -> CacheManifest {
+        let path = generated.join(rel);
+        fs::write(&path, content).unwrap();
+        let mut manifest = CacheManifest::default();
+        manifest
+            .output_hashes
+            .insert(rel.to_string(), string_hash(content));
+        manifest
+            .output_stats
+            .insert(rel.to_string(), file_stat(&path).unwrap());
+        manifest
+    }
+
+    /// Rewrite `path` with `content` and a later mtime, as an external tool
+    /// would, whatever the filesystem's timestamp granularity.
+    fn rewrite_later(path: &Path, content: &str) {
+        fs::write(path, content).unwrap();
+        let later = SystemTime::now() + Duration::from_secs(5);
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+    }
+
+    #[test]
+    fn outputs_intact_trusts_a_file_whose_stats_have_not_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = manifest_for(dir.path(), "ledger.transactions", "2025-01-01 * \"a\"\n");
+        assert!(outputs_intact(dir.path(), &manifest));
+    }
+
+    #[test]
+    fn outputs_intact_rehashes_a_moved_file_and_accepts_the_same_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "2025-01-01 * \"a\"\n";
+        let manifest = manifest_for(dir.path(), "ledger.transactions", content);
+        rewrite_later(&dir.path().join("ledger.transactions"), content);
+        assert!(outputs_intact(dir.path(), &manifest));
+    }
+
+    #[test]
+    fn outputs_intact_detects_a_moved_file_with_other_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = manifest_for(dir.path(), "ledger.transactions", "2025-01-01 * \"a\"\n");
+        // Same length as the original: only the mtime and the bytes differ.
+        rewrite_later(&dir.path().join("ledger.transactions"), "2025-01-01 * \"b\"\n");
+        assert!(!outputs_intact(dir.path(), &manifest));
+    }
+
+    #[test]
+    fn outputs_intact_rehashes_when_no_stat_was_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manifest = manifest_for(dir.path(), "ledger.transactions", "x\n");
+        manifest.output_stats.clear();
+        assert!(outputs_intact(dir.path(), &manifest));
+        fs::write(dir.path().join("ledger.transactions"), "y\n").unwrap();
+        assert!(!outputs_intact(dir.path(), &manifest));
+    }
+
+    #[test]
+    fn outputs_intact_fails_on_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = manifest_for(dir.path(), "ledger.transactions", "x\n");
+        fs::remove_file(dir.path().join("ledger.transactions")).unwrap();
+        assert!(!outputs_intact(dir.path(), &manifest));
+    }
+
+    #[test]
+    fn complete_output_stats_records_missing_stats_and_writes_the_manifest_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manifest = manifest_for(dir.path(), "ledger.transactions", "x\n");
+        manifest.output_stats.clear();
+        complete_output_stats(dir.path(), &mut manifest).unwrap();
+        let expected = file_stat(&dir.path().join("ledger.transactions")).unwrap();
+        assert_eq!(manifest.output_stats.get("ledger.transactions"), Some(&expected));
+        let reloaded = load_manifest(dir.path()).unwrap();
+        assert_eq!(reloaded.output_stats.get("ledger.transactions"), Some(&expected));
+    }
+
+    #[test]
+    fn load_manifest_is_none_without_a_manifest_and_reads_a_saved_one() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_manifest(dir.path()).is_none());
+        fs::write(dir.path().join("out.txt"), "out\n").unwrap();
+        let cache = BuildCache {
+            inputs_hash: Some("fp".to_string()),
+            output_hashes: HashMap::from([("out.txt".to_string(), string_hash("out\n"))]),
+            ..Default::default()
+        };
+        save_cache(dir.path(), &cache, None).unwrap();
+        let manifest = load_manifest(dir.path()).unwrap();
+        assert_eq!(manifest.inputs_hash.as_deref(), Some("fp"));
+        assert_eq!(
+            manifest.output_stats.get("out.txt"),
+            file_stat(&dir.path().join("out.txt")).as_ref()
+        );
+    }
 }

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use emuaccounts::processing_pipeline::{run_pipeline, PipelineConfig};
-use emuaccounts::root_config::{self, platform_app_data_dir};
+use emuaccounts::root_config::CliVault;
 
 fn now_yyyymm() -> String {
     let secs = std::time::SystemTime::now()
@@ -17,20 +17,6 @@ fn now_yyyymm() -> String {
             + ((year - 1970) as i64 / 400));
     let month = (remaining / 30).clamp(0, 11) as u32 + 1;
     format!("{year}{month:02}")
-}
-
-fn resolve_sources_dir() -> PathBuf {
-    let env_override = std::env::var("EMUACC_SOURCES_DIR").ok();
-    let app_dir = platform_app_data_dir();
-    let config = root_config::load_root_config(&app_dir);
-    root_config::resolve_sources(env_override.as_deref(), &config, &app_dir)
-}
-
-fn resolve_generated_dir() -> PathBuf {
-    let env_override = std::env::var("EMUACC_GENERATED_DIR").ok();
-    let app_dir = platform_app_data_dir();
-    let config = root_config::load_root_config(&app_dir);
-    root_config::resolve_generated(env_override.as_deref(), &config, &app_dir)
 }
 
 fn print_usage() {
@@ -98,11 +84,11 @@ fn main() {
         i += 1;
     }
 
-    let app_data_dir = platform_app_data_dir();
-    let root_cfg = root_config::load_root_config(&app_data_dir);
+    let vault = CliVault::load();
+    let root_cfg = vault.config;
     let config = PipelineConfig {
-        sources_dir: sources_dir.unwrap_or_else(resolve_sources_dir),
-        generated_dir: generated_dir.unwrap_or_else(resolve_generated_dir),
+        sources_dir: sources_dir.unwrap_or(vault.sources_dir),
+        generated_dir: generated_dir.unwrap_or(vault.generated_dir),
         now_yyyymm: now.unwrap_or_else(now_yyyymm),
         force: false,
         default_expense_account: root_cfg.default_expense_account.clone(),

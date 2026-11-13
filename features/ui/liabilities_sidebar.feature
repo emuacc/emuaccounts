@@ -5,8 +5,9 @@ Feature: Liabilities source folders appear in the Accounts sidebar
   pipeline posts its rows there, and the Accounts sidebar lists it in a
   "liabilities" group beside the asset folders with the same drill-down, back
   navigation and header. An entity without a liabilities folder sees only its
-  asset folders (sidebar_assets_only.feature), and a liabilities account that
-  only rules reference stays in the Categories pane.
+  asset folders (sidebar_assets_only.feature). A liabilities account that only
+  rules reference has no folder: it is a holding, so the Categories pane never
+  lists it, and the Accounts pane lists it only while Show all holdings is on.
 
   Background:
     Given the app is running
@@ -26,7 +27,7 @@ Feature: Liabilities source folders appear in the Accounts sidebar
     When I go back one sidebar level
     Then the sidebar should include the account group "liabilities:credit-card"
 
-  Scenario: A folder-backed liabilities account leaves the Categories pane
+  Scenario: The Categories pane lists no liabilities
     When I open the Categories roots
     Then the sidebar should include the account group "expenses"
     And the sidebar should not include the account group "liabilities"

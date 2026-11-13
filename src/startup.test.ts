@@ -19,6 +19,7 @@ const MOCK_PIPELINE_METADATA = {
 const MOCK_RESPONSES: Record<string, unknown> = {
   list_account_sets: ["alex"],
   get_display_config: { commodities: {}, default_decimals: 2, base_currency: "AUD" },
+  get_clearing_accounts: ["assets:transfer"],
   load_account_tree: MOCK_BALANCES,
   load_pipeline_metadata: MOCK_PIPELINE_METADATA,
   get_pipeline_warnings: [],
@@ -127,6 +128,7 @@ describe("normalStartup invoke rounds", () => {
 
     expect(r2.sort()).toEqual([
       "get_account_gaps",
+      "get_clearing_accounts",
       "get_display_config",
       "get_trade_links",
       "load_account_tree",
@@ -180,6 +182,16 @@ describe("normalStartup invoke rounds", () => {
     expect(allCmds).toContain("get_pipeline_warnings");
     expect(allCmds).toContain("get_trade_links");
     expect(allCmds).toContain("get_source_folder_path");
+  });
+
+  it("loads the vault's clearing accounts before the sidebar first renders", async () => {
+    const { state, deps, flush } = createHarness({ get_clearing_accounts: ["assets:transfer", "assets:crypto:bridge"] });
+    const done = normalStartup(state, deps);
+
+    while ((await flush()).length > 0) { /* drain */ }
+    await done;
+
+    expect(state.clearingAccounts).toEqual(["assets:transfer", "assets:crypto:bridge"]);
   });
 
   it("never invokes the multi-device sync commands (only the sync build's src/sync.ts does)", async () => {
