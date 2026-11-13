@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use emuaccounts::processing_pipeline::{process_all_imports, process_imports, PipelineConfig};
-use emuaccounts::FALLBACK_EXPENSE_ACCOUNT;
+use emuaccounts::root_config::CliVault;
 
 fn now_yyyymm() -> String {
     let now = chrono_free_now();
@@ -27,75 +27,13 @@ fn chrono_free_now() -> (i32, u32) {
     (year, month)
 }
 
-fn resolve_sources_dir() -> PathBuf {
-    if let Ok(custom) = std::env::var("EMUACC_SOURCES_DIR") {
-        return PathBuf::from(custom);
-    }
-
-    // Platform default (matches Tauri app data dir convention)
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home)
-                .join("Library/Application Support/com.emuacc.app/sources");
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(data) = std::env::var("XDG_DATA_HOME").ok().or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| format!("{h}/.local/share"))
-        }) {
-            return PathBuf::from(data).join("com.emuacc.app/sources");
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            return PathBuf::from(appdata).join("com.emuacc.app/sources");
-        }
-    }
-
-    PathBuf::from("sources")
-}
-
-fn resolve_generated_dir() -> PathBuf {
-    if let Ok(custom) = std::env::var("EMUACC_GENERATED_DIR") {
-        return PathBuf::from(custom);
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home)
-                .join("Library/Application Support/com.emuacc.app/generated");
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(data) = std::env::var("XDG_DATA_HOME").ok().or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| format!("{h}/.local/share"))
-        }) {
-            return PathBuf::from(data).join("com.emuacc.app/generated");
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            return PathBuf::from(appdata).join("com.emuacc.app/generated");
-        }
-    }
-
-    PathBuf::from("generated")
-}
-
 fn print_usage() {
     eprintln!("Usage: emuacc-import [OPTIONS] [FILE...]");
     eprintln!();
     eprintln!("Process pending CSV imports for EmuAcc accounting.");
+    eprintln!();
+    eprintln!("Vault resolution: EMUACC_SOURCES_DIR / EMUACC_GENERATED_DIR env overrides");
+    eprintln!("win, otherwise the app config's current_root.");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --sources-dir PATH   Override sources directory");
@@ -174,8 +112,9 @@ fn main() {
         i += 1;
     }
 
-    let sources_dir = sources_dir.unwrap_or_else(resolve_sources_dir);
-    let generated_dir = generated_dir.unwrap_or_else(resolve_generated_dir);
+    let vault = CliVault::load();
+    let sources_dir = sources_dir.unwrap_or(vault.sources_dir);
+    let generated_dir = generated_dir.unwrap_or(vault.generated_dir);
     let now_yyyymm = now.unwrap_or_else(now_yyyymm);
 
     let config = PipelineConfig {
@@ -183,7 +122,7 @@ fn main() {
         generated_dir,
         now_yyyymm,
         force: false,
-        default_expense_account: FALLBACK_EXPENSE_ACCOUNT.to_string(),
+        default_expense_account: vault.config.default_expense_account,
         changed_folder_hint: None,
     };
 

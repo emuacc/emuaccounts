@@ -29,6 +29,7 @@ pub fn dispatch(ctx: &WebCtx, command: &str, args: &Value) -> Result<Value, Stri
         "get_known_roots" => Ok(json!(ctx.config.known_roots)),
         "list_account_sets" => list_account_sets(ctx),
         "get_update_prices_on_startup" => Ok(json!(ctx.config.update_prices_on_startup)),
+        "get_show_all_holdings" => Ok(json!(ctx.config.show_all_holdings)),
         "get_extra_primary_account_prefixes" => {
             Ok(json!(ctx.config.extra_primary_account_prefixes))
         }
@@ -40,6 +41,9 @@ pub fn dispatch(ctx: &WebCtx, command: &str, args: &Value) -> Result<Value, Stri
 
         // ── Config ──────────────────────────────────────────────────
         "get_display_config" => get_display_config(ctx, args),
+        "get_clearing_accounts" => {
+            to_value(crate::display_config::vault_clearing_accounts(&ctx.generated_dir)?)
+        }
         "get_tax_config" => to_value(get_tax_config(ctx, &account_set_arg(args)?)?),
 
         // ── Reports (financial-year) ────────────────────────────────

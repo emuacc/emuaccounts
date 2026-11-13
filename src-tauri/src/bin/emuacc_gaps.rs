@@ -3,43 +3,15 @@
 use std::path::PathBuf;
 
 use emuaccounts::processing_pipeline::detect_account_gaps;
-
-fn resolve_generated_dir() -> PathBuf {
-    if let Ok(custom) = std::env::var("EMUACC_GENERATED_DIR") {
-        return PathBuf::from(custom);
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home)
-                .join("Library/Application Support/com.emuacc.app/generated");
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(data) = std::env::var("XDG_DATA_HOME").ok().or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| format!("{h}/.local/share"))
-        }) {
-            return PathBuf::from(data).join("com.emuacc.app/generated");
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            return PathBuf::from(appdata).join("com.emuacc.app/generated");
-        }
-    }
-
-    PathBuf::from("generated")
-}
+use emuaccounts::root_config::CliVault;
 
 fn print_usage() {
     eprintln!("Usage: emuacc-gaps [OPTIONS]");
     eprintln!();
     eprintln!("Detect missing monthly statements per account.");
+    eprintln!();
+    eprintln!("Vault resolution: the EMUACC_GENERATED_DIR env override wins, otherwise");
+    eprintln!("the app config's current_root.");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --generated-dir PATH  Override generated directory");
@@ -79,7 +51,7 @@ fn main() {
         i += 1;
     }
 
-    let generated_dir = generated_dir.unwrap_or_else(resolve_generated_dir);
+    let generated_dir = generated_dir.unwrap_or_else(|| CliVault::load().generated_dir);
 
     if !generated_dir.exists() {
         eprintln!(

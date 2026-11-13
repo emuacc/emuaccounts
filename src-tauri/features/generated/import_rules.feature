@@ -34,10 +34,12 @@ Feature: Import rules from CSV
     When I import the rules CSV into "bank"
     Then the rules file "bank/_rules.json" should contain 2 rules
 
-  Scenario: Import invalidates build cache
+  # Imported rules are a pass over the cached raw rows: the pipeline re-runs
+  # the rules, not the transform script.
+  Scenario: Import re-categorises the cached rows without re-running the transform
     Given a pipeline has been run once with a transform
     And a CSV rules file with contents:
       | pattern   | payee       | contra | comment |
       | CacheTest | CachePayee  |        |         |
     When I import the rules CSV into "bank"
-    Then the CSV should be re-transformed (not cached)
+    Then the CSV should be re-categorised from the cache, not re-transformed

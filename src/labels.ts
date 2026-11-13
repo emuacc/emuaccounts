@@ -9,6 +9,7 @@
 
 import type { RuleInfo } from "./rules";
 import { amountMatches, parseAmountCondition, wildcardMatch } from "./rules";
+import { isIdAnchored, metaSegmentMatch } from "./meta";
 
 /** One label plus the folder whose _labels.json owns it ("" = sources root).
  *  Mirrors the Rust `LabelInfo` returned by the `get_labels` command; array
@@ -21,29 +22,6 @@ export type LabelMatchFields = {
   meta?: string | null;
   amount?: number;
 };
-
-/** Port of rules.rs `id_anchor_prefix`: a bare `txn:<id>` / `leg:<id>`
- *  pattern with no glob/alternation/whitespace is id-anchored. */
-function isIdAnchored(pattern: string): boolean {
-  const p = pattern.trim();
-  for (const prefix of ["leg:", "txn:"]) {
-    if (p.startsWith(prefix)) {
-      const rest = p.slice(prefix.length);
-      if (rest && !rest.includes("*") && !rest.includes("|") && !rest.includes(",") && !/\s/.test(rest)) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-/** Port of rules.rs `meta_segment_match`: split meta on `,`, trim, and
- *  require one segment to equal the pattern case-insensitively. */
-function metaSegmentMatch(pattern: string, meta: string): boolean {
-  const p = pattern.trim().toLowerCase();
-  if (!p) return false;
-  return meta.split(",").some((seg) => seg.trim().toLowerCase() === p);
-}
 
 /** Mirror of the per-label predicate inside `find_payee_rename`
  *  (src-tauri/src/rules.rs). Only payee-rename labels participate. */

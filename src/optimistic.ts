@@ -24,22 +24,27 @@ export function resetSearchPaging(state: {
   state.searchFilteredOffset = undefined;
 }
 
-function metaTxnId(meta: string | null | undefined): string {
-  return (meta ?? "").split(",").map((p) => p.trim()).find((p) => p.startsWith("txn:")) ?? "";
+/** The query window for a transaction-search fetch. Infinite scroll appends
+ *  the page at `txWindowStart`. Every other fetch re-fetches the whole loaded
+ *  span — `[0, txWindowStart + pageSize)` — and the caller replaces the rows
+ *  only once the new ones arrive: after a rebuild the table neither empties
+ *  (no flash) nor drops the pages the user scrolled to, and a stale page can
+ *  never be appended to rows from before the rebuild. */
+export function searchWindowFetch(
+  txWindowStart: number,
+  pageSize: number,
+  append: boolean,
+): { offset: number; limit: number; append: boolean } {
+  if (append && txWindowStart > 0) return { offset: txWindowStart, limit: pageSize, append: true };
+  return { offset: 0, limit: txWindowStart + pageSize, append: false };
 }
 
-/** Filter out txns whose id is in pendingDeletes. The renderer calls this
- *  before pagination so optimistic deletes never accumulate as faded rows
- *  while the queued pipeline rebuild catches up. */
-export function filterPendingDeletes<T extends { meta?: string | null }>(
-  txns: T[],
-  pendingDeletes: Set<string>,
-): T[] {
-  if (pendingDeletes.size === 0) return txns;
-  return txns.filter((t) => {
-    const id = metaTxnId(t.meta);
-    return !id || !pendingDeletes.has(id);
-  });
+/** The txWindowStart after a replacing fetch landed with `loaded` rows: the
+ *  next infinite-scroll append (which fetches at txWindowStart + pageSize)
+ *  then starts right after them, even when the user scrolled while it was in
+ *  flight and that page was dropped. */
+export function windowStartAfterReplace(loaded: number, pageSize: number): number {
+  return Math.max(0, loaded - pageSize);
 }
 
 /** Drop any expandKey whose underlying transaction is being hidden.

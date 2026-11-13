@@ -1,5 +1,5 @@
 import "./style.css";
-import { morphInPlace } from "./dom-update";
+import { debouncedRender, morphInPlace, playRowFlashes, preserveFocus } from "./dom-update";
 import { bindOnceDuring } from "./bind-once";
 import { ROW_AI_SPARKLE_SELECTOR } from "./ai-sparkle";
 import { buildSaveRuleArgs } from "./save-rule-args";
@@ -29,6 +29,7 @@ import {
   renderRebuildStrip,
   renderSortHeader,
   renderNavButtons,
+  renderTxnDetailRow,
   withFadeInClass,
   currentFinancialYear,
 } from "./render";
@@ -44,7 +45,10 @@ import {
   computeLabelPreview, labelInsertIndex, labelMatchesFields,
   type LabelInfo, type LabelPreviewMatch,
 } from "./labels";
-import { filterSidebarBalances, filterCategoryBalances } from "./sidebar-accounts";
+import {
+  filterCategoryBalances, filterSidebarBalances, folderBackedAccounts, isIncludedInBalance,
+  isOutsideBalance, transactionQueryFor, withPendingBalances, withPendingOwned, type TransactionQuery,
+} from "./sidebar-accounts";
 import { buildAddPluginsModalHtml, type AvailablePluginInfo } from "./add-plugins-modal";
 import { ACCOUNT_KINDS, NEW_ENTITY, buildAccountName, deriveWalletLabel, initialEntityChoice, isCryptoKind, kindPrefix, resolveEntityChoice, shouldPromptImport, validateEntityName } from "./add-account";
 import { ROOT_FOLDER_PATH, accountDrillSegments, accountFromDrillPath, folderDisplayName, folderTotalAud, formatFolderAmount, isFolderSelection } from "./folder-view";
@@ -52,28 +56,47 @@ import { paginateWithGroups, buildTxnIdMap, type TxGroup, type TxRowItem } from 
 import { normalStartup as _normalStartup } from "./startup";
 import { createUiStatePersister, loadPersistedUiState, resetVaultScopedState, UI_STATE_VERSION, type NavEntry } from "./ui-state";
 import { renderPluginReadmeSection, renderPluginSetupButton } from "./plugin-readme";
-import { categoryLabel, displayLegs, feeLeg, isTradeShaped } from "./transaction-legs";
+import { categoryLabel, displayLegs, feeLeg, flowAmount, isTradeShaped, subAccountLabel } from "./transaction-legs";
 import { computeTransactionValues, describeValueBasis, valueRateCommodity, type TxnValue } from "./transaction-values";
 import { wildcardMatch, computeRulePreviewFromDraft, extractRuleConfigPills, draftConditionsToPills, isDefaultRule, buildRuleFromDraft, categoryEditRuleMatch, derivePatternAndPayeeCondition, mergeRuleConditions, type RuleInfo, type PreviewMatch, type AmountCondition } from "./rules";
 import { collectAccountSuggestions } from "./account-suggestions";
 import { type SearchPill, parseSmartInput, toFlatString, renderSmartSearch, attachSmartSearch } from "./smart-search";
-import { collectIssues, buildAccountIssueCounts, type IssueGroup, type AccountGap } from "./issues";
+import { collectIssues, buildAccountIssueCounts, refreshIssuesCache, type IssueGroup, type AccountGap } from "./issues";
+import { createRenderScheduler, nextFrame, type RenderScheduler } from "./render-scheduler";
+import { startEditTimeline, type EditTimeline } from "./edit-timeline";
 import { loadTreeBaseTotals } from "./currency-totals";
 import { chosenBaseCurrency, needsBaseCurrencySetup, preselectBaseCurrency, renderBaseCurrencySetup } from "./base-currency-setup";
 import { renderVaultRebuilding, waitForVaultRebuild } from "./vault-rebuild";
-import { applyPipelineResponse, applyMutationResponse, applyParse, type MutationResponse } from "./apply-pipeline";
+import { applyPipelineResponse, applyMutationResponse, noteMutationResponse, notePipelineResponse, refreshAfterRebuild, type MutationResponse } from "./apply-pipeline";
+import { creatingAccounts, loadAccountLists, loadAllAccounts } from "./account-lists";
 import { MutationQueue } from "./mutation-queue";
 import {
   buildOptimisticTransaction,
-  filterPendingDeletes,
   nextOptimisticTempId,
   pendingAddsForView,
   pruneExpandedKeysForTxn,
   resetSearchPaging,
+  searchWindowFetch,
+  windowStartAfterReplace,
 } from "./optimistic";
+import {
+  HIDDEN_ACCOUNT,
+  addOptimisticEdit,
+  applyOptimisticEdits,
+  revertOptimisticEdit,
+  setShowIgnored,
+  settleOptimisticEdit,
+  txnRowKey,
+  type EditView,
+  type NewOptimisticEdit,
+  type OptimisticEdit,
+  type RowFlashes,
+  type SettleDeps,
+} from "./optimistic-edits";
 import { attachAccountInput, type AccountInputController } from "./account-input";
 import { formatAmount as formatAmountPure, formatAmountSmart, type DisplayConfig } from "./format";
 import {
+  accountSubtreeTerm,
   extractRuleId,
   legIdFromMeta,
   matchesPrefix,
@@ -118,7 +141,7 @@ async function filterBySearch(accountSet: string, pills: SearchPill[], accountPr
     return [];
   }
 }
-import { TX_WINDOW } from "./virtual-scroll";
+import { TX_WINDOW, hasMoreRowsToLoad, isTransactionPane } from "./virtual-scroll";
 
 // Module-level cache for virtual-scroll tbody re-renders (scroll handler needs these)
 let vsItems: TxRowItem[] = [];
@@ -127,6 +150,9 @@ let vsCleanup: (() => void) | null = null;
 // Smart search cleanup functions (called before re-attaching on render)
 let cleanupAccountSearch: (() => void) | null = null;
 let cleanupRuleSearch: (() => void) | null = null;
+// Their debounced searches (module scope: see debouncedRender)
+const scheduleAccountSearch = debouncedRender(300);
+const scheduleRulePreview = debouncedRender(300);
 
 type PriceImportResponse = { commodities: string[]; total_count: number };
 
@@ -483,12 +509,6 @@ function activeDrillPath(state: AppState): string[] {
   return state.sidebarView === "categories" ? state.categoryDrillPath : state.drillPath;
 }
 
-/** Both left-panes that render the account header + transaction table (Accounts
- *  and Categories), as opposed to Reports/Plugins/rule-editor. */
-function isTransactionPane(state: AppState): boolean {
-  return state.sidebarView === "accounts" || state.sidebarView === "categories";
-}
-
 /** Select a leaf account in the active pane, resetting the shared tx window. */
 function selectActiveAccount(state: AppState, account: string): void {
   if (state.sidebarView === "categories") resetStateForCategoryNavigation(state, account);
@@ -649,16 +669,28 @@ function drillDownIssueCount(node: TreeNode, issueCounts: Map<string, number>): 
   return count;
 }
 
-function renderDrillDownNode(node: TreeNode, selectedAccount: string | undefined, totalText: string, badgeHtml: string): string {
+/** Accounts-pane rows outside "Accounts included in balance" (only "Show all
+ *  holdings" lists them): `isOutside` picks them out, and each shows its own
+ *  value from `totals` (every account's base value, not the primary scope). */
+type OutsideBalanceRows = { isOutside: (node: TreeNode) => boolean; totals?: Map<string, number> };
+
+function renderDrillDownNode(
+  node: TreeNode,
+  selectedAccount: string | undefined,
+  totalText: string,
+  badgeHtml: string,
+  outside = false,
+): string {
+  const outsideAttrs = outside ? ` title="Not included in balance" data-outside-balance="true"` : "";
   if (node.children.length > 0) {
     const groupActive = node.fullPath === selectedAccount;
-    return `<button class="drilldown__item${groupActive ? " drilldown__item--active" : ""}" type="button" data-testid="drilldown-item" data-drill="${escapeText(node.name)}" data-group="${escapeText(node.fullPath)}">
+    return `<button class="drilldown__item${groupActive ? " drilldown__item--active" : ""}${outside ? " drilldown__item--outside" : ""}" type="button" data-testid="drilldown-item" data-drill="${escapeText(node.name)}" data-group="${escapeText(node.fullPath)}"${outsideAttrs}>
       <span class="drilldown__label"><span class="drilldown__name">${escapeText(displayName(node.name))}${badgeHtml}</span>${totalText ? `<span class="drilldown__total">${escapeText(totalText)}</span>` : ""}</span>
       <span class="drilldown__chevron">\u203A</span>
     </button>`;
   }
   const active = node.fullPath === selectedAccount;
-  return `<button class="account ${active ? "account--active" : ""}" type="button" data-testid="account-item" data-account="${escapeText(node.fullPath)}">
+  return `<button class="account ${active ? "account--active" : ""}${outside ? " account--outside" : ""}" type="button" data-testid="account-item" data-account="${escapeText(node.fullPath)}"${outsideAttrs}>
     <span class="account__name">${escapeText(displayName(node.name))}${badgeHtml}</span>
     <span class="account__amt">${escapeText(totalText)}</span>
   </button>`;
@@ -672,6 +704,7 @@ function renderDrillDown(
   issueCounts: Map<string, number>,
   treeBaseTotals?: Map<string, number>,
   baseCurrency?: string,
+  outsideBalance?: OutsideBalanceRows,
 ): string {
   // Walk from the pane's level root (see paneLevelRoot) so the back-button
   // logic is shared by both panes.
@@ -687,10 +720,11 @@ function renderDrillDown(
     html += `<button class="drilldown__back" type="button" data-testid="drilldown-back"><span class="drilldown__backArrow">\u2039</span><span>${escapeText(displayName(current.name))}</span></button>`;
   }
   for (const node of current.children) {
-    const totalText = drillDownNodeTotal(node, treeBaseTotals, baseCurrency);
+    const outside = outsideBalance?.isOutside(node) ?? false;
+    const totalText = drillDownNodeTotal(node, outside ? outsideBalance?.totals : treeBaseTotals, baseCurrency);
     const issueCount = drillDownIssueCount(node, issueCounts);
     const badgeHtml = issueCount > 0 ? `<span class="account__badge">${issueCount}</span>` : "";
-    html += renderDrillDownNode(node, selectedAccount, totalText, badgeHtml);
+    html += renderDrillDownNode(node, selectedAccount, totalText, badgeHtml, outside);
   }
   return html;
 }
@@ -887,6 +921,26 @@ async function loadDisplayConfig(state: AppState): Promise<void> {
   }
 }
 
+/** The app-wide settings (the app's config.json, not the vault's). Read at
+ *  launch, so the first render already honours them and Global Settings opens
+ *  on the saved values, and again whenever the plugin list reloads. A setting
+ *  that can't be read stays unset: off, no prefixes, the catalogue's terms. */
+async function loadAppSettings(state: AppState): Promise<void> {
+  const read = async <T>(cmd: string, apply: (value: T) => void) => {
+    try {
+      apply(await invoke<T>(cmd));
+    } catch {
+      /* non-Tauri context — leave unset */
+    }
+  };
+  await Promise.all([
+    read<boolean>("get_update_prices_on_startup", (v) => { state.updatePricesOnStartup = v; }),
+    read<string[]>("get_extra_primary_account_prefixes", (v) => { state.extraPrimaryAccountPrefixes = v; }),
+    read<boolean>("get_show_all_holdings", (v) => { state.showAllHoldings = v; }),
+    read<Term[]>("get_terms", (v) => { state.terms = v; }),
+  ]);
+}
+
 async function loadPlugins(state: AppState): Promise<void> {
   try {
     state.pluginsList = await invoke<PluginInfo[]>("list_plugins");
@@ -894,21 +948,7 @@ async function loadPlugins(state: AppState): Promise<void> {
     console.error("Failed to load plugins:", e);
     state.pluginsList = [];
   }
-  try {
-    state.updatePricesOnStartup = await invoke<boolean>("get_update_prices_on_startup");
-  } catch {
-    /* non-Tauri context — leave undefined */
-  }
-  try {
-    state.extraPrimaryAccountPrefixes = await invoke<string[]>("get_extra_primary_account_prefixes");
-  } catch {
-    /* non-Tauri context — leave undefined */
-  }
-  try {
-    state.terms = await invoke<Term[]>("get_terms");
-  } catch {
-    /* non-Tauri context — renderers fall back to the catalogue defaults */
-  }
+  await loadAppSettings(state);
 }
 
 function attachDebouncedFilterInput(
@@ -923,18 +963,7 @@ function attachDebouncedFilterInput(
     const el = e.target as HTMLInputElement;
     apply(state, el.value || undefined);
     if (timer) clearTimeout(timer);
-    const savedCursor = el.selectionStart;
-    timer = setTimeout(() => {
-      render(state);
-      const restored = document.querySelector<HTMLInputElement>(selector);
-      if (restored) {
-        restored.focus();
-        if (savedCursor != null) {
-          const pos = Math.min(savedCursor, restored.value.length);
-          restored.selectionStart = restored.selectionEnd = pos;
-        }
-      }
-    }, 200);
+    timer = setTimeout(() => preserveFocus(() => render(state)), 200);
   });
 }
 
@@ -975,11 +1004,19 @@ function maybePrefillBalancesScope(state: AppState): void {
   state.reportBaseScope = state.selectedAccount;
 }
 
+type ReportType = NonNullable<AppState["selectedReport"]>;
+
 type ReportFetchArgs = {
   accountSet: string;
   baseCurrency: string;
   baseAccountScope: string | null;
 };
+
+/** The report fields one load fills in; loadReport applies them to state. */
+type ReportData = Pick<
+  AppState,
+  "cgtReport" | "incomeReport" | "balancesReport" | "performanceReport" | "lossHarvestReport"
+>;
 
 function clearReportData(state: AppState): void {
   state.cgtReport = undefined;
@@ -989,13 +1026,20 @@ function clearReportData(state: AppState): void {
   state.lossHarvestReport = undefined;
 }
 
+function reportFetchArgs(state: AppState): ReportFetchArgs {
+  return {
+    accountSet: state.selectedAccountSet ?? "",
+    baseCurrency: state.displayConfig?.base_currency ?? "AUD",
+    baseAccountScope: state.reportBaseScope || null,
+  };
+}
+
 async function fetchFyReport(
   state: AppState,
-  reportType: "cgt" | "income" | "balances" | "performance" | "loss_harvest",
+  reportType: ReportType,
   fy: string,
   args: ReportFetchArgs,
-): Promise<void> {
-  clearReportData(state);
+): Promise<ReportData> {
   if (reportType === "performance") {
     // Performance is range-only on the backend; an FY *is* a 12-month window.
     const { start, end } = fyDateRange(
@@ -1003,137 +1047,134 @@ async function fetchFyReport(
       state.taxConfig?.financial_year_end_month ?? 6,
       state.taxConfig?.financial_year_end_day ?? 30,
     );
-    state.performanceReport = await invoke<PerformanceReport>(
-      "generate_performance_report_range_cmd",
-      { ...args, dateFrom: start, dateTo: end },
-    );
-    return;
+    return {
+      performanceReport: await invoke<PerformanceReport>(
+        "generate_performance_report_range_cmd",
+        { ...args, dateFrom: start, dateTo: end },
+      ),
+    };
   }
   const fyArgs = { ...args, financialYear: fy };
-  if (reportType === "cgt") {
-    state.cgtReport = await invoke<CgtReport>("generate_cgt_report_cmd", fyArgs);
-  } else if (reportType === "income") {
-    state.incomeReport = await invoke<IncomeTaxReport>("generate_income_report_cmd", fyArgs);
-  } else if (reportType === "balances") {
-    state.balancesReport = await invoke<BalancesReport>("generate_balances_report_cmd", fyArgs);
-  } else {
-    state.lossHarvestReport = await invoke<LossHarvestReport>("generate_loss_harvest_report_cmd", fyArgs);
-  }
+  if (reportType === "cgt") return { cgtReport: await invoke<CgtReport>("generate_cgt_report_cmd", fyArgs) };
+  if (reportType === "income") return { incomeReport: await invoke<IncomeTaxReport>("generate_income_report_cmd", fyArgs) };
+  if (reportType === "balances") return { balancesReport: await invoke<BalancesReport>("generate_balances_report_cmd", fyArgs) };
+  return { lossHarvestReport: await invoke<LossHarvestReport>("generate_loss_harvest_report_cmd", fyArgs) };
 }
 
 async function fetchCustomReport(
-  state: AppState,
-  reportType: "cgt" | "income" | "balances" | "performance" | "loss_harvest",
+  reportType: ReportType,
   dateFrom: string,
   dateTo: string,
   args: ReportFetchArgs,
-): Promise<void> {
-  clearReportData(state);
+): Promise<ReportData> {
+  const range = { ...args, dateFrom, dateTo };
   if (reportType === "performance") {
-    state.performanceReport = await invoke<PerformanceReport>(
-      "generate_performance_report_range_cmd",
-      { ...args, dateFrom, dateTo },
-    );
-    return;
+    return { performanceReport: await invoke<PerformanceReport>("generate_performance_report_range_cmd", range) };
   }
-  if (reportType === "cgt") {
-    state.cgtReport = await invoke<CgtReport>("generate_cgt_report_range_cmd", {
-      ...args, dateFrom, dateTo,
-    });
-  } else if (reportType === "income") {
-    state.incomeReport = await invoke<IncomeTaxReport>("generate_income_report_range_cmd", {
-      ...args, dateFrom, dateTo,
-    });
-  } else if (reportType === "balances") {
+  if (reportType === "cgt") return { cgtReport: await invoke<CgtReport>("generate_cgt_report_range_cmd", range) };
+  if (reportType === "income") return { incomeReport: await invoke<IncomeTaxReport>("generate_income_report_range_cmd", range) };
+  if (reportType === "balances") {
     // Balances is a point-in-time snapshot — only the "to" date is meaningful.
-    state.balancesReport = await invoke<BalancesReport>("generate_balances_report_range_cmd", {
-      ...args, dateTo,
-    });
-  } else {
-    // Loss harvesting offsets gains realised across the whole window.
-    state.lossHarvestReport = await invoke<LossHarvestReport>("generate_loss_harvest_report_range_cmd", {
-      ...args, dateFrom, dateTo,
-    });
+    return { balancesReport: await invoke<BalancesReport>("generate_balances_report_range_cmd", { ...args, dateTo }) };
   }
+  // Loss harvesting offsets gains realised across the whole window.
+  return { lossHarvestReport: await invoke<LossHarvestReport>("generate_loss_harvest_report_range_cmd", range) };
 }
 
+/** Counts the calls to loadReport. A load that finds a later one has started
+ *  was replaced: it leaves the report and the loading screen to the later one. */
+let reportLoads = 0;
+
 async function loadReport(state: AppState): Promise<void> {
-  if (!state.selectedReport) return;
+  const reportType = state.selectedReport;
+  if (!reportType) return;
+  const load = ++reportLoads;
+  const replaced = () => load !== reportLoads;
   // Show a loading screen immediately — the report commands are async, so the
   // thread stays responsive while an uncached report generates (no beach ball).
   clearReportData(state);
   state.reportLoading = true;
   render(state);
   try {
-    if (state.reportDateMode === "custom") {
-      await loadCustomReport(state);
-      return;
-    }
-    const reportType = state.selectedReport;
-
-    // Load available years first so we can pick a sensible default. Performance
-    // and Tax Savings are computed live (no cached report files), so reuse the
-    // CGT year list to populate their FY dropdowns.
-    const yearsReportType =
-      reportType === "performance" || reportType === "loss_harvest" ? "cgt" : reportType;
-    const years = await invoke<number[]>("list_report_years_cmd", {
-      accountSet: state.selectedAccountSet ?? "",
-      reportType: yearsReportType,
-    });
-    state.reportYears = years;
-
-    // Default to the CURRENT financial year (computed from today + FY-end), not
-    // the latest *cached* year — so reports open on "this year" even before the
-    // current FY's cache exists, and don't get stuck on a stale completed year.
-    if (!state.selectedReportYear || (years.length > 0 && !years.includes(state.selectedReportYear))) {
-      state.selectedReportYear = currentFinancialYear(state.taxConfig);
-    }
-
-    if (!state.selectedReportYear) return;
-
-    const args: ReportFetchArgs = {
-      accountSet: state.selectedAccountSet ?? "",
-      baseCurrency: state.displayConfig?.base_currency ?? "AUD",
-      baseAccountScope: state.reportBaseScope || null,
-    };
-    await fetchFyReport(state, reportType, String(state.selectedReportYear), args);
+    const data = state.reportDateMode === "custom"
+      ? await loadCustomReport(state, reportType)
+      : await loadFyReport(state, reportType, replaced);
+    if (!data || replaced()) return;
+    Object.assign(state, data);
     state.reportMarkdown = undefined;
   } catch (err) {
     console.error("Failed to load report:", err);
   } finally {
-    state.reportLoading = false;
-    render(state);
+    if (!replaced()) {
+      state.reportLoading = false;
+      render(state);
+    }
   }
 }
 
-async function loadCustomReport(state: AppState): Promise<void> {
-  if (!state.selectedReport || !state.reportDateFrom || !state.reportDateTo) return;
-  try {
-    state.reportMarkdown = undefined;
-    const args: ReportFetchArgs = {
-      accountSet: state.selectedAccountSet ?? "",
-      baseCurrency: state.displayConfig?.base_currency ?? "AUD",
-      baseAccountScope: state.reportBaseScope || null,
-    };
-    await fetchCustomReport(
-      state,
-      state.selectedReport,
-      state.reportDateFrom,
-      state.reportDateTo,
-      args,
-    );
-  } catch (err) {
-    console.error("Failed to load custom report:", err);
+/** The selected year's report, after defaulting the year. Undefined when there
+ *  is no year to show, or when a later load replaced this one first. */
+async function loadFyReport(
+  state: AppState,
+  reportType: ReportType,
+  replaced: () => boolean,
+): Promise<ReportData | undefined> {
+  // Load available years first so we can pick a sensible default. Performance
+  // and Tax Savings are computed live (no cached report files), so reuse the
+  // CGT year list to populate their FY dropdowns.
+  const yearsReportType =
+    reportType === "performance" || reportType === "loss_harvest" ? "cgt" : reportType;
+  const years = await invoke<number[]>("list_report_years_cmd", {
+    accountSet: state.selectedAccountSet ?? "",
+    reportType: yearsReportType,
+  });
+  if (replaced()) return undefined;
+  state.reportYears = years;
+
+  // Default to the CURRENT financial year (computed from today + FY-end), not
+  // the latest *cached* year — so reports open on "this year" even before the
+  // current FY's cache exists, and don't get stuck on a stale completed year.
+  if (!state.selectedReportYear || (years.length > 0 && !years.includes(state.selectedReportYear))) {
+    state.selectedReportYear = currentFinancialYear(state.taxConfig);
   }
+
+  if (!state.selectedReportYear) return undefined;
+  return fetchFyReport(state, reportType, String(state.selectedReportYear), reportFetchArgs(state));
+}
+
+async function loadCustomReport(state: AppState, reportType: ReportType): Promise<ReportData | undefined> {
+  if (!state.reportDateFrom || !state.reportDateTo) return undefined;
+  return fetchCustomReport(reportType, state.reportDateFrom, state.reportDateTo, reportFetchArgs(state));
+}
+
+/** The render the edit path and the refresh ask for: one per frame (see
+ *  ./render-scheduler), so the optimistic edit, the queue's status and a
+ *  refresh landing in the same tick cost one render, not three. */
+let renderScheduler: RenderScheduler | undefined;
+function requestRender(state: AppState): void {
+  renderScheduler ??= createRenderScheduler(() => render(state));
+  renderScheduler.request();
+}
+
+/** The table edit in flight, from its click until its rebuilt rows land; the
+ *  refresh queries and the renders mark themselves on it (./edit-timeline). */
+let editTimeline: EditTimeline | undefined;
+function noteRender(): void {
+  editTimeline?.rendered();
 }
 
 let heavyRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 
+/** When the last table mutation's write returned (performance.now()), so the
+ *  heavy tail can say how long after the edit landed it finished. */
+let lastWriteLandedAt: number | undefined;
+
 /** The expensive, non-critical tail of a ledger refresh: base-currency
- *  conversions (hundreds of requests) and the full-vault trade-suggestion scan.
- *  Pulled off the per-change critical path and run via scheduleHeavyRefresh so a
- *  burst of changes triggers it once, after the user pauses — the cheap refresh
- *  (header balance + visible window) has already rendered. */
+ *  conversions (hundreds of requests), the issues scan and the trade-suggestion
+ *  scan (each a full-vault pass when its cache misses). Pulled off the
+ *  per-change critical path and run via scheduleHeavyRefresh so a burst of
+ *  changes triggers it once, after the user pauses — the cheap refresh (header
+ *  balance + visible window) has already rendered. */
 async function refreshHeavy(state: AppState): Promise<void> {
   const t0 = performance.now();
   const mark = (label: string) => pushDebug("perf", `[heavy] ${label} +${(performance.now() - t0).toFixed(0)}ms`);
@@ -1141,6 +1182,7 @@ async function refreshHeavy(state: AppState): Promise<void> {
     loadTransactionValues(state).finally(() => mark("txn values")),
     loadAccountTotalValue(state).finally(() => mark("account total value")),
     _loadTreeBaseCurrencyTotals(state).finally(() => mark("tree base-currency totals")),
+    refreshIssuesCache().catch(() => { /* keep the issues we have */ }).finally(() => mark("issues")),
   ]);
   try {
     const suggestions = await invoke<TradeSuggestion[]>("suggest_trade_links_cmd", {
@@ -1152,13 +1194,24 @@ async function refreshHeavy(state: AppState): Promise<void> {
   } catch (e) {
     console.warn("trade suggestions failed:", e);
   }
-  render(state);
+  requestRender(state);
+  // The render is due in the next frame; the tail is done once it has run.
+  nextFrame(() => {
+    mark("rendered");
+    if (lastWriteLandedAt !== undefined) {
+      pushDebug("perf", `[heavy] done ${(performance.now() - lastWriteLandedAt).toFixed(0)}ms after the last write landed`);
+      lastWriteLandedAt = undefined;
+    }
+  });
 }
 
 /** Debounce the heavy refresh: collapses a burst of refreshes into a single run
- *  ~400ms after the last one, so rapid changes don't each pay the full-vault scan. */
+ *  ~400ms after the last one, so rapid changes don't each pay the full-vault
+ *  scan. While more mutations wait on the queue nothing is scheduled: the last
+ *  one's refresh schedules the tail, so a burst of edits pays it once. */
 function scheduleHeavyRefresh(state: AppState): void {
   if (heavyRefreshTimer !== undefined) clearTimeout(heavyRefreshTimer);
+  if (mutationQueue.length > 1) return;
   heavyRefreshTimer = setTimeout(() => {
     heavyRefreshTimer = undefined;
     void refreshHeavy(state);
@@ -1179,40 +1232,14 @@ async function loadGeneratedLedger(state: AppState, opts?: { silent?: boolean })
   }
 
   try {
-    // Load account tree from per-folder summaries (no transaction parsing),
-    // plus the pipeline metadata so account maps and the opening-balance list
-    // track mutations that create folders or declarations (the slim
-    // MutationResponse doesn't carry them).
-    const [balances, meta] = await Promise.all([
-      invoke<{ account: string; totals: { commodity: string; amount: number }[] }[]>(
-        "load_account_tree",
-        { accountSet: state.selectedAccountSet ?? "" },
-      ),
-      invoke<{
-        owner_accounts?: Record<string, string[]>;
-        account_folders?: AccountFolders;
-        account_properties?: Record<string, AccountProperties>;
-        accounts_with_opening?: string[];
-      }>("load_pipeline_metadata").catch(() => null),
-    ]);
-    if (meta) {
-      if (meta.owner_accounts) state.accountSetMap = meta.owner_accounts;
-      if (meta.account_folders) state.accountFoldersMap = meta.account_folders;
-      if (meta.account_properties) {
-        state.accountPropertiesMap = { ...state.accountPropertiesMap, ...meta.account_properties };
-      }
-      if (meta.accounts_with_opening) state.accountsWithOpening = meta.accounts_with_opening;
-    }
-    // Build a lightweight ParseResponse with just balances (no transactions)
-    const response: ParseResponse = {
-      ok: true,
-      diagnostics: [],
-      transactions: [],
-      balances,
-      accounts_with_opening: [],
-      account_properties: {},
-    };
-    applyParse(state, response);
+    // The account lists from per-folder summaries (no transaction parsing):
+    // the sidebar tree, the pool behind every account dropdown and the
+    // pipeline metadata, so a new, renamed or emptied account shows wherever
+    // the change came from.
+    // A mutation's refresh (silent) re-reads the active set's tree only; the
+    // vault-wide pool is re-read when the whole ledger loads.
+    await loadAccountLists(state, invoke, { pool: !silent });
+    editTimeline?.mark("account lists");
     if (!silent) state.status = undefined;
   } catch (err) {
     state.status = `Error: ${String(err)}`;
@@ -1220,48 +1247,13 @@ async function loadGeneratedLedger(state: AppState, opts?: { silent?: boolean })
   } finally {
     if (!silent) state.busy = false;
     // Cheap, scoped refresh on the critical path: header balance + visible
-    // window. Render immediately so the change shows without waiting on the
-    // expensive base-currency conversions + full-vault trade-suggestion scan.
-    await Promise.all([loadPrefixQuery(state), runSearchFilter(state)]);
-    render(state);
+    // window. Render in the next frame so the change shows without waiting
+    // on the expensive base-currency conversions + full-vault scans.
+    await loadSelection(state);
+    requestRender(state);
     // Heavy, non-critical work is deferred + debounced — it lands a beat later
     // and collapses a burst of changes into one run.
     scheduleHeavyRefresh(state);
-  }
-}
-
-/** Apply a slim mutation response and refresh the view cheaply. Balance-changing
- *  mutations (manual add, CSV import) used to return the full active ledger so
- *  the frontend could `applyPipelineResponse` — a ~40MB IPC payload whose
- *  main-thread `JSON.parse` stalled the WebView for seconds on large vaults.
- *
- *  Instead we reload via `loadGeneratedLedger({ silent })`, which refreshes the
- *  sidebar balances (`state.parse.balances` from `load_account_tree`) AND the
- *  account header (`state.prefixQuery` from `query_search`) from the SAME fresh
- *  on-disk state. That shared source is the fix for the earlier window-only
- *  refresh, which left the sidebar stale while the header updated. */
-async function applyMutationAndRefresh(state: AppState, response: MutationResponse): Promise<void> {
-  state.pipelineWarnings = response.warnings ?? [];
-  if (response.output_files_written > 0) state.reportsBuilding = true;
-  // The rebuild invalidates every loaded page of the search window; reset so the
-  // refresh re-fetches from offset 0 (a new/imported row sorts to the top).
-  state.txWindowStart = 0;
-  state.searchFilteredTransactions = undefined;
-  state.searchFilteredCount = undefined;
-  state.searchFilteredOffset = undefined;
-  await loadGeneratedLedger(state, { silent: true });
-}
-
-/** Refresh the global account pool (load_account_tree("") = whole vault) that
- *  feeds account-name autocomplete. Called once at startup and again after a
- *  pipeline rebuild, since the account universe only changes when data does —
- *  switching the selected set does not. */
-async function loadAllAccounts(state: AppState): Promise<void> {
-  try {
-    const all = await invoke<{ account: string }[]>("load_account_tree", { accountSet: "" });
-    state.allAccounts = all.map((b) => b.account);
-  } catch (e) {
-    console.warn("load all accounts failed:", e);
   }
 }
 
@@ -1273,37 +1265,86 @@ async function loadTransactionValues(state: AppState): Promise<void> {
   );
 }
 
+/** The query that reads the active pane's selection, and the `account:` term it
+ *  searches by. `query_global` matches the account's subtree by segment, so
+ *  `income` leaves out `expenses:tax:income`; `query_search` keeps the plain
+ *  `account:` term, the folder prefix it prunes its per-folder ledgers by. */
+function selectionQuery(state: AppState): { cmd: TransactionQuery; account: string; term: string } {
+  const account = activeSelectedAccount(state) ?? "";
+  const cmd = transactionQueryFor(
+    account || undefined,
+    activePaneBalances(state),
+    folderBackedAccounts(state.accountFoldersMap),
+    state.sidebarView === "categories" ? "categories" : "accounts",
+  );
+  const term = !account ? "" : cmd === "query_global" ? accountSubtreeTerm(account) : `account:${account}`;
+  return { cmd, account, term };
+}
+
+/** What a selection's queries ask for. Answers land out of order —
+ *  query_global parses the whole set, so a group's quick query_search answer
+ *  can arrive after the answer for the holding clicked next — so each loader
+ *  keeps an answer only while this still matches what it asked. */
+function selectionRequest(state: AppState): string {
+  const { cmd, term } = selectionQuery(state);
+  return JSON.stringify([
+    state.selectedAccountSet ?? "",
+    cmd,
+    buildSearchString(state, term),
+    backendSortForTransactionWindow(state.txSort),
+    state.showHidden,
+  ]);
+}
+
+/** The selection's header balance and transaction window. With no date filter
+ *  and no search the window query covers the whole selected account, so its
+ *  aggregated balance is the header's and the balance-only query is skipped:
+ *  one query over the ledger per refresh, not two. */
+async function loadSelection(state: AppState): Promise<void> {
+  if (selectionIsUnfiltered(state)) {
+    await runSearchFilter(state);
+    return;
+  }
+  await Promise.all([loadPrefixQuery(state), runSearchFilter(state)]);
+}
+
+/** Does the window query ask for the whole selected account? */
+function selectionIsUnfiltered(state: AppState): boolean {
+  const { account, term } = selectionQuery(state);
+  return !!account && buildSearchString(state, term) === term;
+}
+
 async function loadPrefixQuery(state: AppState): Promise<void> {
-  // Categories pane: the header total comes straight from the in-memory tree
-  // balances (load_account_tree already carries nominal/contra accounts), so no
-  // prefix query is needed — loadAccountTotalValue falls back to state.parse.balances.
-  if (state.sidebarView === "categories") {
+  const { cmd, account, term } = selectionQuery(state);
+  // The Categories roots view has no selection and no header.
+  if (cmd === "query_global" && !account) {
     state.prefixQuery = undefined;
     return;
   }
-  const account = state.selectedAccount ?? "";
-  const search = account ? `account:${account}` : "";
+  const request = selectionRequest(state);
+  let result: QueryResult | undefined;
   try {
     // Only `aggregated_balance` is read from this result (the account header
     // total). For an `account:` search the backend computes balances over the
     // full match regardless of `limit`, so `limit: 0` returns the balance with
     // zero transactions — KB instead of tens of MB, avoiding a multi-second
     // JSON.parse stall on the WebView main thread on large vaults.
-    state.prefixQuery = await invoke<QueryResult>("query_search", {
+    result = await invoke<QueryResult>(cmd, {
       accountSet: state.selectedAccountSet ?? "",
-      search,
+      search: term,
       limit: account ? 0 : undefined,
     });
   } catch {
-    state.prefixQuery = undefined;
+    result = undefined;
   }
+  editTimeline?.mark("balance query");
+  if (selectionRequest(state) === request) state.prefixQuery = result;
 }
 
 /** Build the combined search string from state (account + date + user search). */
-function buildSearchString(state: AppState): string {
+function buildSearchString(state: AppState, accountTerm: string): string {
   const parts: string[] = [];
-  const account = activeSelectedAccount(state) ?? "";
-  if (account) parts.push(`account:${account}`);
+  if (accountTerm) parts.push(accountTerm);
   const dateStart = dateFilterStart(state.dateFilter);
   if (dateStart) parts.push(`date:>=${dateStart}`);
   const searchRaw = state.search.trim();
@@ -1311,40 +1352,62 @@ function buildSearchString(state: AppState): string {
   return parts.join(" AND ");
 }
 
+/** Bumped when a replacing window fetch starts and when it lands: an
+ *  infinite-scroll append begun under an older value was sized against rows
+ *  that have been (or are being) replaced, so its page is dropped — the
+ *  replace covers it, or the next scroll fetches it again. */
+let searchWindowGen = 0;
+
+/** Does a row "Hide" sends to ignore:hidden stay in its account's view?
+ *  Under Show Ignored it does, its legs on ignore:hidden, when the set hides
+ *  that account at all: the queries bring back a row whose legs all left the
+ *  account only for a hidden prefix, and a set config with no
+ *  `hidden_accounts` hides nothing. */
+function hiddenRowStaysShown(state: AppState): boolean {
+  return state.showHidden && state.hiddenAccounts.some((prefix) => HIDDEN_ACCOUNT.startsWith(prefix));
+}
+
+/** Show Ignored toggles whose re-query has not landed (see __diag). */
+let showIgnoredInFlight = 0;
+
+/** E2E vault reopens that have not finished (see __diag). */
+let vaultReopensInFlight = 0;
+
+/** set_show_hidden calls, in click order: two quick Show Ignored clicks could
+ *  otherwise reach the backend the other way round and leave its queries
+ *  returning the rows the button says are left out. */
+let showHiddenApplied: Promise<unknown> = Promise.resolve();
+function applyShowHidden(show: boolean): Promise<unknown> {
+  showHiddenApplied = showHiddenApplied
+    .catch(() => undefined)
+    .then(() => invoke("set_show_hidden", { show }));
+  return showHiddenApplied;
+}
+
 /** Run the search filter via Rust and store results in state.
  *  Supported columns are sorted by Rust before pagination. Unsupported columns
- *  keep a stable backend date order and are only sorted locally in the loaded window. */
-async function runSearchFilter(state: AppState): Promise<void> {
-  const account = activeSelectedAccount(state) ?? "";
+ *  keep a stable backend date order and are only sorted locally in the loaded window.
+ *  `append` (infinite scroll) adds the page at txWindowStart; otherwise the
+ *  whole loaded span is re-fetched and replaces the rows in one step once it
+ *  arrives (see searchWindowFetch) — a rebuild refreshes the table in place. */
+async function runSearchFilter(state: AppState, opts?: { append?: boolean }): Promise<void> {
   const accountSet = state.selectedAccountSet ?? "";
-  const combinedSearch = buildSearchString(state);
-  // Categories are non-folder-backed, so the folder-pruned query_search returns
-  // nothing for them — use the union query_global instead.
-  const queryCmd = state.sidebarView === "categories" ? "query_global" : "query_search";
+  // A selection no source folder backs (a category, a revealed holding) reads
+  // through the union query_global: the folder-pruned query_search finds nothing.
+  const { cmd: queryCmd, account, term } = selectionQuery(state);
+  const combinedSearch = buildSearchString(state, term);
 
-  // Categories with no selected category and no user search → roots view, empty
-  // table. Without this an empty search would union ALL transactions across every
-  // category (query_global ignores the folder scoping that bounds query_search).
-  if (state.sidebarView === "categories" && !account && !state.search.trim()) {
-    state.searchFilteredTransactions = undefined;
-    state.searchFilteredCount = undefined;
-    state.searchFilteredOffset = undefined;
-    state.searchError = undefined;
-    return;
-  }
-
-  if (!combinedSearch && !account && !state.selectedAccountSet) {
-    state.searchFilteredTransactions = undefined;
-    state.searchFilteredCount = undefined;
-    state.searchFilteredOffset = undefined;
+  if (listsNothing(state, queryCmd, account, combinedSearch)) {
+    clearSearchWindow(state);
     state.searchError = undefined;
     return;
   }
 
   const backendSort = backendSortForTransactionWindow(state.txSort);
 
-  const windowStart = state.txWindowStart;
-  const windowSize = TX_WINDOW;
+  const fetch = searchWindowFetch(state.txWindowStart, TX_WINDOW, !!opts?.append && !!state.searchFilteredTransactions);
+  const request = selectionRequest(state);
+  const gen = fetch.append ? searchWindowGen : ++searchWindowGen;
 
   try {
     const result = await invoke<QueryResult>(queryCmd, {
@@ -1352,24 +1415,49 @@ async function runSearchFilter(state: AppState): Promise<void> {
       search: combinedSearch,
       sortField: backendSort.field,
       sortOrder: backendSort.order,
-      offset: windowStart,
-      limit: windowSize,
+      offset: fetch.offset,
+      limit: fetch.limit,
     });
-    // Infinite scroll: append new page when fetching past the start.
-    if (windowStart > 0 && state.searchFilteredTransactions) {
-      state.searchFilteredTransactions = [...state.searchFilteredTransactions, ...result.transactions];
-    } else {
-      state.searchFilteredTransactions = result.transactions;
-    }
-    state.searchFilteredCount = result.transaction_count;
-    state.searchFilteredOffset = 0;
-    state.searchError = undefined;
+    editTimeline?.mark(`window query (${result.transactions.length} rows)`);
+    // A later selection's rows, or a newer replace, own the table.
+    if (selectionRequest(state) !== request || gen !== searchWindowGen) return;
+    storeSearchWindow(state, result, fetch.append);
+    // The whole account's balance came with the window (see loadSelection).
+    if (!fetch.append && account && combinedSearch === term) state.prefixQuery = result;
   } catch (e) {
+    if (selectionRequest(state) !== request || gen !== searchWindowGen) return;
     state.searchError = String(e);
-    state.searchFilteredTransactions = undefined;
-    state.searchFilteredCount = undefined;
-    state.searchFilteredOffset = undefined;
+    clearSearchWindow(state);
   }
+}
+
+/** No query to run: the table is empty. Categories with no selected category
+ *  and no user search are the roots view — without this an empty search would
+ *  union ALL transactions across every category (query_global ignores the
+ *  folder scoping that bounds query_search). */
+function listsNothing(state: AppState, queryCmd: TransactionQuery, account: string | undefined, combinedSearch: string): boolean {
+  if (queryCmd === "query_global" && !account && !state.search.trim()) return true;
+  return !combinedSearch && !account && !state.selectedAccountSet;
+}
+
+function clearSearchWindow(state: AppState): void {
+  state.searchFilteredTransactions = undefined;
+  state.searchFilteredCount = undefined;
+  state.searchFilteredOffset = undefined;
+}
+
+/** Append an infinite-scroll page, or replace the window in one step. */
+function storeSearchWindow(state: AppState, result: QueryResult, append: boolean): void {
+  if (append && state.searchFilteredTransactions) {
+    state.searchFilteredTransactions = [...state.searchFilteredTransactions, ...result.transactions];
+  } else {
+    searchWindowGen++;
+    state.searchFilteredTransactions = result.transactions;
+    state.txWindowStart = windowStartAfterReplace(result.transactions.length, TX_WINDOW);
+  }
+  state.searchFilteredCount = result.transaction_count;
+  state.searchFilteredOffset = 0;
+  state.searchError = undefined;
 }
 
 async function loadAccountTotalValue(state: AppState): Promise<void> {
@@ -1406,6 +1494,7 @@ async function loadAccountTotalValue(state: AppState): Promise<void> {
     const result = await invoke<{ values: (number | null)[] }>("convert_to_base_currency", {
       baseCurrency, requests,
     });
+    if (activeSelectedAccount(state) !== account) return; // a later selection owns the header
     let total = 0;
     const bycommodity = balance.totals.map((t, i) => {
       const rawValue = result.values[i];
@@ -1415,7 +1504,7 @@ async function loadAccountTotalValue(state: AppState): Promise<void> {
     });
     state.accountTotalValue = { total, currency: baseCurrency, bycommodity };
   } catch {
-    state.accountTotalValue = undefined;
+    if (activeSelectedAccount(state) === account) state.accountTotalValue = undefined;
   }
 }
 
@@ -1450,13 +1539,94 @@ function rebuildPipeline(state: AppState): Promise<void> {
       state.status = `Error: ${String(err)}`;
       throw err;
     }
-    await Promise.all([loadPrefixQuery(state), runSearchFilter(state)]);
+    await loadSelection(state);
     await Promise.all([loadTransactionValues(state), loadAccountTotalValue(state), _loadTreeBaseCurrencyTotals(state)]);
   }).catch(() => { /* status already set */ });
 }
 
+/** How pending edits read the loaded rows: the pane's selection, and where
+ *  each row was imported from — its first leg on a folder-backed account. A
+ *  rule categorises that account's contra leg, and applies to the row when
+ *  the rule's folder holds the row's folder. */
+function editView(state: AppState): EditView {
+  const folders = accountFolders(state);
+  const sourceLeg = (t: Transaction) => t.postings.find((p) => resolveAccountFolderFromMap(folders, p.account));
+  return {
+    selectedAccount: activeSelectedAccount(state),
+    sourceAccountOf: (t) => sourceLeg(t)?.account,
+    sourceFolderOf: (t) => {
+      const leg = sourceLeg(t);
+      return leg && resolveAccountFolderFromMap(folders, leg.account);
+    },
+  };
+}
+
+type OptimisticMutation = {
+  /** Shown over the loaded rows at once. Omitted for a mutation whose effect
+   *  can't be predicted (a rule deleted): it still lands in place. */
+  edit?: NewOptimisticEdit;
+  /** The mutation queue's label — the status while it runs. */
+  label: string;
+  /** Accounts the write introduces, listed at once (see creatingAccounts). */
+  newAccounts?: readonly (string | null | undefined)[];
+  /** The backend write + rebuild. Records the response (noteMutationResponse /
+   *  notePipelineResponse) but does not refresh: landing does that. */
+  write: () => Promise<void>;
+  /** The status once it lands as shown. */
+  done: string;
+  /** Extra rollback when the write fails (re-open an editor, …). */
+  onError?: (err: unknown) => void;
+};
+
+/** A table mutation, optimistically: the edit shows at once; the write and
+ *  rebuild run on the mutation queue; when they land the loaded window is
+ *  re-fetched in place and checked against the edit — rows the rebuild did
+ *  not change as shown flash and the status says the change did not apply.
+ *  A failed write withdraws the edit and shows the rows as the vault has them. */
+function runOptimisticMutation(state: AppState, m: OptimisticMutation): void {
+  const deps: SettleDeps = {
+    refresh: () => refreshAfterRebuild(state),
+    rows: () => state.searchFilteredTransactions ?? [],
+    view: () => editView(state),
+    viewKey: () => selectionRequest(state),
+  };
+  const edit = m.edit ? addOptimisticEdit(state, m.edit, deps.rows(), deps.view()) : undefined;
+  // The latest edit owns the timeline; an earlier one still settling marks on
+  // it too, which is what a burst of edits looks like to the user.
+  const timeline = startEditTimeline(edit?.label ?? m.label, (line) => pushDebug("perf", line));
+  editTimeline = timeline;
+  const release = () => { if (editTimeline === timeline) editTimeline = undefined; };
+  mutationQueue.enqueue(state, m.label, creatingAccounts(state, m.newAccounts ?? [], async () => {
+    try {
+      await m.write();
+      lastWriteLandedAt = performance.now();
+      timeline.mark("write landed");
+    } catch (err) {
+      // Say so before the refresh renders the rows going back; the revert
+      // stays on the queue so its refresh never overlaps the next write.
+      state.status = edit ? `${edit.label} did not apply — ${String(err)}` : `Error: ${String(err)}`;
+      m.onError?.(err);
+      await revertOptimisticEdit(state, edit, deps);
+      timeline.end("write failed, reverted");
+      release();
+      throw err;
+    }
+    const { missed, checked } = await settleOptimisticEdit(state, edit, deps);
+    state.status = edit && missed > 0
+      ? `${edit.label} did not apply to ${missed} of ${checked} row${checked === 1 ? "" : "s"} — showing the rebuilt result`
+      : m.done;
+    timeline.mark("settled");
+    // The render that shows the rebuilt rows is due in the next frame; the
+    // timeline ends once it has run.
+    nextFrame(() => { timeline.end("rows landed"); release(); });
+  })).catch(() => requestRender(state));
+  // The next frame shows the edit, the rebuild strip and the queue's status
+  // together: the queue's own render request rides on the same frame.
+  requestRender(state);
+}
+
 /** Append a manual transaction, then refresh balances and the visible window
- *  via the slim mutation path (no full-ledger IPC — see applyMutationAndRefresh). */
+ *  via the main refresh (no full-ledger IPC — see applyMutationResponse). */
 async function addManualTransaction(state: AppState): Promise<void> {
   const draft = state.manualDraft;
   if (!draft) return;
@@ -1491,22 +1661,24 @@ async function addManualTransaction(state: AppState): Promise<void> {
   state.justAddedTxnIds.add(tempId);
   const savedDraft = draft;
   state.manualDraft = undefined; // close the modal — the row is already visible
-  state.status = "Added manual transaction";
-  render(state);
+  // A new account the postings name is listed at once as well.
+  const persist = creatingAccounts(state, built.postings.map((p) => p.account), async () => {
+    await invoke<MutationResponse>("add_manual_transaction", {
+      nowYyyymm: nowYYYYMM(),
+      input,
+      accountFolder,
+      accountSet: state.selectedAccountSet ?? "",
+    });
+    // The real row is now on disk; drop the temp BEFORE the refresh so the
+    // reload renders the real row in its place (no double-row flash).
+    state.pendingAdds = state.pendingAdds.filter((t) => t !== tempTxn);
+    await loadGeneratedLedger(state, { silent: true });
+    // The queue showed its label while this ran and leaves it there.
+    state.status = "Added manual transaction";
+  });
 
   mutationQueue
-    .enqueue(state, "Adding transaction…", async () => {
-      await invoke<MutationResponse>("add_manual_transaction", {
-        nowYyyymm: nowYYYYMM(),
-        input,
-        accountFolder,
-        accountSet: state.selectedAccountSet ?? "",
-      });
-      // The real row is now on disk; drop the temp BEFORE the refresh so the
-      // reload renders the real row in its place (no double-row flash).
-      state.pendingAdds = state.pendingAdds.filter((t) => t !== tempTxn);
-      await loadGeneratedLedger(state, { silent: true });
-    })
+    .enqueue(state, "Adding transaction…", persist)
     .catch((err) => {
       // Rollback: removing the temp also reverts its render-time balance delta.
       state.pendingAdds = state.pendingAdds.filter((t) => t !== tempTxn);
@@ -1514,6 +1686,8 @@ async function addManualTransaction(state: AppState): Promise<void> {
       state.status = `Error: ${String(err)}`;
       render(state);
     });
+  // Render in this frame, after enqueue so the queue's status shows with the row.
+  render(state);
 }
 
 // Auto-prefix with the selected Account Type — user just types "ethereum"
@@ -1660,7 +1834,7 @@ async function addAccountDeclaration(state: AppState): Promise<void> {
         accountFolder,
         accountSet: state.selectedAccountSet ?? "",
       });
-      await applyMutationAndRefresh(state, importResp);
+      await applyMutationResponse(state, importResp);
       state.status = `Added account & imported file`;
     } else {
       state.transformDraft = {
@@ -1708,6 +1882,63 @@ function renderVaultPicker(state: AppState): string {
       </div>`;
 }
 
+/** Save the Global Settings draft of the clearing list. It is vault data
+ *  (generated/config.json, often tracked in git), so it is written only when it
+ *  changed. True when a new list was saved. */
+async function saveClearingAccountsDraft(state: AppState): Promise<boolean> {
+  const draft = state.clearingAccountsDraft;
+  if (draft === undefined || draft.join("\n") === (state.clearingAccounts ?? []).join("\n")) return false;
+  try {
+    state.clearingAccounts = await invoke<string[]>("set_clearing_accounts", { accounts: draft });
+    // The issues cache is keyed on the list: refetch so the Issues panel and
+    // the sidebar badges follow without a rebuild. A full scan takes ~20 s on a
+    // large vault, so it lands in the background instead of holding the dialog.
+    void refreshIssuesCache()
+      .then(() => render(state))
+      .catch((e) => pushDebug("error", `issues refresh failed: ${e}`));
+    return true;
+  } catch (err) {
+    console.error("Failed to save clearing accounts:", err);
+    return false;
+  }
+}
+
+/** Save the Global Settings draft of "Show all holdings" when it changed.
+ *  True when it was saved. */
+async function saveShowAllHoldingsDraft(state: AppState): Promise<boolean> {
+  const draft = state.showAllHoldingsDraft;
+  if (draft === undefined || draft === (state.showAllHoldings ?? false)) return false;
+  try {
+    await invoke("set_show_all_holdings", { enabled: draft });
+    state.showAllHoldings = draft;
+    return true;
+  } catch (err) {
+    console.error("Failed to save Show all holdings:", err);
+    return false;
+  }
+}
+
+/** Close Global Settings, discarding every working copy. */
+function closeGlobalSettings(state: AppState): void {
+  state.globalSettingsOpen = false;
+  state.globalSettingsDraft = undefined;
+  state.showAllHoldingsDraft = undefined;
+  state.clearingAccountsDraft = undefined;
+  state.aiSettingsDraft = undefined;
+  state.termsDraft = undefined;
+}
+
+/** The Accounts pane's rows that count toward no balance: holdings "Show all
+ *  holdings" reveals outside "Accounts included in balance". None while it is
+ *  off — every listed account is then folder-backed. */
+function accountsOutsideBalance(state: AppState): OutsideBalanceRows | undefined {
+  if (!state.showAllHoldings) return undefined;
+  const folderBacked = folderBackedAccounts(state.accountFoldersMap);
+  const prefixes = state.extraPrimaryAccountPrefixes ?? [];
+  const included = (account: string) => isIncludedInBalance(account, folderBacked, prefixes);
+  return { isOutside: (node) => isOutsideBalance(node, included), totals: state.categoryBaseTotals };
+}
+
 function renderAccountsSidebarContent(state: AppState, tree: TreeNode[], selectedAccount: string | undefined, issueCounts: Map<string, number>): string {
   const setLabel = state.accountSets.length > 0
     ? state.selectedAccountSet ?? state.accountSets[0]
@@ -1718,7 +1949,7 @@ function renderAccountsSidebarContent(state: AppState, tree: TreeNode[], selecte
     ? `<button type="button" class="accountSetLabel${rootActive ? " accountSetLabel--active" : ""}" data-testid="sidebar-folder-root" data-folder-root="1">${escapeText(setLabelDisplay)}</button>`
     : "";
   return `<div class="sidebar__title">${rootButton}</div>
-      <div class="accounts ${state.drillPath.length > 0 ? "accounts--drilled" : ""}" role="list">${renderDrillDown(tree, "accounts", state.drillPath, selectedAccount, issueCounts, state.treeBaseTotals, state.displayConfig?.base_currency)}</div>
+      <div class="accounts ${state.drillPath.length > 0 ? "accounts--drilled" : ""}" role="list">${renderDrillDown(tree, "accounts", state.drillPath, selectedAccount, issueCounts, state.treeBaseTotals, state.displayConfig?.base_currency, accountsOutsideBalance(state))}</div>
       <button id="addAccountBtn" class="btn btn--secondary btn--full" type="button" data-testid="add-account-btn" style="margin-top:8px" ${state.busy ? "disabled" : ""}>+ Add Account</button>`;
 }
 
@@ -1727,9 +1958,9 @@ function renderSidebarContent(state: AppState, tree: TreeNode[], selectedAccount
     return renderAccountsSidebarContent(state, tree, selectedAccount, issueCounts);
   }
   if (state.sidebarView === "categories") {
-    // Non-folder-backed accounts (income/expenses/equity/liabilities + asset
-    // contras), rendered as a multi-root drill-down (every tree root is a
-    // level-0 entry). No "Add Account" — categories aren't folder-backed.
+    // Income and expenses (+ ignore while Show Ignored is on), rendered as a
+    // multi-root drill-down (every tree root is a level-0 entry). No "Add
+    // Account" — categories aren't folder-backed.
     return `<div class="sidebar__title"><span class="accountSetLabel accountSetLabel--static">Categories</span></div>
       <div class="accounts ${state.categoryDrillPath.length > 0 ? "accounts--drilled" : ""}" role="list">${renderDrillDown(tree, "categories", state.categoryDrillPath, selectedAccount, issueCounts, state.categoryBaseTotals, state.displayConfig?.base_currency)}</div>`;
   }
@@ -1766,43 +1997,6 @@ function renderSidebar(state: AppState, tree: TreeNode[], selectedAccount: strin
     <div class="sidebar__section">${renderSidebarContent(state, tree, selectedAccount, issueCounts)}</div>
     <div class="sidebar__bottom"><button id="globalSettingsBtn" class="sidebarSettingsBtn" type="button" title="Global Settings">⚙ Settings</button>${dataFolderHtml}${syncUi?.renderSidebar() ?? ""}</div>
   </aside>`;
-}
-
-function renderTxnDetailRow(
-  t: Transaction,
-  txnId: string,
-  expandKey: string,
-  accountFolder: string,
-  explorerUrl: string | undefined,
-  colSpan: number,
-): string {
-  const rawId = txnId.startsWith("txn:") ? txnId.slice(4) : txnId;
-  const txnLink = explorerUrl && rawId
-    ? `<a class="txDetail__link" data-open-explorer="${escapeText(explorerUrl.replace("{txn_id}", rawId))}">${escapeText(rawId)}</a>`
-    : `<span class="txDetail__hash">${escapeText(rawId || "—")}</span>`;
-
-  const postingsHtml = t.postings
-    .map(
-      (p) =>
-        `<div class="txDetail__posting"><span class="txDetail__postingAccount">${escapeText(p.account)}</span> <span class="txDetail__postingAmount">${escapeText(String(p.amount))} ${escapeText(p.commodity)}</span></div>`,
-    )
-    .join("");
-
-  return `<tr class="txRow__detail" data-txn-detail-for="${escapeText(expandKey)}">
-    <td colspan="${colSpan}">
-      <div class="txDetail">
-        <div class="txDetail__row"><span class="txDetail__label">Txn ID</span>${txnLink}</div>
-        <div class="txDetail__row"><span class="txDetail__label">Payee</span><span>${escapeText(t.payee ?? "—")}</span></div>
-        <div class="txDetail__row"><span class="txDetail__label">Meta</span><span>${escapeText(t.meta ?? "—")}</span></div>
-        <div class="txDetail__row"><span class="txDetail__label">Source</span><span>${escapeText(accountFolder || "—")}</span></div>
-        <div class="txDetail__row txDetail__row--postings"><span class="txDetail__label">Postings</span><div>${postingsHtml}</div></div>
-        <div class="txDetail__actions">
-          <button class="btn btn--small txDetail__ruleBtn" data-edit-rule-from-detail="${escapeText(expandKey)}">Edit Rule</button>
-          <button class="btn btn--small txDetail__partyBtn" data-edit-party-from-detail="${escapeText(expandKey)}">Edit Party</button>
-        </div>
-      </div>
-    </td>
-  </tr>`;
 }
 
 /** One in-scope posting leg, pre-formatted for the amount cell. A row usually
@@ -1855,14 +2049,11 @@ const EMPTY_LEG: DisplayLeg = {
 };
 
 function makeDisplayLeg(p: Posting, selectedAccount: string | undefined): DisplayLeg {
-  const isOutgoing = p.amount < 0;
-  const childSuffix = selectedAccount && p.account !== selectedAccount
-    ? p.account.slice(selectedAccount.length + 1)
-    : "";
+  const isOutgoing = flowAmount(p.amount, selectedAccount) < 0;
   return {
     amount: p.amount,
     commodity: p.commodity,
-    childSuffix,
+    childSuffix: subAccountLabel(p.account, selectedAccount),
     amountDisplay: p.amount !== 0 ? formatAmount(Math.abs(p.amount), p.commodity) : "0",
     dirClass: isOutgoing ? "amount--out" : "amount--in",
     dirArrow: isOutgoing ? "→" : "←",
@@ -1963,11 +2154,9 @@ function buildTxnRowContext(
 ): TxnRowContext | null {
   const txnId = txnIdFromMeta(t.meta);
   const legId = legIdFromMeta(t.meta);
-  // Prefer the per-leg id as the expand/row key. Sibling legs of one on-chain
-  // tx share txn+datetime+amount+narration, so the legacy tuple collides and
-  // morphdom (which keys row identity on data-expand-key) collapses the pair;
-  // the leg id is unique per leg. Falls back to the tuple for single-leg rows.
-  const expandKey = legId || (txnId ? `${txnId}|${t.datetime}|${t.amount}|${t.narration ?? ""}` : "");
+  // The expand/row key: morphdom keys row identity on data-expand-key, and the
+  // optimistic-edit flashes find rows by it (see txnRowKey).
+  const expandKey = txnRowKey(t);
   const isExpanded = !!(expandKey && state.txExpandedRows?.has(expandKey));
   const detailColSpan = showValueColumn ? 7 : 6;
 
@@ -1991,19 +2180,26 @@ function renderPayeeCell(t: Transaction): string {
     : `<span class="copyable" data-copy="${escapeText(t.payee ?? "")}" title="Right-click to copy">${escapeText(shortAddress(t.payee ?? ""))}</span>`;
 }
 
+/** The colour of `amount` viewed under `account`: red when it flows out, green
+ *  when it flows in (see `flowAmount` for income's flipped sign). */
+function flowDirClass(amount: number, account: string | undefined): "amount--out" | "amount--in" {
+  return flowAmount(amount, account) < 0 ? "amount--out" : "amount--in";
+}
+
 /** The Value cell: the row's base-currency value, carrying the basis it was
  *  summed from as its tooltip and `data-value-basis`, and \u2014 for the Set Price
  *  modal it opens \u2014 the commodity whose rate the value actually used (the
  *  currency of a leg priced in USD, the held commodity of an unpriced leg) and
  *  the date that rate was looked up at. A row with no value yet opens the
  *  modal for its own commodity and date. `directional` colours the cell by
- *  the value's sign; a swap row shows a single magnitude. */
+ *  the value's flow for the row's account (see `flowAmount`); a swap row
+ *  passes false and shows a single magnitude. */
 function renderValueCellHtml(
   txnValue: TxnValue | undefined,
   rowCommodity: string,
   rowDatetime: string,
   baseCurrency: string,
-  directional: boolean,
+  directional: false | { account: string | undefined },
 ): string {
   const basis = txnValue ? describeValueBasis(txnValue, baseCurrency) : "";
   const commodity = (txnValue && valueRateCommodity(txnValue)) ?? rowCommodity;
@@ -2012,7 +2208,7 @@ function renderValueCellHtml(
   const attrs = `data-value-commodity="${escapeText(commodity)}" data-value-datetime="${escapeText(datetime)}" data-value-basis="${escapeText(basis)}"${tooltip}`;
   const val = txnValue?.value;
   if (val === undefined || val === null) return `<td class="num value-clickable" ${attrs}>\u2014</td>`;
-  const dirClass = directional ? (val < 0 ? " amount--out" : " amount--in") : "";
+  const dirClass = directional ? ` ${flowDirClass(val, directional.account)}` : "";
   return `<td class="num${dirClass} value-clickable" ${attrs}>${escapeText(formatAmount(Math.abs(val), baseCurrency))} <span class="amount__currency">${escapeText(baseCurrency)}</span></td>`;
 }
 
@@ -2022,9 +2218,10 @@ function buildValueCellHtml(
   showValueColumn: boolean,
   baseCurrency: string | undefined,
   commodity: string,
+  account: string | undefined,
 ): string {
   if (!showValueColumn || !baseCurrency) return "";
-  return renderValueCellHtml(state.transactionValues?.get(txnValueKey(t)), commodity, t.datetime, baseCurrency, true);
+  return renderValueCellHtml(state.transactionValues?.get(txnValueKey(t)), commodity, t.datetime, baseCurrency, { account });
 }
 
 function buildSwapValueCellHtml(
@@ -2062,7 +2259,7 @@ function renderSwapRowHtml(
   const partner = computePostingContext(partnerTxn!, selectedAccount);
   const swapValueCellHtml = buildSwapValueCellHtml(t, partnerTxn!, state, showValueColumn, baseCurrency, commodity);
 
-  const detailHtml = isExpanded ? renderTxnDetailRow(t, txnId, expandKey, accountFolder, explorerUrl, detailColSpan) : "";
+  const detailHtml = isExpanded ? renderTxnDetailRow(t, txnId, expandKey, accountFolder, explorerUrl, detailColSpan, { rule: false, party: false }) : "";
   return `
                             <tr data-testid="txn-row" data-txn-row-id="${escapeText(txnId)}" data-leg-id="${escapeText(legId)}" data-expand-key="${escapeText(expandKey)}" class="txRow--swap">
                               <td>${formatDateCell(t)}</td>
@@ -2130,6 +2327,12 @@ function renderTxnActionsCell(ctx: TxnRowContext, state: AppState, chainBtnHtml:
     title="AI suggest category"
     ${state.busy ? "disabled" : ""}
   ><svg class="ai-sparkle-svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0l2.4 9.6L24 12l-9.6 2.4L12 24l-2.4-9.6L0 12l9.6-2.4z"/></svg></button>` : "";
+  // A row "Hide" sent to ignore:hidden (shown under Show Ignored) offers
+  // Unhide instead: hiding it again would do nothing.
+  if (t.postings.some((p) => p.account === HIDDEN_ACCOUNT) && txnId) {
+    const unhideBtn = `<button class="txn-unhide-btn" data-testid="txn-unhide" data-txn-id="${escapeText(txnId)}" title="Unhide transaction">&#x21BA;</button>`;
+    return `<td class="txn-actions-col">${aiBtn}${unhideBtn}${chainBtnHtml}</td>`;
+  }
   const deleteBtn = `<button
     class="txn-delete-btn"
     data-testid="txn-delete"
@@ -2174,17 +2377,18 @@ function renderCategoryCellHtml(ctx: TxnRowContext): string {
 function renderNormalRowHtml(
   ctx: TxnRowContext,
   state: AppState,
+  selectedAccount: string | undefined,
   showValueColumn: boolean,
   baseCurrency: string | undefined,
   chainInfo?: { txnIdB: string; isLinked: boolean; accountFolder: string; isASell: boolean },
 ): string {
   const { t, txnId, legId, expandKey, isExpanded, detailColSpan, commodity, accountFolder, explorerUrl, feePosting } = ctx;
 
-  const valueCellHtml = buildValueCellHtml(t, state, showValueColumn, baseCurrency, commodity);
+  const valueCellHtml = buildValueCellHtml(t, state, showValueColumn, baseCurrency, commodity, selectedAccount);
   const chainBtnHtml = buildChainBtnHtml(txnId, chainInfo);
   const rowClasses = withFadeInClass(buildRowClasses(ctx, !!chainInfo), txnId, state.justAddedTxnIds);
   const feeHtml = feePosting ? `<div class="fee-line">fee ${escapeText(formatAmountSmart(feePosting.amount))} <span class="amount__currency">${highlightNonAscii(escapeText(feePosting.commodity))}</span></div>` : "";
-  const detailHtml = isExpanded ? renderTxnDetailRow(t, txnId, expandKey, accountFolder, explorerUrl, detailColSpan) : "";
+  const detailHtml = isExpanded ? renderTxnDetailRow(t, txnId, expandKey, accountFolder, explorerUrl, detailColSpan, { rule: !ctx.isTrade, party: true }) : "";
 
   return `
                             <tr data-testid="txn-row" data-txn-row-id="${escapeText(txnId)}" data-leg-id="${escapeText(legId)}" data-expand-key="${escapeText(expandKey)}" class="${rowClasses}">
@@ -2227,7 +2431,7 @@ function renderTransactionRows(
       if (ctx.linkInfo && ctx.partnerTxn) {
         return renderSwapRowHtml(ctx, state, selectedAccount, showValueColumn, baseCurrency);
       }
-      return renderNormalRowHtml(ctx, state, showValueColumn, baseCurrency, chainInfo);
+      return renderNormalRowHtml(ctx, state, selectedAccount, showValueColumn, baseCurrency, chainInfo);
     })
     .join("");
 }
@@ -2242,7 +2446,13 @@ function buildGroupCategoryDisplay(g: TxGroup, selectedAccount: string | undefin
 
 /** The aggregated group header's Value: the sum of its rows' values, keyed
  *  the same way the rows are (`txnValueKey`). */
-function buildGroupValueCellHtml(g: TxGroup, state: AppState, showValueColumn: boolean, baseCurrency: string | undefined): string {
+function buildGroupValueCellHtml(
+  g: TxGroup,
+  state: AppState,
+  selectedAccount: string | undefined,
+  showValueColumn: boolean,
+  baseCurrency: string | undefined,
+): string {
   if (!showValueColumn || !baseCurrency) return "";
   let totalValue = 0;
   let hasValue = false;
@@ -2251,8 +2461,7 @@ function buildGroupValueCellHtml(g: TxGroup, state: AppState, showValueColumn: b
     if (val != null) { totalValue += val; hasValue = true; }
   }
   if (hasValue) {
-    const valDirClass = totalValue < 0 ? "amount--out" : "amount--in";
-    return `<td class="num ${valDirClass}">${escapeText(formatAmount(Math.abs(totalValue), baseCurrency))} <span class="amount__currency">${escapeText(baseCurrency)}</span></td>`;
+    return `<td class="num ${flowDirClass(totalValue, selectedAccount)}">${escapeText(formatAmount(Math.abs(totalValue), baseCurrency))} <span class="amount__currency">${escapeText(baseCurrency)}</span></td>`;
   }
   return `<td class="num">\u2014</td>`;
 }
@@ -2299,7 +2508,7 @@ function renderGroupHeaderRow(
   const netDisplay = formatAmount(Math.abs(g.netAmount), g.commodity);
   const toggleIcon = expanded ? "\u2212" : "+";
   const categoryDisplay = buildGroupCategoryDisplay(g, selectedAccount);
-  const valueCellHtml = buildGroupValueCellHtml(g, state, showValueColumn, baseCurrency);
+  const valueCellHtml = buildGroupValueCellHtml(g, state, selectedAccount, showValueColumn, baseCurrency);
   const groupChainBtnHtml = buildGroupChainBtnHtml(g, itemIdx, items, groupPairIndices, state, selectedAccount);
   const isPair = groupPairIndices.has(itemIdx) || groupPairIndices.has(itemIdx - 1);
 
@@ -2569,10 +2778,10 @@ function renderTransformAiStatus(td: NonNullable<AppState["transformDraft"]>): s
     return `<div class="aiModal__steps" style="margin-bottom:8px">${(td.aiSteps ?? []).map((s, i) => { const isLast = i === (td.aiSteps ?? []).length - 1; return `<div class="aiModal__step ${isLast ? "aiModal__step--active" : "aiModal__step--done"}"><span class="aiModal__stepIcon">${isLast ? '<span class="aiModal__spinner"></span>' : "\u2713"}</span>${escapeText(s)}</div>`; }).join("")}</div>`;
   }
   if (td.aiStatus === "done") {
-    return `<div style="font-size:12px;color:#059669;margin-bottom:8px">\u2713 AI generated transform — review and edit as needed</div>`;
+    return `<div style="font-size:var(--text-sm);color:#059669;margin-bottom:8px">\u2713 AI generated transform — review and edit as needed</div>`;
   }
   if (td.aiStatus === "error") {
-    return `<div class="modal__error">${escapeText(td.aiError ?? "AI generation failed")}</div>${td.aiRawOutput ? `<details style="margin-bottom:8px"><summary style="font-size:12px;cursor:pointer">AI output</summary><pre style="font-size:11px;max-height:150px;overflow:auto;background:#1a1a2e;color:#e0e0e0;padding:8px;border-radius:4px">${escapeText(td.aiRawOutput)}</pre></details>` : ""}`;
+    return `<div class="modal__error">${escapeText(td.aiError ?? "AI generation failed")}</div>${td.aiRawOutput ? `<details style="margin-bottom:8px"><summary style="font-size:var(--text-sm);cursor:pointer">AI output</summary><pre style="font-size:var(--text-xs);max-height:150px;overflow:auto;background:#1a1a2e;color:#e0e0e0;padding:8px;border-radius:4px">${escapeText(td.aiRawOutput)}</pre></details>` : ""}`;
   }
   return "";
 }
@@ -2581,7 +2790,7 @@ function renderTransformCsvInfo(td: NonNullable<AppState["transformDraft"]>): st
   let html = "";
   if (td.csvFilename) html += `<div class="modal__subtitle">Importing: ${escapeText(td.csvFilename)}</div>`;
   if (td.headers.length > 0) html += `<div class="modal__headers">Available columns: <code>${td.headers.map(h => escapeText(h)).join("</code>, <code>")}</code></div>`;
-  if (td.csvTypes && td.csvTypes.length > 1) html += `<div class="modal__info" style="font-size:12px;color:#6b7280;margin-bottom:8px">Detected ${td.csvTypes.length} CSV formats: ${td.csvTypes.map(t => `<strong>${escapeText(t.pattern)}</strong> (${t.file_count} file${t.file_count === 1 ? "" : "s"})`).join(", ")}</div>`;
+  if (td.csvTypes && td.csvTypes.length > 1) html += `<div class="modal__info" style="font-size:var(--text-sm);color:#6b7280;margin-bottom:8px">Detected ${td.csvTypes.length} CSV formats: ${td.csvTypes.map(t => `<strong>${escapeText(t.pattern)}</strong> (${t.file_count} file${t.file_count === 1 ? "" : "s"})`).join(", ")}</div>`;
   return html;
 }
 
@@ -2625,7 +2834,7 @@ function renderAiSuggestModal(state: AppState): string {
         <div class="aiModal__suggestionHeader"><span class="aiModal__suggestionPattern">${escapeText(s.pattern)}</span><span class="aiModal__suggestionArrow">\u2192</span><span class="aiModal__suggestionAccount">${escapeText(s.amount_account)}</span></div>
         ${s.payee ? `<div class="aiModal__suggestionPayee">Payee: ${escapeText(s.payee)}</div>` : ""}
         <div class="aiModal__suggestionExplanation">${escapeText(s.explanation)}</div>
-        <div class="aiModal__suggestionActions">${ai.appliedIndices?.has(i) ? `<span style="color:#059669;font-size:12px">\u2713 Applied</span>` : `<button class="btn btn--small" data-ai-apply="${i}">Edit Rule</button><button class="btn btn--secondary btn--small" data-ai-skip="${i}">Skip</button>`}</div>
+        <div class="aiModal__suggestionActions">${ai.appliedIndices?.has(i) ? `<span style="color:#059669;font-size:var(--text-sm)">\u2713 Applied</span>` : `<button class="btn btn--small" data-ai-apply="${i}">Edit Rule</button><button class="btn btn--secondary btn--small" data-ai-skip="${i}">Skip</button>`}</div>
       </div>`).join("")}</div>
     ${(ai.suggestions ?? []).length === 0 ? `<div style="color:#6b7280;padding:12px">No suggestions were generated.</div>` : ""}
     ${ai.rawOutput ? `<details class="aiModal__rawOutput"><summary>AI output</summary><pre class="aiModal__rawPre">${escapeText(ai.rawOutput)}</pre></details>` : ""}`;
@@ -2805,6 +3014,23 @@ function readAndBuildRule(draft: AppState["ruleEditorDraft"] & {}) {
   }, parseSmartInput, toFlatString, ruleKeywords);
 }
 
+/** A saved rule in the shape the preview matcher reads (absent = undefined). */
+function savedRuleInfo(id: string, saved: ReturnType<typeof buildRuleFromDraft>): RuleInfo {
+  return {
+    id,
+    pattern: saved.pattern,
+    match_field: saved.match_field ?? undefined,
+    amount_condition: saved.amount_condition ?? undefined,
+    fee_condition: saved.fee_condition ?? undefined,
+    payee_condition: saved.payee_condition ?? undefined,
+    narration_condition: saved.narration_condition ?? undefined,
+    commodity_condition: saved.commodity_condition ?? undefined,
+    meta_condition: saved.meta_condition ?? undefined,
+    amount_account: saved.amount_account ?? undefined,
+    fee_account: saved.fee_account ?? undefined,
+  };
+}
+
 async function invokeRuleSave(
   draft: AppState["ruleEditorDraft"] & {},
   saved: ReturnType<typeof buildRuleFromDraft>,
@@ -2821,17 +3047,6 @@ async function invokeRuleSave(
   const targetFolder = targetFolderForScope(draft.accountFolder, draft.ruleScope);
   return invoke<MutationResponse>("save_rule",
     buildSaveRuleArgs(saved, targetFolder, accountSet, nowYYYYMM()));
-}
-
-function restoreFocusAfterRender(activeId: string | undefined, cursorPos: number | null): void {
-  const toFocus = activeId ? document.getElementById(activeId) : null;
-  if (toFocus && toFocus instanceof HTMLInputElement) {
-    toFocus.focus();
-    if (cursorPos != null) {
-      const pos = Math.min(cursorPos, toFocus.value.length);
-      toFocus.selectionStart = toFocus.selectionEnd = pos;
-    }
-  }
 }
 
 type RenderViewState = {
@@ -2873,7 +3088,12 @@ function resolveSelectedAccount(state: AppState, balances: AccountBalance[], tre
 }
 
 function computeTransactionViewState(state: AppState, selectedAccount: string | undefined, baseCurrency: string | undefined) {
-  const realTxns = state.searchFilteredTransactions ?? [];
+  const loaded = state.searchFilteredTransactions ?? [];
+  // Pending optimistic edits (re-categorise, rename, hide, unhide) apply over
+  // the loaded window until their rebuild lands; see optimistic-edits.ts.
+  const realTxns = state.pendingEdits.length > 0
+    ? applyOptimisticEdits(loaded, state.pendingEdits, editView(state))
+    : loaded;
   // Splice optimistic adds (this account, not yet superseded by a real row) in
   // front of the loaded window so a newly-added txn shows instantly.
   const allTransactions = [...pendingAddsForView(state.pendingAdds, selectedAccount, realTxns), ...realTxns];
@@ -2898,20 +3118,30 @@ function computeTransactionViewState(state: AppState, selectedAccount: string | 
   return { allTransactions, searchFiltered: allTransactions, filteredTransactions, tradeLinkMap, uncategorisedCount, showValueColumn, isUncategorisedTxn };
 }
 
-/** Pick the balances/tree/selection for the active left-pane (Accounts vs the
- *  Categories complement partition) and lazily initialise its drill path. The
- *  Categories pane reuses the entire accounts render path over a different
- *  partition + selection slice, so surfacing them here keeps the topbar, header,
- *  drill-down and transaction table free of pane branching. */
+/** The balances the active left-pane lists: the Accounts pane's holdings or the
+ *  Categories pane's income and expenses. */
+function activePaneBalances(state: AppState): AccountBalance[] {
+  // An account a mutation in flight is writing is listed at once, its totals
+  // to come with the refresh.
+  const all = withPendingBalances(state.parse?.balances ?? [], state.pendingAccounts);
+  if (state.sidebarView === "categories") return filterCategoryBalances(all, state.showHidden);
+  const owned = withPendingOwned(state.accountSetMap, state.selectedAccountSet, state.pendingAccounts);
+  return filterSidebarBalances(all, state.accountFoldersMap, owned, state.selectedAccountSet, {
+    showAllHoldings: state.showAllHoldings,
+    clearingAccounts: state.clearingAccounts,
+  });
+}
+
+/** Pick the balances/tree/selection for the active left-pane (Accounts vs
+ *  Categories) and lazily initialise its drill path. The Categories pane reuses
+ *  the entire accounts render path over a different partition + selection
+ *  slice, so surfacing them here keeps the topbar, header, drill-down and
+ *  transaction table free of pane branching. */
 function resolveActivePartition(
   state: AppState,
 ): { balances: AccountBalance[]; tree: TreeNode[]; selectedAccount: string | undefined } {
   const isCategoriesView = state.sidebarView === "categories";
-  const balances = isCategoriesView
-    ? filterCategoryBalances(state.parse?.balances ?? [], state.accountFoldersMap, state.showHidden)
-    : filterSidebarBalances(
-        state.parse?.balances ?? [], state.accountFoldersMap, state.accountSetMap, state.selectedAccountSet,
-      );
+  const balances = activePaneBalances(state);
   // The Accounts pane always has the entity root (its root folder view);
   // Categories build every root on demand.
   const tree = buildAccountTree(balances, isCategoriesView ? [] : [ROOT_FOLDER_PATH]);
@@ -2975,6 +3205,7 @@ function collectAccountSuggestionsFrom(state: AppState): string[] {
     balances: state.parse?.balances,
     transactions: state.parse?.transactions,
     allAccounts: state.allAccounts,
+    pendingAccounts: state.pendingAccounts,
   });
 }
 
@@ -3149,13 +3380,14 @@ function render(state: AppState): void {
       : "Pick a file to begin.");
 
   if (renderSetupGate(state)) return;
+  noteRender();
 
   let html: string;
   try {
     html = buildMainHtml(state, vs, statusText, diagnostics);
   } catch (renderErr) {
     console.error("Render failed:", renderErr);
-    app.innerHTML = `<div style="padding:24px;color:red;font-family:monospace;white-space:pre-wrap"><h2>Render Error</h2>${String(renderErr)}\n${(renderErr as Error)?.stack ?? ""}</div>`;
+    app.innerHTML = `<div style="padding:24px;color:red;font-family:var(--font-mono);white-space:pre-wrap"><h2>Render Error</h2>${String(renderErr)}\n${(renderErr as Error)?.stack ?? ""}</div>`;
     return;
   }
 
@@ -3189,6 +3421,9 @@ function render(state: AppState): void {
   // The fade-in animation is one-shot — clear the set so subsequent renders
   // (scroll, sort, filter) don't re-fade rows that already settled in.
   state.justAddedTxnIds = undefined;
+  // Same for the optimistic-edit flashes, played on the rows just rendered.
+  playRowFlashes(app, state.rowFlashes);
+  state.rowFlashes = undefined;
 }
 
 // Non-intrusive DOM diff: unchanged nodes stay put, preserving focus,
@@ -3310,14 +3545,11 @@ function buildAccountsTopbar(state: AppState, vs: RenderViewState, statusText: s
 function buildTxTableBody(state: AppState, vs: RenderViewState): string {
   const { selectedAccount, allTransactions, filteredTransactions, tradeLinkMap,
     showValueColumn, isUncategorisedTxn, baseCurrency } = vs;
-  // Truly optimistic delete: txns the user has clicked but the pipeline
-  // hasn't yet processed are filtered out of the rendered list entirely.
-  // Without this, rapid clicks accumulate as faded rows occupying space
-  // until the pipeline catches up.
-  const visible = filterPendingDeletes(filteredTransactions, state.pendingDeletes);
+  // Rows hidden or deleted optimistically are already gone from
+  // filteredTransactions (computeTransactionViewState applies pendingEdits).
   const sorted = state.txSort && shouldClientSortLoadedTransactions(state.txSort)
-    ? sortTransactions(visible, state.txSort, selectedAccount)
-    : visible;
+    ? sortTransactions(filteredTransactions, state.txSort, selectedAccount)
+    : filteredTransactions;
   const expandedGroups = state.txExpandedGroups ?? new Set<string>();
   const pageSize = Math.max(1, sorted.length);
   const { items } = paginateWithGroups(sorted, selectedAccount, tradeLinkMap, expandedGroups, pageSize);
@@ -3941,7 +4173,7 @@ function attachReportNavHandlers(state: AppState, vs: RenderViewState): void {
         pushNav(state);
         updateNavFlags(state);
         render(state);
-        void Promise.all([loadPrefixQuery(state), runSearchFilter(state)]).then(() => render(state));
+        void loadSelection(state).then(() => render(state));
         return;
       }
       if (view === "categories") {
@@ -3954,10 +4186,12 @@ function attachReportNavHandlers(state: AppState, vs: RenderViewState): void {
         state.searchFilteredCount = undefined;
         state.searchFilteredOffset = undefined;
         state.txWindowStart = 0;
+        // The header reads prefixQuery, still the Accounts selection's answer.
+        state.prefixQuery = undefined;
         pushNav(state);
         updateNavFlags(state);
         render(state);
-        void Promise.all([runSearchFilter(state)]).then(() => {
+        void loadSelection(state).then(() => {
           render(state);
           return Promise.all([loadTransactionValues(state), loadAccountTotalValue(state)]);
         }).then(() => render(state));
@@ -4182,18 +4416,14 @@ function attachReportNavHandlers(state: AppState, vs: RenderViewState): void {
     if (!from || !to) return;
     state.reportDateFrom = from;
     state.reportDateTo = to;
-    await loadCustomReport(state);
+    await loadReport(state);
     render(state);
   });
 
   // Base account scope
   document.querySelector("#reportBaseScope")?.addEventListener("change", async (e) => {
     state.reportBaseScope = (e.target as HTMLInputElement).value || undefined;
-    if (state.reportDateMode === "custom") {
-      await loadCustomReport(state);
-    } else {
-      await loadReport(state);
-    }
+    await loadReport(state);
     render(state);
   });
 
@@ -4298,6 +4528,11 @@ function attachReportNavHandlers(state: AppState, vs: RenderViewState): void {
   // discards and Save persists).
   document.querySelector("#globalSettingsBtn")?.addEventListener("click", async () => {
     state.globalSettingsDraft = [...(state.extraPrimaryAccountPrefixes ?? [])];
+    // The clearing list and Show all holdings get a working copy only once
+    // edited: until then the dialog shows the values in force, even one that
+    // is still loading when the dialog opens, and Save leaves them alone.
+    state.showAllHoldingsDraft = undefined;
+    state.clearingAccountsDraft = undefined;
     state.aiSettingsDraft = { apiUrl: "", apiKey: "", model: "", reasoningEffort: "", userName: "" };
     state.termsDraft = overridesOf(state.terms ?? defaultTerms());
     state.globalSettingsOpen = true;
@@ -4359,33 +4594,47 @@ function attachReportNavHandlers(state: AppState, vs: RenderViewState): void {
     });
   });
 
-  // Add the input value to the draft (trimmed, de-duplicated, non-empty).
-  const addGlobalPrefix = () => {
-    const input = document.querySelector<HTMLInputElement>("#globalPrefixInput");
-    const value = input?.value.trim() ?? "";
-    if (!value) return;
-    const draft = state.globalSettingsDraft ?? [];
-    if (!draft.includes(value)) draft.push(value);
-    state.globalSettingsDraft = draft;
-    render(state);
-  };
-  document.querySelector("#globalPrefixAdd")?.addEventListener("click", addGlobalPrefix);
-  document
-    .querySelector<HTMLInputElement>("#globalPrefixInput")
-    ?.addEventListener("keydown", (e) => {
+  // A Global Settings account list (renderAccountListEditor): Add (button or
+  // Enter) puts the trimmed input into the draft once; ✕ drops its row.
+  const bindAccountListEditor = (
+    ids: { input: string; add: string; removeAttr: string },
+    draft: { get: () => string[]; set: (next: string[]) => void },
+  ) => {
+    const add = () => {
+      const value = document.querySelector<HTMLInputElement>(ids.input)?.value.trim() ?? "";
+      if (!value) return;
+      const current = draft.get();
+      if (!current.includes(value)) draft.set([...current, value]);
+      render(state);
+    };
+    document.querySelector(ids.add)?.addEventListener("click", add);
+    document.querySelector<HTMLInputElement>(ids.input)?.addEventListener("keydown", (e) => {
       if (e.key === "Enter") {
         e.preventDefault();
-        addGlobalPrefix();
+        add();
       }
     });
-
-  // Remove a prefix from the draft.
-  document.querySelectorAll<HTMLButtonElement>("[data-prefix-remove]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const target = btn.getAttribute("data-prefix-remove");
-      state.globalSettingsDraft = (state.globalSettingsDraft ?? []).filter((p) => p !== target);
-      render(state);
+    document.querySelectorAll<HTMLButtonElement>(`[${ids.removeAttr}]`).forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const target = btn.getAttribute(ids.removeAttr);
+        draft.set(draft.get().filter((a) => a !== target));
+        render(state);
+      });
     });
+  };
+  bindAccountListEditor(
+    { input: "#globalPrefixInput", add: "#globalPrefixAdd", removeAttr: "data-prefix-remove" },
+    { get: () => state.globalSettingsDraft ?? [], set: (next) => { state.globalSettingsDraft = next; } },
+  );
+  bindAccountListEditor(
+    { input: "#clearingAccountInput", add: "#clearingAccountAdd", removeAttr: "data-clearing-remove" },
+    {
+      get: () => state.clearingAccountsDraft ?? state.clearingAccounts ?? [],
+      set: (next) => { state.clearingAccountsDraft = next; },
+    },
+  );
+  document.querySelector<HTMLInputElement>("#showAllHoldingsInput")?.addEventListener("change", (e) => {
+    state.showAllHoldingsDraft = (e.target as HTMLInputElement).checked;
   });
 
   // Save the draft → persist, refresh the open report and the sidebar/header
@@ -4407,6 +4656,14 @@ function attachReportNavHandlers(state: AppState, vs: RenderViewState): void {
         console.error("Failed to save terminology:", err);
       }
     }
+    const clearingSaved = await saveClearingAccountsDraft(state);
+    const showAllSaved = await saveShowAllHoldingsDraft(state);
+    if (clearingSaved || showAllSaved) {
+      // The Accounts pane lists other rows now; a selection it no longer lists
+      // falls back, and the header and table follow the new query choice. A
+      // query_global over a large set takes seconds, so it lands after close.
+      void loadSelection(state).then(() => render(state));
+    }
     const ai = state.aiSettingsDraft;
     if (ai) {
       try {
@@ -4423,19 +4680,13 @@ function attachReportNavHandlers(state: AppState, vs: RenderViewState): void {
         console.error("Failed to save AI settings:", err);
       }
     }
-    state.globalSettingsOpen = false;
-    state.globalSettingsDraft = undefined;
-    state.aiSettingsDraft = undefined;
-    state.termsDraft = undefined;
+    closeGlobalSettings(state);
     await loadReport(state);
     render(state);
   });
 
   document.querySelector("#globalSettingsCancel")?.addEventListener("click", () => {
-    state.globalSettingsOpen = false;
-    state.globalSettingsDraft = undefined;
-    state.aiSettingsDraft = undefined;
-    state.termsDraft = undefined;
+    closeGlobalSettings(state);
     render(state);
   });
 
@@ -4498,7 +4749,7 @@ function attachReportNavHandlers(state: AppState, vs: RenderViewState): void {
       pushNav(state);
       updateNavFlags(state);
       render(state);
-      await Promise.all([loadPrefixQuery(state), runSearchFilter(state)]);
+      await loadSelection(state);
       render(state);
       await Promise.all([loadTransactionValues(state), loadAccountTotalValue(state), _loadTreeBaseCurrencyTotals(state)]);
       render(state);
@@ -4549,7 +4800,7 @@ async function importReadyCsvFiles(
     accountFolder,
     accountSet: state.selectedAccountSet ?? "",
   });
-  await applyMutationAndRefresh(state, response);
+  await applyMutationResponse(state, response);
   return `Imported ${ready.length} file${plural}`;
 }
 
@@ -4641,7 +4892,7 @@ async function applyConfirmedDocImport(
 ): Promise<void> {
   if (response.imported && response.mutation) {
     state.docImportDraft = undefined;
-    await applyMutationAndRefresh(state, response.mutation);
+    await applyMutationResponse(state, response.mutation);
     state.status = `Imported ${draft.rows.length} rows from ${draft.sourcePath.split("/").pop()}`;
     const next = state.docImportQueue?.shift();
     if (next) {
@@ -4911,15 +5162,24 @@ function attachAccountDataHandlers(state: AppState, vs: RenderViewState): void {
     render(state);
   });
 
-  document.getElementById("showHiddenBtn")?.addEventListener("click", async () => {
-    state.showHidden = !state.showHidden;
-    await invoke("set_show_hidden", { show: state.showHidden });
-    await loadGeneratedLedger(state);
+  // Show Ignored: the ignored rows join or leave the table in place, no reload.
+  document.getElementById("showHiddenBtn")?.addEventListener("click", () => {
+    showIgnoredInFlight += 1;
+    setShowIgnored(state, !state.showHidden, {
+      apply: applyShowHidden,
+      refresh: () => loadGeneratedLedger(state, { silent: true }),
+      render: () => render(state),
+      viewKey: () => selectionRequest(state),
+    })
+      .catch((err) => { state.status = `Show Ignored: ${String(err)}`; })
+      .finally(() => {
+        showIgnoredInFlight -= 1;
+        render(state);
+      });
   });
 
   // Accounts/Categories page smart search bar (both render the same topbar search)
   if (isTransactionPane(state)) {
-    let acctSearchTimer: ReturnType<typeof setTimeout> | null = null;
     let prevPillCount = state.searchPills.length;
     cleanupAccountSearch?.();
     cleanupAccountSearch = attachSmartSearch("accountSearch", state.searchPills, {
@@ -4935,20 +5195,7 @@ function attachAccountDataHandlers(state: AppState, vs: RenderViewState): void {
       const text = change.text.trim();
       // Only re-render when: pills changed, text cleared, or text has 2+ chars
       if (!pillsChanged && text.length === 1) return;
-      if (acctSearchTimer) clearTimeout(acctSearchTimer);
-      const savedCursor = (document.activeElement as HTMLInputElement)?.selectionStart ?? null;
-      acctSearchTimer = setTimeout(async () => {
-        await runSearchFilter(state);
-        render(state);
-        const restored = document.querySelector<HTMLInputElement>("#accountSearchInput");
-        if (restored) {
-          restored.focus();
-          if (savedCursor != null) {
-            const pos = Math.min(savedCursor, restored.value.length);
-            restored.selectionStart = restored.selectionEnd = pos;
-          }
-        }
-      }, 300);
+      scheduleAccountSearch(() => runSearchFilter(state), () => render(state));
     });
   }
 
@@ -4959,7 +5206,7 @@ function attachAccountDataHandlers(state: AppState, vs: RenderViewState): void {
       pushNav(state);
       updateNavFlags(state);
       render(state);
-      await Promise.all([loadPrefixQuery(state), runSearchFilter(state)]);
+      await loadSelection(state);
       render(state);
       await Promise.all([loadTransactionValues(state), loadAccountTotalValue(state), _loadTreeBaseCurrencyTotals(state)]);
       render(state);
@@ -4983,7 +5230,7 @@ function attachAccountDataHandlers(state: AppState, vs: RenderViewState): void {
       pushNav(state);
       updateNavFlags(state);
       render(state);
-      await Promise.all([loadPrefixQuery(state), runSearchFilter(state)]);
+      await loadSelection(state);
       render(state);
       await Promise.all([loadTransactionValues(state), loadAccountTotalValue(state)]);
       render(state);
@@ -5000,7 +5247,7 @@ function attachAccountDataHandlers(state: AppState, vs: RenderViewState): void {
     pushNav(state);
     updateNavFlags(state);
     render(state);
-    await Promise.all([loadPrefixQuery(state), runSearchFilter(state)]);
+    await loadSelection(state);
     render(state);
     await Promise.all([loadTransactionValues(state), loadAccountTotalValue(state)]);
     render(state);
@@ -5015,7 +5262,7 @@ function attachAccountDataHandlers(state: AppState, vs: RenderViewState): void {
     pushNav(state);
     updateNavFlags(state);
     render(state);
-    await Promise.all([loadPrefixQuery(state), runSearchFilter(state)]);
+    await loadSelection(state);
     render(state);
     await Promise.all([loadTransactionValues(state), loadAccountTotalValue(state)]);
     render(state);
@@ -5143,9 +5390,14 @@ function attachAiAccountHandlers(state: AppState, vs: RenderViewState): void {
     await rebuildPipeline(state);
   });
   document.querySelector<HTMLButtonElement>("#e2e-restart-vault")?.addEventListener("click", async () => {
-    await uiStatePersister.flush();
-    uiStatePersister.reset();
-    await reopenVault(state);
+    vaultReopensInFlight++;
+    try {
+      await uiStatePersister.flush();
+      uiStatePersister.reset();
+      await reopenVault(state);
+    } finally {
+      vaultReopensInFlight--;
+    }
   });
 
   const manualCancel = document.querySelector<HTMLButtonElement>("#manualCancel");
@@ -5475,7 +5727,7 @@ function attachTransformAndDocImportHandlers(state: AppState): void {
           script,
           accountSet: state.selectedAccountSet ?? "",
         });
-        await applyMutationAndRefresh(state, response);
+        await applyMutationResponse(state, response);
         state.transformDraft = undefined;
         await continueQueuedImportsAfterTransform(state, draft);
       }
@@ -5853,34 +6105,55 @@ function attachRuleAndTableHandlers(state: AppState, vs: RenderViewState): void 
         : (el.textContent?.trim() ?? "");
 
       const cellSuggestions = ruleType === "category" ? collectAccountSuggestions() : undefined;
+      // The payee edit saves a label at institution scope; the labels already
+      // there decide which rows it can rename (the first match wins). Fetch
+      // them while the user types, so the prediction skips rows they claim.
+      const labelFolder = targetFolderForScope(accountFolder, "institution");
+      let labelChain: LabelInfo[] | undefined;
+      if (ruleType === "payee") {
+        void invoke<LabelInfo[]>("get_labels", { accountFolder }).then((chain) => { labelChain = chain; }, () => undefined);
+      }
       startCellEdit(el, { initialValue: originalValue === "\u2014" ? "" : originalValue, select: true, suggestions: cellSuggestions }, async (value) => {
-        const label = ruleType === "payee" ? "Saving label..." : "Saving rule...";
-        mutationQueue.enqueue(state, label, async () => {
-          let response: MutationResponse;
-          if (ruleType === "payee") {
-            const sourcePayee = el.getAttribute("data-source-payee") ?? "";
-            const pattern = payeeLabelPattern(sourcePayee || narration);
-            const matchField = sourcePayee ? "payee" : null;
-            response = await invoke<MutationResponse>("save_label", {
-              nowYyyymm: nowYYYYMM(), accountFolder: targetFolderForScope(accountFolder, "institution"), pattern,
-              payee: value, commodity: null, matchField, accountSet: state.selectedAccountSet ?? "",
-            });
-            state.status = "Label saved";
-          } else {
-            const row = el.closest<HTMLTableRowElement>("[data-txn-row-id]");
-            const txnId = row?.getAttribute("data-txn-row-id") ?? "";
-            const legId = row?.getAttribute("data-leg-id") ?? "";
-            const { pattern, matchField } = categoryEditRuleMatch(legId, txnId, narration);
-            response = await invoke<MutationResponse>("save_rule", {
-              nowYyyymm: nowYYYYMM(), accountFolder, pattern,
-              payee: null, commodity: null, matchField, amountCondition: null, feeCondition: null, amountAccount: value, feeAccount: null, comment: null, accountSet: state.selectedAccountSet ?? "",
-            });
-            state.status = "Rule saved";
-          }
-          await applyMutationResponse(state, response);
-        }).catch((err) => {
-          state.status = `Error: ${String(err)}`;
-          render(state);
+        const accountSet = state.selectedAccountSet ?? "";
+        if (ruleType === "payee") {
+          const sourcePayee = el.getAttribute("data-source-payee") ?? "";
+          const pattern = payeeLabelPattern(sourcePayee || narration);
+          const matchField = sourcePayee ? "payee" : null;
+          runOptimisticMutation(state, {
+            edit: {
+              field: "payee", value, label: `Party "${value}"`,
+              target: {
+                by: "label", label: { id: "", pattern, match_field: matchField ?? undefined, payee: value },
+                scopeFolder: labelFolder,
+                chain: labelChain, insertIndex: labelChain && labelInsertIndex(labelChain, labelFolder),
+              },
+            },
+            label: "Saving label...",
+            write: async () => noteMutationResponse(state, await invoke<MutationResponse>("save_label", {
+              nowYyyymm: nowYYYYMM(), accountFolder: labelFolder, pattern,
+              payee: value, commodity: null, matchField, accountSet,
+            })),
+            done: "Label saved",
+          });
+          return;
+        }
+        // A rule anchored on this row's leg (or txn) re-categorises just it.
+        const row = el.closest<HTMLTableRowElement>("[data-txn-row-id]");
+        const txnId = row?.getAttribute("data-txn-row-id") ?? "";
+        const legId = row?.getAttribute("data-leg-id") ?? "";
+        const { pattern, matchField } = categoryEditRuleMatch(legId, txnId, narration);
+        runOptimisticMutation(state, {
+          edit: txnId || legId
+            ? { field: "category", value, label: `Category "${value}"`, target: { by: "row", legId, txnId } }
+            : undefined,
+          label: "Saving rule...",
+          // A category the edit introduces is listed at once.
+          newAccounts: [value],
+          write: async () => noteMutationResponse(state, await invoke<MutationResponse>("save_rule", {
+            nowYyyymm: nowYYYYMM(), accountFolder, pattern,
+            payee: null, commodity: null, matchField, amountCondition: null, feeCondition: null, amountAccount: value, feeAccount: null, comment: null, accountSet,
+          })),
+          done: "Rule saved",
         });
       });
     });
@@ -5915,16 +6188,13 @@ function attachRuleAndTableHandlers(state: AppState, vs: RenderViewState): void 
       if (!oldCommodity) return;
 
       startCellEdit(el, { initialValue: oldCommodity, placeholder: oldCommodity, width: "6em" }, async (value) => {
-        mutationQueue.enqueue(state, "Saving commodity rule...", async () => {
-          const response = await invoke<MutationResponse>("save_rule", {
+        runOptimisticMutation(state, {
+          label: "Saving commodity rule...",
+          write: async () => noteMutationResponse(state, await invoke<MutationResponse>("save_rule", {
             nowYyyymm: nowYYYYMM(), accountFolder, pattern: oldCommodity,
             payee: null, commodity: value, matchField: "commodity", amountCondition: null, feeCondition: null, amountAccount: null, feeAccount: null, comment: null, accountSet: state.selectedAccountSet ?? "",
-          });
-          await applyMutationResponse(state, response);
-          state.status = `Commodity "${oldCommodity}" renamed to "${value}"`;
-        }).catch((err) => {
-          state.status = `Error: ${String(err)}`;
-          render(state);
+          })),
+          done: `Commodity "${oldCommodity}" renamed to "${value}"`,
         });
       });
     });
@@ -5932,76 +6202,70 @@ function attachRuleAndTableHandlers(state: AppState, vs: RenderViewState): void 
 
   // Transaction delete/hide buttons — routed through the mutation queue
   // so rapid clicks don't pile up parallel pipeline rebuilds, and the
-  // rebuild strip stays lit across the whole batch.
+  // rebuild strip stays lit across the whole batch. The row leaves the
+  // table (or, under Show Ignored, moves to ignore:hidden) in the same frame
+  // as the click.
   document.querySelectorAll<HTMLButtonElement>(".txn-delete-btn").forEach((btn) => {
     btn.addEventListener("click", (e) => {
       e.stopPropagation();
       const isManual = btn.getAttribute("data-txn-is-manual") === "true";
-      const label = isManual ? "Deleting transaction..." : "Hiding transaction...";
       const datetime = btn.getAttribute("data-txn-datetime") ?? "";
       const payee = btn.getAttribute("data-txn-payee") ?? "";
       const narration = btn.getAttribute("data-txn-narration") ?? "";
       const txnId = btn.getAttribute("data-txn-id") ?? "";
       const rowAccountFolder = btn.getAttribute("data-account-folder") ?? "";
       pushDebug("info", `delete:click txnId=${txnId.slice(0, 16)} folder=${rowAccountFolder.slice(0, 40)}`);
-      // Step 1: remove the row from the DOM IMMEDIATELY. No waiting on
-      // a render cycle — the user sees the row vanish in the same frame
-      // as the click. Plus add to pendingDeletes so any deferred render
-      // that fires before the backend rebuild lands also filters it
-      // out (and the renderer's morphdom keying preserves identity for
-      // every other row, so siblings don't shuffle).
-      const tr = btn.closest("tr");
-      const detail = tr?.nextElementSibling?.matches('[data-txn-detail-for]')
-        ? tr.nextElementSibling
-        : null;
-      tr?.remove();
-      detail?.remove();
       // Without pruning, a row the user previously expanded still has
       // its expandKey in state.txExpandedRows after the delete. If the
       // row ever re-appears (multi-leg sibling, "Show Ignored" toggled
       // back on, or a rule that didn't catch it), it renders expanded
       // — a "hidden" row surfaces under whatever the user clicks next.
-      if (txnId) {
-        pruneExpandedKeysForTxn(state.txExpandedRows, txnId);
-        state.pendingDeletes.add(txnId);
-      }
-      // The strip is outside the txn table and survives renders, so
-      // setting its class directly gives a same-frame "working..." signal.
-      const strip = document.querySelector('[data-testid="rebuild-strip"]');
-      strip?.classList.add("rebuildStrip--active");
-      strip?.setAttribute("aria-hidden", "false");
-      mutationQueue.enqueue(state, label, async () => {
-        if (isManual) {
-          const selAcct = state.selectedAccount ?? "";
-          const acctFolder = selAcct ? resolveAccountFolder(state, selAcct) : "";
-          const response = await invoke<PipelineResponse>("delete_manual_transaction", {
-            nowYyyymm: nowYYYYMM(), datetime, payee, narration,
-            accountFolder: acctFolder,
-            accountSet: state.selectedAccountSet ?? "",
-          });
-          await applyPipelineResponse(state, response);
-        } else {
-          pushDebug("info", `delete:invoke hide_transaction folder=${rowAccountFolder.slice(0, 40)}`);
-          const response = await invoke<MutationResponse>("hide_transaction", {
-            nowYyyymm: nowYYYYMM(), txnId,
-            accountFolder: rowAccountFolder,
-            accountSet: state.selectedAccountSet ?? "",
-          });
-          pushDebug("info", `delete:invoked ok=${response.ok}`);
-          await applyMutationResponse(state, response);
-          pushDebug("info", `delete:applied searchFiltered=${state.searchFilteredTransactions?.length ?? 0}`);
-        }
-        state.status = isManual ? "Transaction deleted." : "Transaction hidden.";
-      }).catch((err) => {
-        // Pipeline rejected — un-mark so the row reappears at full opacity.
-        if (txnId) state.pendingDeletes.delete(txnId);
-        state.status = `Error: ${err}`;
-        render(state);
-      }).finally(() => {
-        // After the rebuild lands the txn is gone from data; the entry
-        // is now redundant. Clear it so the set can't grow unbounded
-        // across long sessions.
-        if (txnId) state.pendingDeletes.delete(txnId);
+      if (txnId) pruneExpandedKeysForTxn(state.txExpandedRows, txnId);
+      const accountSet = state.selectedAccountSet ?? "";
+      const field = !isManual && hiddenRowStaysShown(state) ? "hide" : "remove";
+      runOptimisticMutation(state, {
+        edit: txnId
+          ? { field, value: "", label: isManual ? "Delete" : "Hide", target: { by: "txn", txnId } }
+          : undefined,
+        label: isManual ? "Deleting transaction..." : "Hiding transaction...",
+        write: isManual
+          ? async () => {
+            const selAcct = state.selectedAccount ?? "";
+            notePipelineResponse(state, await invoke<PipelineResponse>("delete_manual_transaction", {
+              nowYyyymm: nowYYYYMM(), datetime, payee, narration,
+              accountFolder: selAcct ? resolveAccountFolder(state, selAcct) : "",
+              accountSet,
+            }));
+          }
+          : async () => {
+            const response = await invoke<MutationResponse>("hide_transaction", {
+              nowYyyymm: nowYYYYMM(), txnId, accountFolder: rowAccountFolder, accountSet,
+            });
+            pushDebug("info", `delete:invoked ok=${response.ok}`);
+            noteMutationResponse(state, response);
+          },
+        done: isManual ? "Transaction deleted." : "Transaction hidden.",
+      });
+    });
+  });
+
+  // Unhide buttons — on a row "Hide" sent to ignore:hidden (Show Ignored). The
+  // row leaves the ignored view at once; the rebuild restores it to its account.
+  document.querySelectorAll<HTMLButtonElement>(".txn-unhide-btn").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const txnId = btn.getAttribute("data-txn-id") ?? "";
+      if (!txnId) return;
+      const viewingIgnored = matchesPrefix(activeSelectedAccount(state) ?? "", "ignore");
+      runOptimisticMutation(state, {
+        edit: viewingIgnored
+          ? { field: "remove", value: "", label: "Unhide", target: { by: "txn", txnId } }
+          : undefined,
+        label: "Unhiding transaction...",
+        write: async () => noteMutationResponse(state, await invoke<MutationResponse>("unhide_transaction", {
+          nowYyyymm: nowYYYYMM(), txnId, accountSet: state.selectedAccountSet ?? "",
+        })),
+        done: "Transaction unhidden.",
       });
     });
   });
@@ -6211,11 +6475,7 @@ function attachTableControlHandlers(state: AppState, vs: RenderViewState): void 
     vsCleanup?.();
     vsCleanup = null;
     const contentEl = document.querySelector(".content");
-    const loaded = state.searchFilteredTransactions?.length ?? 0;
-    const hasMore = state.searchFilteredCount !== undefined
-      && loaded > 0
-      && loaded < state.searchFilteredCount;
-    if (contentEl && hasMore) {
+    if (contentEl && hasMoreRowsToLoad(state)) {
       let loading = false;
       const onScroll = async () => {
         if (loading) return;
@@ -6223,19 +6483,12 @@ function attachTableControlHandlers(state: AppState, vs: RenderViewState): void 
         const scrollBottom = el.scrollTop + el.clientHeight;
         if (scrollBottom < el.scrollHeight - 200) return;
         loading = true;
-        const scrollY = el.scrollTop;
-        const restoreScroll = () => {
-          const restored = document.querySelector(".content") as HTMLElement | null;
-          if (restored) restored.scrollTop = scrollY;
-        };
         state.txWindowStart += TX_WINDOW;
-        await runSearchFilter(state);
+        await runSearchFilter(state, { append: true });
         render(state);
-        restoreScroll();
         // The appended rows have no entries in the value map yet.
         await loadTransactionValues(state);
         render(state);
-        restoreScroll();
         loading = false;
       };
       contentEl.addEventListener("scroll", onScroll, { passive: true });
@@ -6470,13 +6723,8 @@ function attachTableControlHandlers(state: AppState, vs: RenderViewState): void 
 function attachRuleEditorPageHandlers(state: AppState): void {
   // Rule editor page — smart search bar + live preview
   if (state.sidebarView === "rule-editor" && state.ruleEditorDraft) {
-    let previewTimer: ReturnType<typeof setTimeout> | null = null;
-
-    async function updatePreview() {
+    async function loadPreview() {
       if (!state.ruleEditorDraft) return;
-      const activeId = document.activeElement?.id;
-      const cursorPos = (document.activeElement as HTMLInputElement)?.selectionStart ?? null;
-
       const draft = state.ruleEditorDraft;
       const ruleKeywords = [...TRANSACTION_SEARCH_KEYWORDS, "field"] as string[];
       const { pills: textPills, text: cleanPattern } = parseSmartInput(draft.pattern, ruleKeywords);
@@ -6489,9 +6737,6 @@ function attachRuleEditorPageHandlers(state: AppState): void {
         { pattern: previewPattern, ...conditions, ruleId: draft.ruleId },
         draft.allRules, scopedTxns, draft.accountName,
       );
-
-      render(state);
-      restoreFocusAfterRender(activeId, cursorPos);
     }
 
     // Build initial pills from draft state
@@ -6524,8 +6769,7 @@ function attachRuleEditorPageHandlers(state: AppState): void {
       const text = change.text.trim();
       // Only update preview when: pills changed, text cleared, or text has 2+ chars
       if (!pillsChanged && text.length === 1) return;
-      if (previewTimer) clearTimeout(previewTimer);
-      previewTimer = setTimeout(updatePreview, 300);
+      scheduleRulePreview(loadPreview, () => render(state));
     });
 
     // Scope radio buttons — update scope and refresh preview
@@ -6533,7 +6777,7 @@ function attachRuleEditorPageHandlers(state: AppState): void {
       radio.addEventListener("change", () => {
         if (state.ruleEditorDraft) {
           state.ruleEditorDraft.ruleScope = radio.value as "local" | "institution" | "global";
-          updatePreview();
+          void loadPreview().then(() => preserveFocus(() => render(state)));
         }
       });
     });
@@ -6588,25 +6832,34 @@ function attachRuleEditorPageHandlers(state: AppState): void {
     const draft = state.ruleEditorDraft;
     const saved = readAndBuildRule(draft);
     // Optimistic close: navigate back to the previous view in the same
-    // frame as the click. The pipeline rebuild then runs in the
-    // background and the morphdom-driven refreshSearch updates the txn
-    // rows in place when it lands. Without this, the user stares at
-    // the rule editor for the full ~7s rebuild on a large vault.
-    const prevView = draft.previousView ?? "accounts";
+    // frame as the click, with the rows the rule categorises already
+    // showing their new account and the accounts it posts to already
+    // listed. The pipeline rebuild then runs in the background and lands
+    // in place. Without this, the user stares at the rule editor for the
+    // full ~7s rebuild on a large vault.
     state.ruleEditorDraft = undefined;
-    state.sidebarView = prevView;
-    render(state);
-    mutationQueue.enqueue(state, "Saving rule...", async () => {
-      const response = await invokeRuleSave(draft, saved, state.selectedAccountSet ?? "");
-      await applyMutationResponse(state, response);
-      state.status = "Rule saved";
-    }).catch((err) => {
+    state.sidebarView = draft.previousView ?? "accounts";
+    const amountAccount = saved.amount_account ?? "";
+    runOptimisticMutation(state, {
+      edit: amountAccount
+        ? {
+          field: "category", value: amountAccount, label: `Rule "${saved.pattern}"`,
+          target: {
+            by: "rule", rule: savedRuleInfo(draft.ruleId, saved), allRules: draft.allRules,
+            scopeFolder: targetFolderForScope(draft.accountFolder, draft.ruleScope),
+          },
+        }
+        : undefined,
+      label: "Saving rule...",
+      newAccounts: [saved.amount_account, saved.fee_account],
+      write: async () => noteMutationResponse(state, await invokeRuleSave(draft, saved, state.selectedAccountSet ?? "")),
+      done: "Rule saved",
       // Re-open the editor with the in-flight draft so the user
       // doesn't lose their unsaved edits.
-      state.ruleEditorDraft = { ...draft, error: String(err) };
-      state.sidebarView = "rule-editor";
-      state.status = `Error: ${String(err)}`;
-      render(state);
+      onError: (err) => {
+        state.ruleEditorDraft = { ...draft, error: String(err) };
+        state.sidebarView = "rule-editor";
+      },
     });
   });
 
@@ -6614,24 +6867,23 @@ function attachRuleEditorPageHandlers(state: AppState): void {
   ruleDelete?.addEventListener("click", () => {
     if (!state.ruleEditorDraft) return;
     const draft = state.ruleEditorDraft;
-    const prevView = draft.previousView ?? "accounts";
     state.ruleEditorDraft = undefined;
-    state.sidebarView = prevView;
-    render(state);
-    mutationQueue.enqueue(state, "Deleting rule...", async () => {
-      const response = await invoke<MutationResponse>("delete_rule", {
+    state.sidebarView = draft.previousView ?? "accounts";
+    // What the rows fall back to without the rule isn't known until the
+    // rebuild; it lands in place and the rows that change fade.
+    runOptimisticMutation(state, {
+      label: "Deleting rule...",
+      write: async () => noteMutationResponse(state, await invoke<MutationResponse>("delete_rule", {
         nowYyyymm: nowYYYYMM(),
         accountFolder: draft.accountFolder,
         ruleId: draft.ruleId,
         accountSet: state.selectedAccountSet ?? "",
-      });
-      await applyMutationResponse(state, response);
-      state.status = "Rule deleted";
-    }).catch((err) => {
-      state.ruleEditorDraft = { ...draft, error: String(err) };
-      state.sidebarView = "rule-editor";
-      state.status = `Error: ${String(err)}`;
-      render(state);
+      })),
+      done: "Rule deleted",
+      onError: (err) => {
+        state.ruleEditorDraft = { ...draft, error: String(err) };
+        state.sidebarView = "rule-editor";
+      },
     });
   });
 
@@ -6661,11 +6913,8 @@ function attachLabelEditorPageHandlers(state: AppState): void {
     function refreshPreview() {
       const draft = state.labelEditorDraft;
       if (!draft) return;
-      const activeId = document.activeElement?.id;
-      const cursorPos = (document.activeElement as HTMLInputElement)?.selectionStart ?? null;
       draft.previewMatches = recomputeLabelPreviewMatches(draft);
-      render(state);
-      restoreFocusAfterRender(activeId, cursorPos);
+      preserveFocus(() => render(state));
     }
 
     (["labelPattern", "labelParty"] as const).forEach((id) => {
@@ -6750,45 +6999,49 @@ function attachLabelEditorPageHandlers(state: AppState): void {
       render(state);
       return;
     }
-    // Optimistic close — same rationale as the rule editor's #ruleSave.
-    const prevView = draft.previousView ?? "accounts";
+    // Optimistic close — same rationale as the rule editor's #ruleSave:
+    // the rows the label renames show the new party at once.
     state.labelEditorDraft = undefined;
-    state.sidebarView = prevView;
-    render(state);
-    mutationQueue.enqueue(state, "Saving label...", async () => {
-      const accountSet = state.selectedAccountSet ?? "";
-      const response = draft.labelId
+    state.sidebarView = draft.previousView ?? "accounts";
+    const accountSet = state.selectedAccountSet ?? "";
+    runOptimisticMutation(state, {
+      edit: {
+        field: "payee", value: draft.party.trim(), label: `Party "${draft.party.trim()}"`,
+        target: {
+          by: "label",
+          label: { id: draft.labelId, pattern: draft.pattern, match_field: draft.matchField || undefined, payee: draft.party },
+          scopeFolder: draft.labelId ? draft.folder : targetFolderForScope(draft.accountFolder, "institution"),
+          chain: draft.allLabels, insertIndex: labelDraftInsertIndex(draft),
+        },
+      },
+      label: "Saving label...",
+      write: async () => noteMutationResponse(state, draft.labelId
         ? await invoke<MutationResponse>("update_label",
             buildUpdateLabelArgs(draft.labelId, draft.pattern, draft.party, draft.matchField, draft.folder, accountSet, nowYYYYMM()))
         : await invoke<MutationResponse>("save_label",
-            buildSaveLabelArgs(draft.pattern, draft.party, draft.matchField, targetFolderForScope(draft.accountFolder, "institution"), accountSet, nowYYYYMM()));
-      await applyMutationResponse(state, response);
-      state.status = "Label saved";
-    }).catch((err) => {
-      state.labelEditorDraft = { ...draft, error: String(err) };
-      state.sidebarView = "label-editor";
-      state.status = `Error: ${String(err)}`;
-      render(state);
+            buildSaveLabelArgs(draft.pattern, draft.party, draft.matchField, targetFolderForScope(draft.accountFolder, "institution"), accountSet, nowYYYYMM()))),
+      done: "Label saved",
+      onError: (err) => {
+        state.labelEditorDraft = { ...draft, error: String(err) };
+        state.sidebarView = "label-editor";
+      },
     });
   });
 
   document.querySelector<HTMLButtonElement>("#labelDelete")?.addEventListener("click", () => {
     const draft = state.labelEditorDraft;
     if (!draft || !draft.labelId) return;
-    const prevView = draft.previousView ?? "accounts";
     state.labelEditorDraft = undefined;
-    state.sidebarView = prevView;
-    render(state);
-    mutationQueue.enqueue(state, "Deleting label...", async () => {
-      const response = await invoke<MutationResponse>("delete_label",
-        buildDeleteLabelArgs(draft.folder, draft.labelId, state.selectedAccountSet ?? "", nowYYYYMM()));
-      await applyMutationResponse(state, response);
-      state.status = "Label deleted";
-    }).catch((err) => {
-      state.labelEditorDraft = { ...draft, error: String(err) };
-      state.sidebarView = "label-editor";
-      state.status = `Error: ${String(err)}`;
-      render(state);
+    state.sidebarView = draft.previousView ?? "accounts";
+    runOptimisticMutation(state, {
+      label: "Deleting label...",
+      write: async () => noteMutationResponse(state, await invoke<MutationResponse>("delete_label",
+        buildDeleteLabelArgs(draft.folder, draft.labelId, state.selectedAccountSet ?? "", nowYYYYMM()))),
+      done: "Label deleted",
+      onError: (err) => {
+        state.labelEditorDraft = { ...draft, error: String(err) };
+        state.sidebarView = "label-editor";
+      },
     });
   });
 }
@@ -6796,7 +7049,11 @@ function attachLabelEditorPageHandlers(state: AppState): void {
 type AppState = {
   busy: boolean;
   pendingMutations: number;
-  pendingDeletes: Set<string>;
+  /** Edits (re-categorise, rename, hide, unhide, delete) shown over the loaded
+   *  rows until their rebuild lands — see optimistic-edits.ts. */
+  pendingEdits: OptimisticEdit[];
+  /** Rows to fade/flash after the next render; consumed by render(). */
+  rowFlashes?: RowFlashes;
   /** Optimistically-added txns shown immediately, before the backend rebuild lands. */
   pendingAdds: Transaction[];
   justAddedTxnIds?: Set<string>;
@@ -6822,6 +7079,11 @@ type AppState = {
   /** Every account known across the whole vault (load_account_tree("")),
    *  the global pool for account-name autocomplete. */
   allAccounts: string[];
+  /** Accounts a mutation in flight is writing (./account-lists
+   *  creatingAccounts): listed in the sidebar and the dropdowns until it settles. */
+  pendingAccounts: string[];
+  /** The active set's hidden account prefixes, left out while Show Ignored is off. */
+  hiddenAccounts: string[];
   accountFoldersMap: AccountFolders;
   accountPropertiesMap: Record<string, AccountProperties>;
   accountsWithOpening: string[];
@@ -6943,7 +7205,8 @@ type AppState = {
    *  — the Accounts sidebar rows and folder/leaf header. `get("assets")` is the
    *  Balances report total. */
   treeBaseTotals?: Map<string, number>;
-  /** Same computation over every account — the Categories pane rows. */
+  /** Every account valued by its own balance — the Categories rows and the
+   *  revealed holdings outside the primary scope. */
   categoryBaseTotals?: Map<string, number>;
   tradeLinks: TradeLink[];
   tradeSuggestions: TradeSuggestion[];
@@ -6967,8 +7230,15 @@ type AppState = {
   pluginReadmes?: Record<string, string>;
   updatePricesOnStartup?: boolean;
   extraPrimaryAccountPrefixes?: string[];
+  /** Global Settings → Show all holdings (app-wide). */
+  showAllHoldings?: boolean;
+  /** The vault's clearing accounts (`get_clearing_accounts`); vault-scoped. */
+  clearingAccounts?: string[];
   globalSettingsOpen?: boolean;
   globalSettingsDraft?: string[];
+  showAllHoldingsDraft?: boolean;
+  /** Working copy of the clearing list while Global Settings is open; vault data. */
+  clearingAccountsDraft?: string[];
   aiSettingsDraft?: {
     apiUrl: string;
     apiKey: string;
@@ -7042,7 +7312,7 @@ type AppState = {
   searchFilteredCount?: number;
   searchFilteredOffset?: number;
   refreshView?: () => Promise<void>;
-  refreshSearch?: () => Promise<void>;
+  refreshLedger?: () => Promise<void>;
 };
 
 // The state starts with plain defaults: the previous session's nav state is
@@ -7051,7 +7321,7 @@ type AppState = {
 const state: AppState = {
   busy: false,
   pendingMutations: 0,
-  pendingDeletes: new Set<string>(),
+  pendingEdits: [],
   pendingAdds: [],
   search: "",
   searchPills: [],
@@ -7066,6 +7336,8 @@ const state: AppState = {
   accountSets: [],
   accountSetMap: {},
   allAccounts: [],
+  pendingAccounts: [],
+  hiddenAccounts: [],
   accountFoldersMap: {},
   accountPropertiesMap: {},
   accountsWithOpening: [],
@@ -7078,21 +7350,16 @@ const state: AppState = {
   reportPageSize: 50,
 };
 
+// After a pipeline response: its parse carries the account tree, so re-read
+// the rest — the dropdowns' pool, the header and the window.
 state.refreshView = async () => {
-  await Promise.all([loadPrefixQuery(state), runSearchFilter(state)]);
+  await Promise.all([loadPrefixQuery(state), runSearchFilter(state), loadAllAccounts(state, invoke)]);
 };
 
-// Lighter refresh for mutations: just the visible search window. The
-// prefix query (used for sidebar account counts) is intentionally NOT
-// kicked off here — it returns ALL transactions for the selected
-// account prefix, which on a large vault means a multi-second IPC
-// deserialize stall. A mutation that only changes the categorisation
-// of one txn doesn't need the prefix query to be live-fresh.
-state.refreshSearch = async () => {
-  await runSearchFilter(state);
-};
+// After a slim mutation response: the main refresh.
+state.refreshLedger = () => loadGeneratedLedger(state, { silent: true });
 
-const mutationQueue = new MutationQueue({ render: () => render(state) });
+const mutationQueue = new MutationQueue({ render: () => requestRender(state) });
 
 // First paint is a neutral shell: nav history is seeded in the startup IIFE
 // once the root check has decided between vault picker and restored state.
@@ -7105,10 +7372,12 @@ document.addEventListener("visibilitychange", () => {
 });
 
 // Diagnostic hook for MCP/devtools: snapshot the bits of state most useful
-// for debugging the optimistic-delete + morphdom flow.
+// for debugging the optimistic-edit + morphdom flow.
 (window as unknown as { __diag?: () => unknown }).__diag = () => ({
-  pendingDeletes: [...state.pendingDeletes],
+  pendingEdits: state.pendingEdits.map((e) => `${e.field}:${e.label}`),
   pendingMutations: state.pendingMutations,
+  showIgnoredInFlight,
+  vaultReopensInFlight,
   searchFiltered: state.searchFilteredTransactions?.length ?? 0,
   selectedAccount: state.selectedAccount,
   status: state.status,
@@ -7154,7 +7423,6 @@ async function normalStartup(): Promise<void> {
         state.status = `Auto-rebuilt (${payload.total_written} transactions)`;
         pushDebug("info", "pipeline-rebuilt: calling loadGeneratedLedger (with sync renders)");
         loadGeneratedLedger(state);
-        void loadAllAccounts(state);
       } else {
         state.status = `Rebuilt — no changes`;
         const t0 = performance.now();
@@ -7172,7 +7440,7 @@ async function normalStartup(): Promise<void> {
   await Promise.all([
     timed("prefix query", loadPrefixQuery(state)),
     timed("search window", runSearchFilter(state)),
-    timed("all-accounts pool", loadAllAccounts(state)),
+    timed("all-accounts pool", loadAllAccounts(state, invoke)),
   ]);
   render(state);
   mark("first data render");
@@ -7180,8 +7448,7 @@ async function normalStartup(): Promise<void> {
   // suggestions ~4-9s, issues cache ~9.5s) must not block the visible window
   // or the event-listener registrations below. Each renders when it lands.
   void timed("heavy refresh complete", refreshHeavy(state));
-  void timed("issues cache refreshed", import("./issues")
-    .then((m) => m.refreshIssuesCache())
+  void timed("issues cache refreshed", refreshIssuesCache()
     .then(() => render(state))
     // Surface failures in the terminal — a silent catch here means the issues
     // tab just never appears, with nothing to debug from.
@@ -7192,13 +7459,12 @@ async function normalStartup(): Promise<void> {
     void loadReport(state).then(() => render(state));
   }
 
-  // Listen for background report generation completion
+  // Background report generation (a full rebuild, the file watcher, a price
+  // refresh) has finished: only the Reports view has anything to show for it.
   listen("reports-rebuilt", () => {
     state.reportsBuilding = false;
     if (state.sidebarView === "reports" && state.selectedReport) {
       void loadReport(state).then(() => render(state));
-    } else {
-      render(state);
     }
   }).catch(() => {});
 
@@ -7343,6 +7609,7 @@ async function maybeRunStartupPriceSync(): Promise<void> {
     const { createSyncUi } = await import("./sync");
     syncUi = createSyncUi({ app: state, render: () => render(state) });
   }
+  await loadAppSettings(state);
   // Check if a root folder is configured
   try {
     const hasRoot = await invoke<boolean>("has_root_dir");

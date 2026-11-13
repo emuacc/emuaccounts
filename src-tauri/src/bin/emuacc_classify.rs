@@ -1,7 +1,6 @@
 #![deny(warnings)]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use emuaccounts::ai_client::{AiClient, ChatMessage};
@@ -9,22 +8,8 @@ use emuaccounts::ai_suggest::{self, AiRuleSuggestion};
 use emuaccounts::generated_store::load_active_ledger;
 use emuaccounts::ledger_parser::Transaction;
 use emuaccounts::processing_pipeline::PipelineMetadata;
-use emuaccounts::root_config::{self, platform_app_data_dir};
+use emuaccounts::root_config::CliVault;
 use emuaccounts::rules::{ai_rule_id, RulesFile};
-
-fn resolve_generated_dir() -> PathBuf {
-    let env_override = std::env::var("EMUACC_GENERATED_DIR").ok();
-    let app_dir = platform_app_data_dir();
-    let config = root_config::load_root_config(&app_dir);
-    root_config::resolve_generated(env_override.as_deref(), &config, &app_dir)
-}
-
-fn resolve_sources_dir() -> PathBuf {
-    let env_override = std::env::var("EMUACC_SOURCES_DIR").ok();
-    let app_dir = platform_app_data_dir();
-    let config = root_config::load_root_config(&app_dir);
-    root_config::resolve_sources(env_override.as_deref(), &config, &app_dir)
-}
 
 const DEFAULT_CLASSIFY_PROMPT: &str = include_str!("../../prompts/classify.md");
 
@@ -126,10 +111,11 @@ fn main() {
         i += 1;
     }
 
-    let generated_dir = resolve_generated_dir();
-    let sources_dir = resolve_sources_dir();
-    let app_dir = platform_app_data_dir();
-    let root_cfg = root_config::load_root_config(&app_dir);
+    let CliVault {
+        config: root_cfg,
+        sources_dir,
+        generated_dir,
+    } = CliVault::load();
     let prompt_template = load_classify_prompt(root_cfg.classify_prompt_path.as_deref());
     let user_context = ai_suggest::user_context_section(&root_cfg.ai_user_name);
 
@@ -256,7 +242,7 @@ fn main() {
     let client = if print_prompt {
         None
     } else {
-        match AiClient::from_disk() {
+        match AiClient::from_root_config(&root_cfg) {
             Ok(c) => Some(c),
             Err(e) => {
                 eprintln!("[classify] ERROR: {e}");

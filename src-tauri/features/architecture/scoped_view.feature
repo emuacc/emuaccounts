@@ -110,3 +110,19 @@ Feature: Scoped view — only load what the user is looking at
     When I run the pipeline
     Then a summary file should exist at "bank/savings/summary.json"
     And loading the account tree should return balance for "assets:savings"
+
+  # The app re-reads the account tree after every change (TASK-148), so the
+  # tree must follow one: the category a rule now posts to replaces the old
+  # one, which no posting uses any more.
+  Scenario: The account tree follows a rule that renames a category
+    Given a CSV "bank/savings/2025-01.csv":
+      | Date       | Description | Amount |
+      | 2025-01-15 | Coffee Shop | -4.50  |
+    And a transform at "bank/savings/_transform.rhai" that maps Date/Description/Amount to AUD
+    And a rules file at "bank/savings/_rules.json" matching "Coffee Shop" with contra "expenses:coffee"
+    When I run the pipeline
+    Then loading the account tree should return balance for "expenses:coffee"
+    When the rules in "bank/savings/_rules.json" now post to "expenses:cafe"
+    And I run the pipeline
+    Then loading the account tree should return balance for "expenses:cafe"
+    And loading the account tree should not list "expenses:coffee"

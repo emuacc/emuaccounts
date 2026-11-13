@@ -7,18 +7,41 @@ Feature: Edit Rule pre-populates narration and payee
   when no label exists. Without the payee condition the rule is too
   broad and would match unrelated counterparties.
 
-  Wildcards in the seeded payee condition (`*Kraken*` for substring
+  Wildcards in the seeded payee condition (`*Bakery*` for substring
   match) must remain visible in the pill so the user can see whether
   the rule will substring-match unrelated counterparties.
 
+  Each editor seeds from a cell of the row, so a row without that cell does not
+  offer it: a trade has no single contra account to recategorise
+  (trade_label.feature), and a swap row merges two transactions into one line.
+
   Scenario: Edit Rule seeds both narration and payee
+    Given the app is running
+    When I parse the transactions file "src-tauri/features/fixtures/uncategorised_bank.transactions"
+    And I select the account "assets:bank:everyday"
+    And I expand the transaction row for payee "Bakery"
+    And I click "Edit Rule" in the row detail
+    Then the rule editor pattern should contain "Card purchase BAKERY"
+    And the rule editor should show the pill "payee:*Bakery*"
+
+  Scenario: A trade row offers Edit Party but not Edit Rule
     Given the app is running
     When I parse the transactions file "src-tauri/features/fixtures/example.transactions"
     And I select the account "assets:exchange:kraken:btc"
     And I expand the transaction row for payee "Kraken"
-    And I click "Edit Rule" in the row detail
-    Then the rule editor pattern should contain "Sell BTC"
-    And the rule editor should show the pill "payee:*Kraken*"
+    Then the detail row should not contain an "Edit Rule" button
+    When I click "Edit Party" in the row detail
+    Then the party editor pattern should contain "Kraken"
+
+  Scenario: A swap row offers neither editor
+    Given the app is running
+    When I parse the transactions file "src-tauri/features/fixtures/multi_fill_exchange.transactions"
+    And I select the account "assets:crypto:exchange:bybit"
+    And I click the group chain link button
+    Then the aggregated groups should dissolve into swap rows
+    When I expand the transaction row for payee "Bybit"
+    Then the detail row should not contain an "Edit Rule" button
+    And the detail row should not contain an "Edit Party" button
 
   # Regression: clicking a row whose (txn, datetime, narration, amount)
   # tuple collides with another row's (e.g. two legs of one Raydium swap)
@@ -45,9 +68,9 @@ Feature: Edit Rule pre-populates narration and payee
   # "keyword: value" form typed into the rule editor must still become one pill.
   Scenario: Rule editor accepts an EXCHANGE:SYMBOL commodity condition
     Given the app is running
-    When I parse the transactions file "src-tauri/features/fixtures/example.transactions"
-    And I select the account "assets:exchange:kraken:btc"
-    And I expand the transaction row for payee "Kraken"
+    When I parse the transactions file "src-tauri/features/fixtures/uncategorised_bank.transactions"
+    And I select the account "assets:bank:everyday"
+    And I expand the transaction row for payee "Bakery"
     And I click "Edit Rule" in the row detail
     And I type "commodity: xyz:WTIOIL " into the rule editor pattern
     Then the rule editor should show the pill "commodity:xyz:WTIOIL"

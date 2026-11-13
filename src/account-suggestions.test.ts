@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { collectAccountSuggestions } from "./account-suggestions";
+import { collectAccountSuggestions, knownAccounts } from "./account-suggestions";
 
 describe("collectAccountSuggestions", () => {
   it("offers a vault-wide account absent from the current set (regression: income:dividends)", () => {
@@ -25,8 +25,29 @@ describe("collectAccountSuggestions", () => {
     expect(result).toEqual(["assets:a", "assets:b", "expenses:x", "income:z"]);
   });
 
+  it("offers an account a mutation in flight is writing, before the pool holds it", () => {
+    const result = collectAccountSuggestions({
+      accountSetMap: {},
+      allAccounts: ["expenses:food"],
+      pendingAccounts: ["expenses:pets"],
+    });
+    expect(result).toEqual(["expenses:food", "expenses:pets"]);
+  });
+
   it("handles missing optional sources", () => {
     expect(collectAccountSuggestions({ accountSetMap: {} })).toEqual([]);
     expect(collectAccountSuggestions({ accountSetMap: { r: ["assets:a"] } })).toEqual(["assets:a"]);
+  });
+});
+
+describe("knownAccounts", () => {
+  it("is the pool plus the pending accounts it lacks", () => {
+    expect(knownAccounts(["assets:a", "expenses:b"], ["expenses:b", "expenses:c"]))
+      .toEqual(["assets:a", "expenses:b", "expenses:c"]);
+  });
+
+  it("is the pool itself when nothing is pending", () => {
+    const pool = ["assets:a"];
+    expect(knownAccounts(pool, [])).toBe(pool);
   });
 });

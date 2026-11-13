@@ -10,7 +10,7 @@ use emuaccounts::dedupe::apply::{apply, archive_timestamp, write_report, Report}
 use emuaccounts::dedupe::csv as dcsv;
 use emuaccounts::dedupe::ofx as dofx;
 use emuaccounts::dedupe::plan::{DupeKind, FolderPlan, StripLocations};
-use emuaccounts::root_config::{self, platform_app_data_dir};
+use emuaccounts::root_config::CliVault;
 
 fn print_usage() {
     eprintln!("Usage: emuacc-dedupe [OPTIONS]");
@@ -28,16 +28,6 @@ fn print_usage() {
     eprintln!("  --verbose          Print per-key/per-row drop detail");
     eprintln!("  --sources-dir PATH Override sources directory");
     eprintln!("  --help             Show this help");
-}
-
-fn resolve_sources_dir(override_path: Option<&Path>) -> PathBuf {
-    if let Some(p) = override_path {
-        return p.to_path_buf();
-    }
-    let env_override = std::env::var("EMUACC_SOURCES_DIR").ok();
-    let app_dir = platform_app_data_dir();
-    let config = root_config::load_root_config(&app_dir);
-    root_config::resolve_sources(env_override.as_deref(), &config, &app_dir)
 }
 
 struct Args {
@@ -130,7 +120,9 @@ fn main() {
 
 fn run() -> Result<(), i32> {
     let args = parse_args()?;
-    let sources_root = resolve_sources_dir(args.sources_dir.as_deref());
+    let sources_root = args
+        .sources_dir
+        .unwrap_or_else(|| CliVault::load().sources_dir);
     let scan_root = match args.folder {
         Some(ref f) if f.is_absolute() => f.clone(),
         Some(ref f) => sources_root.join(f),

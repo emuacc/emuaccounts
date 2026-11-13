@@ -18,11 +18,13 @@ Feature: Transaction categorization rules
     When I run the pipeline
     Then transactions with narration "imported" should have payee "Wildcard Match"
 
-  Scenario: Rules invalidate build cache
+  # The build cache holds the transform's raw rows; the rules are a pass over
+  # them, so a new rule never re-runs the transform script.
+  Scenario: A new rule re-categorises the cached rows without re-running the transform
     Given a pipeline has been run once with a transform
     When a rules file is added to "bank/_rules.json" matching "CacheTest" with payee "Ruled"
     And I run the pipeline again
-    Then the CSV should be re-transformed (not cached)
+    Then the CSV should be re-categorised from the cache, not re-transformed
 
   Scenario: Transform suggestion maps Description to narration not payee
     Given a CSV with headers "Date,Description,Amount"

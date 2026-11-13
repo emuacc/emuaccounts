@@ -6,7 +6,7 @@
  *
  *   Round 1: list_account_sets
  *   Round 2: load_account_tree ‖ load_pipeline_metadata ‖ get_display_config
- *            ‖ get_trade_links ‖ get_account_gaps
+ *            ‖ get_clearing_accounts ‖ get_trade_links ‖ get_account_gaps
  *   Round 3: get_pipeline_warnings ‖ get_source_folder_path×N
  *
  * Startup deliberately does NOT invoke `rebuild_pipeline`. The backend already
@@ -65,6 +65,8 @@ export interface StartupState {
   accountFoldersMap: AccountFolders;
   accountPropertiesMap: Record<string, any>;
   accountsWithOpening: string[];
+  /** The vault's clearing accounts, which neither sidebar pane lists. */
+  clearingAccounts?: string[];
   tradeLinks: any[];
   tradeSuggestions: any[];
   accountGaps?: any[];
@@ -101,14 +103,21 @@ export async function normalStartup(state: StartupState, deps: StartupDeps): Pro
     } catch { /* fallback to defaults */ }
   })();
 
+  const clearingAccountsP = (async () => {
+    try {
+      state.clearingAccounts = await deps.invoke<string[]>("get_clearing_accounts");
+    } catch { /* not available in non-Tauri contexts */ }
+  })();
+
   const treeP = (async () => {
     try {
       const balances = await deps.invoke<
         Array<{ account: string; totals: Array<{ commodity: string; amount: number }> }>
       >("load_account_tree", { accountSet });
-      // The default-account fallback below reads displayConfig; wait for it so
-      // the initial selection doesn't race the config fetch.
-      await displayConfigP;
+      // The default-account fallback below reads displayConfig, and the
+      // sidebar leaves out the clearing accounts; wait for both so the initial
+      // selection doesn't race them.
+      await Promise.all([displayConfigP, clearingAccountsP]);
       applyParse(state, {
         ok: true,
         diagnostics: [],

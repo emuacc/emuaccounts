@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { applyPipelineResponse, applyMutationResponse, type ApplyTarget } from "./apply-pipeline";
+import { applyPipelineResponse, applyMutationResponse, noteMutationResponse, type ApplyTarget } from "./apply-pipeline";
 import type { PipelineResponse } from "./types";
 
 function makeState(extra: Partial<ApplyTarget> = {}): ApplyTarget {
@@ -123,63 +123,39 @@ describe("applyPipelineResponse", () => {
 
     expect(state.justAddedTxnIds).toBeUndefined();
   });
-
-  it("resets paged scroll so refreshView re-fetches from offset 0", async () => {
-    // Regression: after a mutation (save_label / save_rule) the search view
-    // must re-fetch from the top, otherwise runSearchFilter appends a fresh
-    // page to the stale earlier pages and the rows on screen keep their
-    // pre-mutation values.
-    let seenWindowStart: number | undefined;
-    let seenFiltered: unknown;
-    const state = makeState({
-      txWindowStart: 500,
-      searchFilteredTransactions: [{ id: "stale" } as never],
-      refreshView: async () => {
-        seenWindowStart = state.txWindowStart;
-        seenFiltered = state.searchFilteredTransactions;
-      },
-    });
-
-    await applyPipelineResponse(state, makeResponse());
-
-    expect(seenWindowStart).toBe(0);
-    expect(seenFiltered).toBeUndefined();
-  });
 });
 
 describe("applyMutationResponse", () => {
-  it("refreshes the account balance + window via refreshView, not just the window", async () => {
-    // Perf regression guard: a slim mutation must use refreshView (which now runs
-    // the cheap balances-only prefix query + the paged window), NOT the window-only
-    // refreshSearch. Otherwise the account header balance goes stale after an add
-    // until the next navigation. (The prefix query was made balances-only / cheap,
-    // so there is no longer a reason to skip it on mutations.)
+  it("runs the main refresh, so a rule or label change reaches the account lists", async () => {
+    // TASK-148: a slim response carries no account tree, so refreshing only the
+    // header and the window (refreshView) left the sidebar and the account
+    // dropdowns without the account a rule had just created.
+    const refreshLedger = vi.fn().mockResolvedValue(undefined);
     const refreshView = vi.fn().mockResolvedValue(undefined);
-    const refreshSearch = vi.fn().mockResolvedValue(undefined);
-    const state = makeState({ refreshView, refreshSearch });
+    const state = makeState({ refreshLedger, refreshView });
 
     await applyMutationResponse(state, { ok: true, warnings: [], output_files_written: 1 });
 
-    expect(refreshView).toHaveBeenCalledTimes(1);
-    expect(refreshSearch).not.toHaveBeenCalled();
+    expect(refreshLedger).toHaveBeenCalledTimes(1);
+    expect(refreshView).not.toHaveBeenCalled();
   });
 
-  it("resets the paged window so the refresh re-fetches from offset 0", async () => {
-    let seenWindowStart: number | undefined;
-    const state = makeState({
-      txWindowStart: 500,
-      searchFilteredTransactions: [{ id: "stale" } as never],
-      refreshView: async () => {
-        seenWindowStart = state.txWindowStart;
-      },
-    });
+  it("records warnings without refreshing, and never marks the reports as rebuilding (noteMutationResponse)", () => {
+    const refreshLedger = vi.fn().mockResolvedValue(undefined);
+    const refreshView = vi.fn().mockResolvedValue(undefined);
+    const state = makeState({ refreshLedger, refreshView });
 
-    await applyMutationResponse(state, { ok: true, warnings: [], output_files_written: 0 });
+    noteMutationResponse(state, { ok: true, warnings: ["w1"], output_files_written: 2 });
 
-    expect(seenWindowStart).toBe(0);
+    expect(state.pipelineWarnings).toEqual(["w1"]);
+    // A mutation does not regenerate the report files; the Reports view
+    // computes a stale report live, so there is nothing to wait for.
+    expect(state.reportsBuilding).toBeUndefined();
+    expect(refreshLedger).not.toHaveBeenCalled();
+    expect(refreshView).not.toHaveBeenCalled();
   });
 
-  it("does not throw when refreshView is unset", async () => {
+  it("does not throw when refreshLedger is unset", async () => {
     const state = makeState();
     await expect(
       applyMutationResponse(state, { ok: true, warnings: [], output_files_written: 0 }),

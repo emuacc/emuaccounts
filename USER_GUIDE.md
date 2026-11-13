@@ -57,6 +57,8 @@ chmod +x EmuAcc_*_amd64.AppImage
 ./EmuAcc_*_amd64.AppImage
 ```
 
+Run from the AppImage, EmuAcc adds itself to your applications menu, so your dock or taskbar shows the emu instead of a generic icon. Each launch keeps two things current: `~/.local/share/applications/emuaccounts.desktop`, which starts the AppImage from where it is now, and the `emuaccounts.png` icons under `~/.local/share/icons/hicolor/`. It rewrites them only after you move or update the AppImage. To remove EmuAcc from the menu, delete those files.
+
 ## Using the app
 
 - **Every account in one ledger** — bank, broker, exchange and wallet exports (CSV, OFX, or a PDF statement read by the AI assistant) compiled into one double-entry ledger.
@@ -68,7 +70,7 @@ chmod +x EmuAcc_*_amd64.AppImage
 ### The main window
 
 - Click `Import` to bring a CSV or OFX file into the selected account (EmuAcc suggests a column mapping). Other documents — PDF or text bank/dividend statements — are interpreted by the AI into a normalised CSV behind a preview‑and‑confirm step; the original is kept in the account folder's `originals/`. The same path runs headlessly as [`emuacc-ai-import`](#importing-a-pdf-or-text-statement).
-- The left sidebar lists accounts and their running balances (per commodity, preferring `USD` for display).
+- The left sidebar's **Accounts** pane lists the accounts your source folders feed and their running balances (per commodity, preferring `USD` for display); the **Categories** pane lists income and expenses. Clearing accounts and equity appear in neither.
 - The main table shows transactions affecting the selected account, with `Payment` / `Deposit` split from the selected account’s posting amount.
 - The **Plugins** view runs the [plugins](PLUGINS.md) that fetch prices and sync transactions.
 - On your phone, the read-only web client serves the same reports: [docs/PWA.md](docs/PWA.md).
@@ -92,6 +94,29 @@ Some nouns in the UI are configurable. **Global Settings → Terminology** lists
 singular/plural or leave the fields blank to keep the default. The default for one holding is
 *asset* / *assets* (a coin, a share, a currency, a property…), used by the Balances and Tax
 Savings reports. Overrides are saved under `terms` in the app `config.json`.
+
+### Clearing accounts
+
+A clearing account is one money only passes through, so its postings should net
+to zero: `assets:transfer`, where a transfer between your own accounts is
+booked, or a bridge account between two chains. **Global Settings → Clearing
+accounts** lists them; each entry covers its sub-accounts, and with none
+declared the list is `assets:transfer`. The list is saved with the data folder,
+as `clearing_accounts` in `generated/config.json`. Clearing accounts appear in
+neither sidebar pane and never ask for an opening balance. One whose postings in
+a commodity don't net to zero across the whole data folder is listed under
+**Issues → Unbalanced clearing account**, with the amount left over: usually the
+other half of a transfer that was never imported or never matched.
+
+### Holdings with no source folder
+
+Staking, lending, a card that only rules post to: these are holdings without a
+source folder of their own, so the Accounts pane leaves them out. Turn on
+**Global Settings → Show all holdings** to list them there too, in their groups.
+It changes only what is shown: the header, the group totals and the Balances
+report still count what **Accounts included in balance** lists, and a holding
+outside that list shows its own value, muted, with a "Not included in balance"
+tooltip.
 
 ### AI assistant
 
@@ -148,6 +173,11 @@ tools, so each of these does what the app does, without a window open:
 `emuacc-regenerate` builds the ledger the app builds, `emuacc-query` answers
 the searches the app's search box answers, `emuacc-reports` produces the
 reports the app shows, and `emuacc-web` serves the read-only [phone client](docs/PWA.md).
+
+They all work on the vault the app has open, the app config's `current_root`;
+the `EMUACC_SOURCES_DIR` / `EMUACC_GENERATED_DIR` env overrides point one at
+other folders, and a tool's `--sources-dir` / `--generated-dir`, where it has
+them, win over both.
 
 ### Keeping data fresh from cron
 

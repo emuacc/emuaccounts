@@ -61,6 +61,12 @@ describe("ruleMatchesFields", () => {
     expect(ruleMatchesFields(rule, { narration: "Coffee Shop", meta: "txn:csv-123" })).toBe(false);
     expect(ruleMatchesFields(rule, { narration: "Coffee Shop", meta: "coffee-order" })).toBe(true);
   });
+
+  it("id-anchored meta rule matches one meta segment exactly, like rules.rs", () => {
+    const rule: RuleInfo = { id: "r1", pattern: "leg:L2", match_field: "meta" };
+    expect(ruleMatchesFields(rule, { meta: "txn:abc, leg:L2, rule:r0" })).toBe(true);
+    expect(ruleMatchesFields(rule, { meta: "txn:abc, leg:L20" })).toBe(false);
+  });
 });
 
 describe("parseAmountCondition", () => {

@@ -122,9 +122,13 @@ describe("resetVaultScopedState", () => {
       selectedAccountSet: "alex",
       accountSetMap: { alex: ["assets:x"] },
       allAccounts: ["assets:equity:broker:ibkr"],
+      pendingAccounts: ["expenses:pets"],
+      hiddenAccounts: ["ignore:"],
       accountFoldersMap: { alex: { "assets:x": "x" } },
       accountPropertiesMap: { "assets:x": {} },
       accountsWithOpening: ["assets:x"],
+      clearingAccounts: ["assets:transfer", "assets:crypto:bridge"],
+      clearingAccountsDraft: ["assets:transfer"],
       displayConfig: { base_currency: "AUD" },
       search: "ibkr",
       searchPills: [{ key: "account", value: "ibkr" }],
@@ -149,7 +153,8 @@ describe("resetVaultScopedState", () => {
       taxConfig: {},
       cgtSort: { column: "sell_date", direction: "desc" },
       pendingMutations: 3,
-      pendingDeletes: new Set(["x"]),
+      pendingEdits: [{}],
+      rowFlashes: {},
       pendingAdds: [{}],
       pipelineWarnings: ["w"],
       status: "Loaded",
@@ -186,8 +191,12 @@ describe("resetVaultScopedState", () => {
     expect(state.selectedAccountSet).toBeUndefined();
     expect(state.accountSetMap).toEqual({});
     expect(state.allAccounts).toEqual([]);
+    expect(state.pendingAccounts).toEqual([]);
+    expect(state.hiddenAccounts).toEqual([]);
     expect(state.accountFoldersMap).toEqual({});
     expect(state.accountsWithOpening).toEqual([]);
+    expect(state.clearingAccounts).toBeUndefined();
+    expect(state.clearingAccountsDraft).toBeUndefined();
     expect(state.displayConfig).toBeUndefined();
     expect(state.search).toBe("");
     expect(state.searchPills).toEqual([]);
@@ -215,7 +224,8 @@ describe("resetVaultScopedState", () => {
     expect(state.cgtSort).toBeUndefined();
     expect(state.txSort).toEqual({ column: "date", direction: "asc" });
     expect(state.pendingMutations).toBe(0);
-    expect(state.pendingDeletes).toEqual(new Set());
+    expect(state.pendingEdits).toEqual([]);
+    expect(state.rowFlashes).toBeUndefined();
     expect(state.pendingAdds).toEqual([]);
     expect(state.pipelineWarnings).toEqual([]);
     expect(state.status).toBeUndefined();
@@ -248,6 +258,8 @@ describe("resetVaultScopedState", () => {
       showHidden: true,
       updatePricesOnStartup: true,
       extraPrimaryAccountPrefixes: ["loans:"],
+      showAllHoldings: true,
+      showAllHoldingsDraft: false,
       globalSettingsOpen: true,
       globalSettingsDraft: ["loans:"],
       aiSettingsDraft: { apiUrl: "http://localhost:1234", apiKey: "", model: "m" },
@@ -263,6 +275,8 @@ describe("resetVaultScopedState", () => {
     expect(state.showHidden).toBe(true);
     expect(state.updatePricesOnStartup).toBe(true);
     expect(state.extraPrimaryAccountPrefixes).toEqual(["loans:"]);
+    expect(state.showAllHoldings).toBe(true);
+    expect(state.showAllHoldingsDraft).toBe(false);
     expect(state.globalSettingsOpen).toBe(true);
     expect(state.globalSettingsDraft).toEqual(["loans:"]);
     expect(state.aiSettingsDraft).toEqual({ apiUrl: "http://localhost:1234", apiKey: "", model: "m" });

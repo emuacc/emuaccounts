@@ -33,10 +33,10 @@ Then(
 );
 
 When("I click the group chain link button", async function () {
-  const btn = await this.driver.findElement(
-    By.css(".txGroup__header .chain-btn"),
-  );
-  await btn.click();
+  // Found and clicked in one script: a background render can replace the button
+  // between finding it and clicking a handle to it.
+  await this.driver.wait(until.elementLocated(By.css(".txGroup__header .chain-btn")), 10_000);
+  await this.driver.executeScript(`document.querySelector(".txGroup__header .chain-btn").click();`);
   // Wait for the linking to complete (busy state clears)
   await this.driver.wait(async () => {
     const busyEls = await this.driver.findElements(
@@ -49,12 +49,12 @@ When("I click the group chain link button", async function () {
 Then(
   "the aggregated groups should dissolve into swap rows",
   async function () {
-    // After linking, group headers should be gone (transactions become swap rows)
-    const headers = await this.driver.findElements(By.css(".txGroup__header"));
-    assert.equal(
-      headers.length,
-      0,
-      `Expected no group headers after linking, found ${headers.length}`,
+    // After linking, group headers should go (transactions become swap rows).
+    // The links save and the rows reload in the background, so wait for it.
+    await this.driver.wait(
+      async () => (await this.driver.findElements(By.css(".txGroup__header"))).length === 0,
+      15_000,
+      "Expected no group headers after linking",
     );
     // Should have swap rows instead
     const swapRows = await this.driver.findElements(By.css(".txRow--swap"));

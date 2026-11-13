@@ -7,13 +7,13 @@ Feature: Link aggregated trade groups
   Scenario: Aggregated exchange fills show a link icon on group headers
     Given the app is running
     When I parse the transactions file "src-tauri/features/fixtures/multi_fill_exchange.transactions"
-    And I select the account "equity:trading"
+    And I select the account "assets:crypto:exchange:bybit"
     Then I should see 2 aggregated group headers
     And the first group header should have a chain link button
 
   Scenario: Clicking the group link icon links all pairs
     Given the app is running
     When I parse the transactions file "src-tauri/features/fixtures/multi_fill_exchange.transactions"
-    And I select the account "equity:trading"
+    And I select the account "assets:crypto:exchange:bybit"
     And I click the group chain link button
     Then the aggregated groups should dissolve into swap rows

@@ -5,8 +5,8 @@ use emuaccounts::ai_suggest::{self, CategorisationContext};
 use emuaccounts::build_cache;
 use emuaccounts::generated_ledger::rotate_ledger_if_needed;
 use emuaccounts::generated_store::{
-    filter_hidden_accounts, load_account_tree, load_active_ledger, ManualPostingInput,
-    ManualTransactionInput,
+    filter_hidden_accounts, load_account_tree, load_active_ledger, scoped_query,
+    ManualPostingInput, ManualTransactionInput, ScopedQueryOptions,
 };
 use emuaccounts::ledger_parser::{
     lookup_price, parse_prices, parse_transactions, AccountBalance, ParseResult, PriceGraph,
@@ -15,6 +15,7 @@ use emuaccounts::ledger_parser::{
 use emuaccounts::plugins::{self, discover_plugins_in, PluginInfo, PluginRunResult};
 use emuaccounts::processing_pipeline::{
     append_account_and_rebuild, append_hide_rule, append_manual_and_rebuild, append_to_ignored,
+    remove_hide_rule,
     auto_link_equity_swaps, delete_account_folder_and_rebuild, transaction_to_text,
     delete_manual_transaction_and_rebuild, detect_account_gaps, extract_account_set,
     import_csv_to_sources,
@@ -33,7 +34,7 @@ use emuaccounts::rules::{
     apply_label_delete, apply_label_edit, apply_label_upsert, remove_trade_link_rules, LabelsFile,
     MatchFields, Rule, RulesFile,
 };
-use emuaccounts::trade_link_repair::plan_trade_link_rules;
+use emuaccounts::trade_link_repair::{extract_txn_id, plan_trade_link_rules, write_trade_link};
 use emuaccounts::trade_links::{
     self, suggest_trade_links, trade_link_id, TradeLink, TradeSuggestion, METADATA_FILE,
     TRADE_LINKS_FILE,
@@ -47,6 +48,10 @@ use std::sync::Arc;
 #[cfg(feature = "sync")]
 #[path = "sync/steps.rs"]
 mod sync_steps;
+
+// The AppImage desktop integration scenarios' steps (TASK-140).
+#[path = "appimage/steps.rs"]
+mod appimage_steps;
 
 #[derive(Debug, Default, cucumber::World)]
 struct LedgerWorld {
@@ -71,6 +76,8 @@ struct LedgerWorld {
     // Multi-device sync scenarios (features/sync/, `sync` feature only)
     #[cfg(feature = "sync")]
     sync: sync_steps::SyncWorld,
+    // AppImage desktop integration scenarios
+    appimage: appimage_steps::AppImageWorld,
     // Gap detection fields
     gap_results: Option<Vec<AccountGap>>,
     // Prices parser fields
@@ -130,6 +137,8 @@ struct LedgerWorld {
     resolved_display_config: Option<serde_json::Value>,
     vault_base_currency_result: Option<Result<(), String>>,
     base_currency_candidates: Option<Vec<String>>,
+    // Issues collected across a vault (clearing accounts)
+    collected_issues: Option<emuaccounts::issues::CollectedIssues>,
     resolved_sources: Option<PathBuf>,
     resolved_generated: Option<PathBuf>,
     strict_resolution: Option<Result<PathBuf, String>>,
@@ -153,6 +162,11 @@ struct LedgerWorld {
     update_stdout: Option<String>,
     update_stderr: Option<String>,
     update_exit: Option<i32>,
+    // CLI vault resolution: (bin, exit code, stdout, stderr) of an emuacc-import
+    // or emuacc-gaps run, and the vault the app settings point at when that is
+    // not the scenario's own vault.
+    vault_cli_output: Option<(String, i32, String, String)>,
+    settings_vault: Option<PathBuf>,
     // AI client fields
     ai_stub_url: Option<String>,
     ai_stub_requests: Option<Arc<std::sync::Mutex<Vec<String>>>>,
@@ -180,6 +194,15 @@ struct LedgerWorld {
     // Architecture: every .rs file under src/ (path, text), for the
     // main-thread rules
     app_sources: Vec<(PathBuf, String)>,
+    // Rule specificity: the matched row's posting accounts, per path through
+    // the pipeline
+    matched_accounts: Vec<(&'static str, Vec<String>)>,
+    // Trade links: how long the rebuild after a link took
+    last_pipeline_elapsed: Option<std::time::Duration>,
+    // UI over CLI: what the real binaries produced
+    cli_generated_dir: Option<PathBuf>,
+    cli_query: Option<serde_json::Value>,
+    ui_query: Option<serde_json::Value>,
 }
 
 fn fixtures_dir() -> PathBuf {
@@ -615,13 +638,23 @@ async fn the_file_should_exist_in_sources(world: &mut LedgerWorld, relative_path
     );
 }
 
-#[when(regex = r#"^I look up the price for "([^"]+)" at "([^"]+)"$"#)]
-async fn i_look_up_the_price(world: &mut LedgerWorld, commodity: String, target_datetime: String) {
+#[when(regex = r#"^I look up the price for "([^"]+)" in "([^"]+)" at "([^"]+)"$"#)]
+async fn i_look_up_the_price(
+    world: &mut LedgerWorld,
+    commodity: String,
+    quote: String,
+    target_datetime: String,
+) {
     let sources = world
         .sources_dir
         .as_ref()
         .expect("sources_dir should be set");
-    world.price_lookup_result = Some(lookup_price(sources, &commodity, &target_datetime));
+    world.price_lookup_result = Some(lookup_price(
+        sources,
+        &commodity,
+        &target_datetime,
+        &quote,
+    ));
 }
 
 #[then(regex = r#"^the lookup result should be "([^"]+)" "([^"]+)"$"#)]
@@ -1365,6 +1398,26 @@ async fn i_hide_the_manual_transaction_with_payee(world: &mut LedgerWorld, payee
     append_hide_rule(sources, "bank", &txn_id).expect("append hide rule");
 }
 
+#[when(expr = "I unhide the transaction with payee {string}")]
+async fn i_unhide_the_transaction_with_payee(world: &mut LedgerWorld, payee: String) {
+    let sources = world.sources_dir.as_ref().expect("sources_dir");
+    let dir = set_generated_dir(world);
+    let result = load_active_ledger(&dir).expect("load active ledger");
+    let txn = result
+        .transactions
+        .iter()
+        .find(|t| t.payee.as_deref() == Some(payee.as_str()))
+        .expect("transaction not found");
+    let txn_id = meta_txn_id(txn).expect("txn ID not found in meta");
+    remove_hide_rule(sources, &txn_id).expect("remove hide rule");
+}
+
+#[when(expr = "I try to unhide txn id {string}")]
+async fn i_try_to_unhide_txn_id(world: &mut LedgerWorld, txn_id: String) {
+    let sources = world.sources_dir.as_ref().expect("sources_dir");
+    world.last_error = remove_hide_rule(sources, &txn_id).err();
+}
+
 #[then(regex = r#"^exactly (\d+) transactions? with payee "([^"]+)" should post to "([^"]+)"$"#)]
 async fn exactly_n_transactions_with_payee_should_post_to(
     world: &mut LedgerWorld,
@@ -2104,6 +2157,30 @@ async fn the_per_folder_ledger_is_externally_clobbered(world: &mut LedgerWorld, 
         .expect("write clobbered ledger");
 }
 
+/// Rewrite the ledger with the bytes it already holds and a later mtime, as a
+/// touch or a checkout of the same content would, whatever the filesystem's
+/// timestamp granularity.
+#[when(expr = "the per-folder ledger for {string} is rewritten with its own content")]
+async fn the_per_folder_ledger_is_rewritten_with_its_own_content(
+    world: &mut LedgerWorld,
+    folder: String,
+) {
+    let generated = world
+        .generated_dir
+        .as_ref()
+        .expect("generated_dir should be set");
+    let ledger = generated.join(&folder).join("ledger.transactions");
+    let content = std::fs::read_to_string(&ledger).expect("read per-folder ledger");
+    std::fs::write(&ledger, &content).expect("rewrite per-folder ledger");
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    std::fs::File::options()
+        .write(true)
+        .open(&ledger)
+        .expect("open per-folder ledger")
+        .set_modified(later)
+        .expect("set the ledger's mtime");
+}
+
 #[then(expr = "the per-folder ledger for {string} should include payee {string}")]
 async fn the_per_folder_ledger_should_include_payee(
     world: &mut LedgerWorld,
@@ -2207,6 +2284,25 @@ async fn the_csv_should_be_re_transformed(world: &mut LedgerWorld) {
     assert!(
         result.csv_transformed > 0,
         "expected CSVs to be re-transformed, got 0 transformed"
+    );
+}
+
+/// The cache holds the transform's raw rows, so a rule or label change is a
+/// pass over them: the file counts as cached and no script runs.
+#[then("the CSV should be re-categorised from the cache, not re-transformed")]
+async fn the_csv_should_be_re_categorised_from_the_cache(world: &mut LedgerWorld) {
+    let result = world
+        .pipeline_result
+        .as_ref()
+        .expect("pipeline_result should be set");
+    assert_eq!(
+        result.csv_transformed, 0,
+        "expected no CSV to be re-transformed, got {}",
+        result.csv_transformed
+    );
+    assert!(
+        result.csv_cached > 0,
+        "expected the CSV to be served from the cache, got 0 cached"
     );
 }
 
@@ -3431,6 +3527,25 @@ async fn a_rules_file_is_added(
             meta_condition: None,            postings: vec![],
         }],
     };
+    write_rules_file(sources, &path, &rules);
+}
+
+#[when(regex = r#"^the rules in "([^"]+)" now post to "([^"]+)"$"#)]
+async fn the_rules_now_post_to(world: &mut LedgerWorld, path: String, account: String) {
+    let sources = world
+        .sources_dir
+        .as_ref()
+        .expect("sources_dir should be set");
+    let file = sources.join(&path);
+    let mut rules: RulesFile =
+        serde_json::from_str(&std::fs::read_to_string(&file).expect("read rules file"))
+            .expect("parse rules file");
+    for rule in &mut rules.rules {
+        rule.amount_account = Some(account.clone());
+    }
+    // The folder fingerprint reads `_rules.json`'s mtime in whole seconds, so
+    // a rewrite inside the same second as the last run could go unseen.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
     write_rules_file(sources, &path, &rules);
 }
 
@@ -7500,6 +7615,85 @@ async fn generated_reports_does_not_contain(world: &mut LedgerWorld, filename: S
     }
 }
 
+/// Did the last run write the changed folders from their own sources and
+/// leave the rest on disk unread (`PipelineResult::scoped`)?
+fn last_run_was_scoped(world: &LedgerWorld) -> bool {
+    world
+        .pipeline_result
+        .as_ref()
+        .expect("pipeline_result should be set")
+        .scoped
+}
+
+#[then("the last rebuild should have been scoped")]
+async fn the_last_rebuild_should_have_been_scoped(world: &mut LedgerWorld) {
+    assert!(
+        last_run_was_scoped(world),
+        "expected a scoped run (only the changed folders read); it was a full run"
+    );
+}
+
+#[then("the last rebuild should have been a full run")]
+async fn the_last_rebuild_should_have_been_a_full_run(world: &mut LedgerWorld) {
+    assert!(
+        !last_run_was_scoped(world),
+        "expected a full run (every folder of the set read); it was scoped"
+    );
+}
+
+/// The cached CGT report for `fy`, as the app's FY command reads it: Some
+/// only while the set's reports are current for what the set holds now.
+fn cached_cgt_report(world: &LedgerWorld, fy: &str) -> Option<emuaccounts::reports::CgtReport> {
+    let gen_dir = world
+        .generated_dir
+        .as_ref()
+        .expect("generated dir should be set");
+    let sources_dir = world.sources_dir.as_ref().expect("sources_dir");
+    let path = find_generated_report(gen_dir, &format!("cgt-{fy}.json"))
+        .expect("the CGT report file should exist");
+    let set_dir = path
+        .parent()
+        .and_then(|reports| reports.parent())
+        .expect("a reports dir inside a set dir");
+    report_templates::cached_report(gen_dir, set_dir, sources_dir, &[], &path)
+}
+
+#[then(regex = r#"^the cached CGT report for FY "([^"]+)" is current$"#)]
+async fn the_cached_cgt_report_is_current(world: &mut LedgerWorld, fy: String) {
+    assert!(
+        cached_cgt_report(world, &fy).is_some(),
+        "the cached CGT report for FY {fy} should be served"
+    );
+}
+
+#[then(regex = r#"^the cached CGT report for FY "([^"]+)" is stale$"#)]
+async fn the_cached_cgt_report_is_stale(world: &mut LedgerWorld, fy: String) {
+    assert!(
+        cached_cgt_report(world, &fy).is_none(),
+        "the cached CGT report for FY {fy} should be stale"
+    );
+}
+
+/// A table edit's rebuild: the pipeline runs and nothing regenerates the
+/// report files.
+#[when("I run the pipeline without regenerating reports")]
+async fn i_run_the_pipeline_without_regenerating_reports(world: &mut LedgerWorld) {
+    let config = make_pipeline_config(world);
+    let result = run_pipeline(&config).expect("pipeline run");
+    world.pipeline_result = Some(result);
+}
+
+/// An explicit regeneration (a full rebuild, the CLI) after the last run.
+#[when("the reports are regenerated")]
+async fn the_reports_are_regenerated(world: &mut LedgerWorld) {
+    let config = make_pipeline_config(world);
+    let result = world
+        .pipeline_result
+        .as_ref()
+        .expect("pipeline_result should be set");
+    generate_reports_after_pipeline(&config, result);
+}
+
 // === Performance report artifacts ===
 
 /// Load a written `performance-<fy>.json` into the world so the performance
@@ -7659,6 +7853,24 @@ async fn root_config_with_startup_enabled(world: &mut LedgerWorld) {
     };
     root_config::save_root_config(&dir, &config).expect("save config");
     world.root_config_dir = Some(dir);
+}
+
+#[given("a root config file with show all holdings enabled")]
+async fn root_config_with_show_all_holdings(world: &mut LedgerWorld) {
+    let dir = new_temp_dir("emuacc-root-config");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let config = root_config::RootConfig {
+        show_all_holdings: true,
+        ..Default::default()
+    };
+    root_config::save_root_config(&dir, &config).expect("save config");
+    world.root_config_dir = Some(dir);
+}
+
+#[then(regex = r#"^show all holdings should be (true|false)$"#)]
+async fn show_all_holdings_should_be(world: &mut LedgerWorld, expected: String) {
+    let config = world.root_config.as_ref().expect("config should be loaded");
+    assert_eq!(config.show_all_holdings, expected == "true", "show_all_holdings mismatch");
 }
 
 #[given("a raw config file containing:")]
@@ -9758,6 +9970,93 @@ async fn base_currency_candidates_are(world: &mut LedgerWorld, expected: String)
     assert_eq!(got, expected);
 }
 
+// ---------------------------------------------------------------------------
+// Clearing accounts: the vault's declared list and the issues it drives
+// ---------------------------------------------------------------------------
+
+#[given("an issues vault")]
+async fn an_issues_vault(world: &mut LedgerWorld) {
+    let root = new_temp_dir("emuacc-clearing");
+    let generated = root.join("generated");
+    let sources = root.join("sources");
+    std::fs::create_dir_all(&generated).expect("create generated dir");
+    std::fs::create_dir_all(&sources).expect("create sources dir");
+    world.generated_dir = Some(generated);
+    world.sources_dir = Some(sources);
+}
+
+/// The set's whole ledger, in the flat layout (`generated/<set>/ledger.transactions`).
+#[given(expr = "the set {string} ledger:")]
+async fn set_ledger(world: &mut LedgerWorld, set: String, step: &cucumber::gherkin::Step) {
+    let dir = world.generated_dir.as_ref().expect("generated_dir").join(&set);
+    std::fs::create_dir_all(&dir).expect("create set dir");
+    let text = step.docstring.as_ref().expect("docstring");
+    std::fs::write(dir.join("ledger.transactions"), text.trim_start()).expect("write set ledger");
+}
+
+#[when(expr = "I declare the clearing accounts {string}")]
+async fn declare_clearing_accounts(world: &mut LedgerWorld, list: String) {
+    let dir = world.generated_dir.as_ref().expect("generated_dir");
+    let accounts: Vec<String> = list.split(',').map(|s| s.trim().to_string()).collect();
+    emuaccounts::display_config::set_vault_clearing_accounts(dir, &accounts)
+        .expect("declare clearing accounts");
+}
+
+#[then(expr = "the vault clearing accounts should be {string}")]
+async fn vault_clearing_accounts_are(world: &mut LedgerWorld, expected: String) {
+    let dir = world.generated_dir.as_ref().expect("generated_dir");
+    let got = emuaccounts::display_config::vault_clearing_accounts(dir)
+        .expect("read clearing accounts")
+        .join(", ");
+    assert_eq!(got, expected);
+}
+
+#[when("I collect the issues")]
+async fn collect_the_issues(world: &mut LedgerWorld) {
+    let generated = world.generated_dir.as_ref().expect("generated_dir");
+    let sources = world.sources_dir.as_ref().expect("sources_dir");
+    let filter = emuaccounts::issues::CollectFilter::all_categories();
+    world.collected_issues =
+        Some(emuaccounts::issues::collect_all(sources, generated, &filter).expect("collect issues"));
+}
+
+fn issue_messages(world: &LedgerWorld, label: &str) -> Vec<String> {
+    world
+        .collected_issues
+        .as_ref()
+        .expect("issues collected")
+        .groups
+        .iter()
+        .filter(|g| g.label == label)
+        .flat_map(|g| g.issues.iter().map(|i| i.message.clone()))
+        .collect()
+}
+
+#[then(expr = "the {string} issues should be:")]
+async fn issues_should_be(world: &mut LedgerWorld, label: String, step: &cucumber::gherkin::Step) {
+    let table = step.table.as_ref().expect("a table of messages");
+    let expected: Vec<String> = table.rows.iter().skip(1).map(|r| r[0].clone()).collect();
+    assert_eq!(issue_messages(world, &label), expected);
+}
+
+#[then(expr = "there should be no {string} issues")]
+async fn no_issues_in_group(world: &mut LedgerWorld, label: String) {
+    let got = issue_messages(world, &label);
+    assert!(got.is_empty(), "expected no {label:?} issues, got {got:?}");
+}
+
+#[then(expr = "the issue badge count for {string} should be {int}")]
+async fn issue_badge_count_is(world: &mut LedgerWorld, account: String, expected: usize) {
+    let counts = &world.collected_issues.as_ref().expect("issues collected").account_counts;
+    assert_eq!(counts.get(&account).copied(), Some(expected), "badge counts: {counts:?}");
+}
+
+#[then(expr = "there should be no issue badge for {string}")]
+async fn no_issue_badge_for(world: &mut LedgerWorld, account: String) {
+    let counts = &world.collected_issues.as_ref().expect("issues collected").account_counts;
+    assert!(!counts.contains_key(&account), "badge counts: {counts:?}");
+}
+
 fn main() {
     // cucumber-rs step dispatch can overflow the default 8MB main stack
     // when there are many (300+) step definitions. Run on a larger thread.
@@ -10297,6 +10596,108 @@ async fn loading_account_tree_should_return_balance(world: &mut LedgerWorld, acc
             .iter()
             .map(|balance| balance.account.clone())
             .collect::<Vec<_>>()
+    );
+}
+
+#[then(regex = r#"^loading the account tree should not list "([^"]+)"$"#)]
+async fn loading_account_tree_should_not_list(world: &mut LedgerWorld, account: String) {
+    let balances = load_account_tree(&set_generated_dir(world)).expect("load account tree");
+    let accounts: Vec<_> = balances
+        .iter()
+        .map(|balance| balance.account.as_str())
+        .collect();
+    assert!(
+        !accounts.contains(&account.as_str()),
+        "expected account tree to leave out {account:?}; got {accounts:?}"
+    );
+}
+
+#[then(expr = "the account tree should total {string} {string} for {string}")]
+async fn account_tree_should_total(
+    world: &mut LedgerWorld,
+    amount: String,
+    commodity: String,
+    account: String,
+) {
+    let tree = load_account_tree(&set_generated_dir(world)).expect("load account tree");
+    let expected: f64 = amount.parse().expect("amount should be a number");
+    let actual = tree
+        .iter()
+        .find(|b| b.account == account)
+        .and_then(|b| b.totals.iter().find(|t| t.commodity == commodity))
+        .map(|t| t.amount);
+    assert!(
+        actual.is_some_and(|a| (a - expected).abs() < 1e-6),
+        "expected the account tree to total {expected} {commodity} for {account}; got {actual:?}"
+    );
+}
+
+/// A generated summary.json read the way a script reads it: raw JSON, no
+/// crate types.
+fn generated_summary_json(world: &LedgerWorld, relative_path: &str) -> serde_json::Value {
+    let path = world
+        .generated_dir
+        .as_ref()
+        .expect("generated_dir")
+        .join(relative_path);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+}
+
+/// The `commodity` amount for `account` in a summary's list of
+/// `{account, totals: [{commodity, amount}]}` entries.
+fn summary_amount(entries: &serde_json::Value, account: &str, commodity: &str) -> Option<f64> {
+    entries
+        .as_array()?
+        .iter()
+        .find(|b| b["account"] == account)?["totals"]
+        .as_array()?
+        .iter()
+        .find(|t| t["commodity"] == commodity)?["amount"]
+        .as_f64()
+}
+
+#[then(expr = "the summary {string} should total {string} {string} for {string}")]
+async fn summary_should_total(
+    world: &mut LedgerWorld,
+    relative_path: String,
+    amount: String,
+    commodity: String,
+    account: String,
+) {
+    let summary = generated_summary_json(world, &relative_path);
+    let expected: f64 = amount.parse().expect("amount should be a number");
+    let actual = summary_amount(&summary["balances"], &account, &commodity);
+    assert!(
+        actual.is_some_and(|a| (a - expected).abs() < 1e-6),
+        "expected {relative_path} to total {expected} {commodity} for {account}; got {actual:?}\n{summary:#}"
+    );
+}
+
+#[then(expr = "the summary {string} should list an opening of {string} {string} for {string}")]
+async fn summary_should_list_opening(
+    world: &mut LedgerWorld,
+    relative_path: String,
+    amount: String,
+    commodity: String,
+    account: String,
+) {
+    let summary = generated_summary_json(world, &relative_path);
+    let expected: f64 = amount.parse().expect("amount should be a number");
+    let actual = summary_amount(&summary["openings"], &account, &commodity);
+    assert!(
+        actual.is_some_and(|a| (a - expected).abs() < 1e-6),
+        "expected {relative_path} to list an opening of {expected} {commodity} for {account}; got {actual:?}\n{summary:#}"
+    );
+}
+
+#[then(expr = "the summary {string} should have no openings field")]
+async fn summary_should_have_no_openings(world: &mut LedgerWorld, relative_path: String) {
+    let summary = generated_summary_json(world, &relative_path);
+    assert!(
+        summary.get("openings").is_none(),
+        "expected {relative_path} to have no openings field\n{summary:#}"
     );
 }
 
@@ -11009,6 +11410,164 @@ async fn update_then_reports_exist(world: &mut LedgerWorld) {
     );
 }
 
+// === CLI vault resolution (TASK-088) ===
+
+fn save_settings_with_root(world: &mut LedgerWorld, vault: &std::path::Path) {
+    let app_dir = new_temp_dir("emuacc-cli-settings");
+    let root = vault.to_string_lossy().to_string();
+    let config = root_config::RootConfig {
+        current_root: Some(root.clone()),
+        known_roots: vec![root],
+        ..Default::default()
+    };
+    root_config::save_root_config(&app_dir, &config).expect("save app settings");
+    world.root_config_dir = Some(app_dir);
+}
+
+#[given("app settings whose current root is that vault")]
+async fn cli_settings_root_is_vault(world: &mut LedgerWorld) {
+    let sources = world.sources_dir.as_ref().expect("vault root step first");
+    let vault = sources.parent().expect("vault root").to_path_buf();
+    save_settings_with_root(world, &vault);
+}
+
+#[given("app settings whose current root is an empty vault elsewhere")]
+async fn cli_settings_root_is_other_vault(world: &mut LedgerWorld) {
+    let vault = new_temp_dir("emuacc-cli-settings-vault");
+    std::fs::create_dir_all(vault.join("sources")).expect("mkdir sources");
+    std::fs::create_dir_all(vault.join("generated")).expect("mkdir generated");
+    save_settings_with_root(world, &vault);
+    world.settings_vault = Some(vault);
+}
+
+#[given(regex = r#"^a pending import "([^"]+)" in folder "([^"]+)" with payee "([^"]+)"$"#)]
+async fn cli_pending_import(world: &mut LedgerWorld, file: String, folder: String, payee: String) {
+    let sources = world.sources_dir.as_ref().expect("sources_dir");
+    write_simple_csv(
+        sources,
+        &format!("{folder}/imports/{file}"),
+        &[("2025-02-10", &payee, "-5.00")],
+    );
+}
+
+/// One transaction per month on `account`, in the archive ledgers emuacc-gaps
+/// scans.
+#[given(
+    regex = r#"^the generated archive holds "([^"]+)" postings in (\d{4})-(\d{2}) and (\d{4})-(\d{2})$"#
+)]
+async fn cli_archive_postings(
+    world: &mut LedgerWorld,
+    account: String,
+    year_a: String,
+    month_a: String,
+    year_b: String,
+    month_b: String,
+) {
+    let generated = world.generated_dir.as_ref().expect("generated_dir");
+    let archive = generated.join("archive");
+    std::fs::create_dir_all(&archive).expect("mkdir archive");
+    for (year, month) in [(year_a, month_a), (year_b, month_b)] {
+        std::fs::write(
+            archive.join(format!("ledger-{year}{month}.transactions")),
+            format!(
+                "{year}-{month}-15 * \"Shop\" \"test\"\n    {account}  -10.00 AUD\n    expenses:unknown  10.00 AUD\n"
+            ),
+        )
+        .expect("write archive ledger");
+    }
+}
+
+/// Run a CLI against the scenario's app settings only, plus the vault env
+/// overrides when `vault_env`. HOME points at a scratch folder so a CLI that
+/// ignored the settings could not reach this machine's real app-data folder
+/// either.
+fn run_vault_cli(world: &mut LedgerWorld, bin: &str, vault_env: bool) {
+    let path = match bin {
+        "emuacc-import" => env!("CARGO_BIN_EXE_emuacc-import"),
+        "emuacc-gaps" => env!("CARGO_BIN_EXE_emuacc-gaps"),
+        other => panic!("no binary for {other}"),
+    };
+    let app_dir = world
+        .root_config_dir
+        .as_ref()
+        .expect("app settings step first");
+    let mut cmd = std::process::Command::new(path);
+    cmd.env("EMUACC_APP_DATA_DIR", app_dir)
+        .env("HOME", new_temp_dir("emuacc-cli-home"))
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("APPDATA")
+        .env_remove("EMUACC_SOURCES_DIR")
+        .env_remove("EMUACC_GENERATED_DIR");
+    if vault_env {
+        let sources = world.sources_dir.as_ref().expect("sources_dir");
+        let generated = world.generated_dir.as_ref().expect("generated_dir");
+        cmd.env("EMUACC_SOURCES_DIR", sources)
+            .env("EMUACC_GENERATED_DIR", generated);
+    }
+    let output = cmd.output().unwrap_or_else(|e| panic!("spawn {bin}: {e}"));
+    world.vault_cli_output = Some((
+        bin.to_string(),
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    ));
+}
+
+#[when("I run emuacc-import with no vault env overrides")]
+async fn cli_run_import(world: &mut LedgerWorld) {
+    run_vault_cli(world, "emuacc-import", false);
+}
+
+#[when("I run emuacc-import with EMUACC_SOURCES_DIR and EMUACC_GENERATED_DIR set to the vault")]
+async fn cli_run_import_with_env(world: &mut LedgerWorld) {
+    run_vault_cli(world, "emuacc-import", true);
+}
+
+#[when("I run emuacc-gaps with no vault env overrides")]
+async fn cli_run_gaps(world: &mut LedgerWorld) {
+    run_vault_cli(world, "emuacc-gaps", false);
+}
+
+fn vault_cli_output<'a>(world: &'a LedgerWorld, bin: &str) -> (i32, &'a str, &'a str) {
+    let (ran, code, stdout, stderr) = world
+        .vault_cli_output
+        .as_ref()
+        .unwrap_or_else(|| panic!("run {bin} first"));
+    assert_eq!(ran, bin, "the scenario ran {ran}, not {bin}");
+    (*code, stdout, stderr)
+}
+
+#[then(regex = r#"^(emuacc-import|emuacc-gaps) should exit with code (\d+)$"#)]
+async fn cli_then_exit_code(world: &mut LedgerWorld, bin: String, expected: i32) {
+    let (code, stdout, stderr) = vault_cli_output(world, &bin);
+    assert_eq!(
+        code, expected,
+        "{bin} exited {code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[then(regex = r#"^the emuacc-gaps stdout should mention "([^"]+)"$"#)]
+async fn cli_then_gaps_stdout(world: &mut LedgerWorld, needle: String) {
+    let (_, stdout, stderr) = vault_cli_output(world, "emuacc-gaps");
+    assert!(
+        stdout.contains(&needle),
+        "stdout does not mention {needle:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[then("the vault in the app settings should still be empty")]
+async fn cli_then_settings_vault_empty(world: &mut LedgerWorld) {
+    let vault = world.settings_vault.as_ref().expect("settings vault");
+    for dir in ["sources", "generated"] {
+        let entries: Vec<_> = std::fs::read_dir(vault.join(dir))
+            .unwrap_or_else(|e| panic!("read {dir}: {e}"))
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert!(entries.is_empty(), "{dir}/ holds {entries:?}");
+    }
+}
+
 // === emuacc-ai-import CLI scenarios ===
 
 const AI_IMPORT_FIXTURE_PDF: &str = "features/fixtures/minimal-text.pdf";
@@ -11178,9 +11737,16 @@ fn find_in_transactions(dir: &std::path::Path, needle: &str) -> bool {
 }
 
 #[then(regex = r#"^the generated ledger should contain a transaction with payee "([^"]+)"$"#)]
-async fn ai_import_then_ledger_payee(world: &mut LedgerWorld, payee: String) {
+async fn cli_then_ledger_payee(world: &mut LedgerWorld, payee: String) {
     let generated = world.generated_dir.as_ref().expect("generated_dir");
-    let (_, out, err) = ai_import_output(world);
+    // Whichever CLI the scenario ran, for the failure message.
+    let (out, err) = match &world.vault_cli_output {
+        Some((_, _, out, err)) => (out.as_str(), err.as_str()),
+        None => {
+            let (_, out, err) = ai_import_output(world);
+            (out, err)
+        }
+    };
     assert!(
         find_in_transactions(generated, &format!("\"{payee}\"")),
         "no transaction with payee {payee} under {}\nstdout:\n{out}\nstderr:\n{err}",
@@ -12111,6 +12677,25 @@ fn only_command_on_main_thread(world: &mut LedgerWorld, allowed: String) {
     );
 }
 
+/// `text` from its first `{` through the `}` that closes it.
+fn first_braced_block(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let mut depth = 0usize;
+    for (offset, c) in text[start..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..=start + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The body of main.rs's `.setup(|app| { … })` closure.
 fn setup_hook(world: &LedgerWorld) -> &str {
     let (path, text) = world
@@ -12120,22 +12705,9 @@ fn setup_hook(world: &LedgerWorld) -> &str {
         .expect("src/main.rs among the app's sources");
     let start = text
         .find(".setup(|app| {")
-        .unwrap_or_else(|| panic!("no `.setup(|app| {{` in {}", path.display()))
-        + ".setup(|app| ".len();
-    let mut depth = 0usize;
-    for (offset, c) in text[start..].char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return &text[start..=start + offset];
-                }
-            }
-            _ => {}
-        }
-    }
-    panic!("the setup hook in {} never closes", path.display());
+        .unwrap_or_else(|| panic!("no `.setup(|app| {{` in {}", path.display()));
+    first_braced_block(&text[start..])
+        .unwrap_or_else(|| panic!("the setup hook in {} never closes", path.display()))
 }
 
 #[then(expr = "the setup hook calls {string}")]
@@ -12154,11 +12726,38 @@ fn setup_hook_does_not_call(world: &mut LedgerWorld, function: String) {
     );
 }
 
+#[then("every Tauri command that passes a changed-folder hint marks its rebuild for the file watcher")]
+fn hinted_commands_mark_their_rebuild(world: &mut LedgerWorld) {
+    let mut hinted = 0;
+    let mut unmarked = Vec::new();
+    for (path, text) in &world.app_sources {
+        for (at, _) in text.match_indices("#[tauri::command") {
+            let command = &text[at..];
+            let body = first_braced_block(command)
+                .unwrap_or_else(|| panic!("a command in {} never closes", path.display()));
+            if !body.contains("changed_folder_hint = Some") {
+                continue;
+            }
+            hinted += 1;
+            if !body.contains("LastCommandRebuild>().mark()") {
+                let name = command.split("fn ").nth(1).and_then(|rest| rest.split('(').next());
+                unmarked.push(name.unwrap_or(command).to_string());
+            }
+        }
+    }
+    assert!(hinted > 0, "found no command that passes a changed-folder hint");
+    assert!(
+        unmarked.is_empty(),
+        "these pass a hint without marking LastCommandRebuild, so the file watcher repeats their rebuild: {unmarked:?}"
+    );
+}
+
 async fn async_main() {
     let opts = cucumber::cli::Opts::<_, _, _, cucumber::cli::Empty>::parsed();
     let features = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("features");
 
-    let cucumber = LedgerWorld::cucumber().with_cli(opts);
+    // An undefined or mistyped step fails the run instead of skipping its scenario.
+    let cucumber = LedgerWorld::cucumber().with_cli(opts).fail_on_skipped();
     #[cfg(feature = "sync")]
     cucumber.run_and_exit(features).await;
     // Without the `sync` feature its scenarios (features/sync/) have no steps.
@@ -12377,5 +12976,474 @@ async fn pipeline_warnings_contain(world: &mut LedgerWorld, text: String) {
         result.warnings.iter().any(|w| w.contains(&text)),
         "expected a pipeline warning containing '{text}', got: {:?}",
         result.warnings
+    );
+}
+
+// === Rule specificity, trade links and the CLI against the UI's code (TASK-169) ===
+
+/// The folder a scenario's rule or row lands in when it names none.
+const DEFAULT_RULE_FOLDER: &str = "alex/wallet";
+
+/// The folder of the rows that "two linkable transactions" link.
+const LINKABLE_FOLDER: &str = "alex/exchange/binance";
+
+/// Add a rule to the end of a folder's `_rules.json`, file order intact.
+/// `RulesFile::save` sorts by specificity, which would hide whether the matcher
+/// does.
+fn append_rule(world: &LedgerWorld, folder: &str, rule: serde_json::Value) {
+    let dir = world
+        .sources_dir
+        .as_ref()
+        .expect("sources_dir should be set")
+        .join(folder);
+    std::fs::create_dir_all(&dir).expect("create rules folder");
+    let path = dir.join("_rules.json");
+    let mut file: serde_json::Value = std::fs::read_to_string(&path)
+        .map(|text| serde_json::from_str(&text).expect("parse _rules.json"))
+        .unwrap_or_else(|_| serde_json::json!({ "rules": [] }));
+    file["rules"]
+        .as_array_mut()
+        .expect("a rules array")
+        .push(rule);
+    std::fs::write(&path, file.to_string()).expect("write _rules.json");
+}
+
+#[given(
+    regex = r#"^a (narration|payee|payee-conditioned) rule(?: "([^"]+)")? with (?:pattern|payee) "([^"]+)" routes to "([^"]+)"(?: in (root|"[^"]+"))?$"#
+)]
+fn a_rule_routes_to(
+    world: &mut LedgerWorld,
+    kind: String,
+    id: String,
+    pattern: String,
+    account: String,
+    place: String,
+) {
+    let mut rule = serde_json::json!({
+        "id": if id.is_empty() { format!("{kind}-{account}") } else { id },
+        "pattern": pattern,
+        "amount_account": account,
+    });
+    match kind.as_str() {
+        "payee-conditioned" => rule["payee_condition"] = pattern.into(),
+        field => rule["match_field"] = field.into(),
+    }
+    let folder = match place.as_str() {
+        "" => DEFAULT_RULE_FOLDER,
+        "root" => "",
+        quoted => quoted.trim_matches('"'),
+    };
+    append_rule(world, folder, rule);
+}
+
+#[given(expr = "a meta rule with pattern {string} routes to {string} in root")]
+fn a_root_meta_rule_routes_to(world: &mut LedgerWorld, pattern: String, account: String) {
+    let rule = serde_json::json!({
+        "id": format!("meta-{account}"),
+        "pattern": pattern,
+        "match_field": "meta",
+        "amount_account": account,
+    });
+    append_rule(world, "", rule);
+}
+
+/// The posting accounts of the one row in a folder's generated ledger.
+fn matched_row_accounts(world: &LedgerWorld, folder: &str) -> Vec<String> {
+    let ledger = world
+        .generated_dir
+        .as_ref()
+        .expect("generated_dir")
+        .join(folder)
+        .join("ledger.transactions");
+    let text = std::fs::read_to_string(&ledger)
+        .unwrap_or_else(|e| panic!("read {}: {e}", ledger.display()));
+    let txns = parse_transactions(&text).transactions;
+    assert_eq!(txns.len(), 1, "expected the one matched row:\n{text}");
+    txns[0].postings.iter().map(|p| p.account.clone()).collect()
+}
+
+/// Run a folder's one row through the real pipeline, so the rules chain (leaf
+/// folder up to sources/) is the one a vault gets, down both paths that apply
+/// rules to it: a fresh transform, and the cached rows a rule edit
+/// re-categorises.
+fn match_row_on_both_paths(world: &mut LedgerWorld, folder: &str) {
+    run_the_pipeline_once(world);
+    world.matched_accounts = vec![("a fresh transform", matched_row_accounts(world, folder))];
+
+    append_rule(
+        world,
+        folder,
+        serde_json::json!({
+            "id": "an-edit-no-row-matches",
+            "pattern": "no row says this",
+            "match_field": "narration",
+            "amount_account": "expenses:never",
+        }),
+    );
+    run_the_pipeline_once(world);
+    let result = world
+        .pipeline_result
+        .as_ref()
+        .expect("pipeline_result should be set");
+    assert_eq!(
+        result.csv_transformed + result.ofx_transformed,
+        0,
+        "the rule edit should re-categorise cached rows"
+    );
+    let cached = matched_row_accounts(world, folder);
+    world.matched_accounts.push(("cached rows", cached));
+}
+
+#[when(
+    regex = r#"^a transaction with payee "([^"]+)"(?: and narration "([^"]+)")? is matched(?: in "([^"]+)")?$"#
+)]
+fn a_transaction_is_matched(
+    world: &mut LedgerWorld,
+    payee: String,
+    narration: String,
+    folder: String,
+) {
+    let folder = if folder.is_empty() {
+        DEFAULT_RULE_FOLDER.to_string()
+    } else {
+        folder
+    };
+    let narration = if narration.is_empty() {
+        "imported"
+    } else {
+        narration.as_str()
+    };
+    let dir = world
+        .sources_dir
+        .as_ref()
+        .expect("sources_dir should be set")
+        .join(&folder);
+    std::fs::create_dir_all(&dir).expect("create the row's folder");
+    std::fs::write(
+        dir.join("2025-01.csv"),
+        format!("Date,Payee,Narration,Amount\n2025-01-15,{payee},{narration},-4.50\n"),
+    )
+    .expect("write CSV");
+    std::fs::write(
+        dir.join("_transform.rhai"),
+        r##"#{
+  date: row["Date"],
+  payee: row["Payee"],
+  narration: row["Narration"],
+  amount: row["Amount"],
+  commodity: "AUD",
+  status: "*"
+}"##,
+    )
+    .expect("write transform");
+    match_row_on_both_paths(world, &folder);
+}
+
+/// An OFX row's memo is both its payee and its narration.
+#[when(expr = "an OFX row with memo {string} is matched in {string}")]
+fn an_ofx_row_is_matched(world: &mut LedgerWorld, memo: String, folder: String) {
+    let dir = world
+        .sources_dir
+        .as_ref()
+        .expect("sources_dir should be set")
+        .join(&folder);
+    std::fs::create_dir_all(&dir).expect("create the row's folder");
+    std::fs::write(
+        dir.join("statement.ofx"),
+        format!(
+            "OFXHEADER:100\nDATA:OFXSGML\n\n<OFX>\n<BANKMSGSRSV1>\n<STMTTRNRS>\n<STMTRS>\n\
+             <CURDEF>AUD\n<BANKTRANLIST>\n<STMTTRN>\n<TRNTYPE>DEBIT\n<DTPOSTED>20250115\n\
+             <TRNAMT>-4.50\n<FITID>TXN001\n<MEMO>{memo}\n</STMTTRN>\n</BANKTRANLIST>\n\
+             </STMTRS>\n</STMTTRNRS>\n</BANKMSGSRSV1>\n</OFX>\n"
+        ),
+    )
+    .expect("write OFX");
+    match_row_on_both_paths(world, &folder);
+}
+
+#[then(expr = "it routes to {string}")]
+fn it_routes_to(world: &mut LedgerWorld, account: String) {
+    assert!(
+        !world.matched_accounts.is_empty(),
+        "match a transaction first"
+    );
+    for (path, accounts) in &world.matched_accounts {
+        assert!(
+            accounts.contains(&account),
+            "on {path}: expected a posting to {account}, got {accounts:?}"
+        );
+    }
+}
+
+/// Link a folder's two rows as a trade the way the `save_trade_link` command
+/// does: the shared library call, then a rebuild hinted at the folder it names.
+fn link_folder_as_trade(world: &mut LedgerWorld, folder: &str) {
+    let config = make_pipeline_config(world);
+    let ledger = config
+        .generated_dir
+        .join(folder)
+        .join("ledger.transactions");
+    let text = std::fs::read_to_string(&ledger)
+        .unwrap_or_else(|e| panic!("read {}: {e}", ledger.display()));
+    let ids: Vec<String> = parse_transactions(&text)
+        .transactions
+        .iter()
+        .filter_map(|t| extract_txn_id(&t.meta))
+        .collect();
+    assert_eq!(ids.len(), 2, "expected two rows to link:\n{text}");
+    snapshot_generated_ledgers(world);
+    let target = write_trade_link(
+        &config.sources_dir,
+        &config.generated_dir,
+        &ids[0],
+        &ids[1],
+        folder,
+        false,
+    )
+    .expect("write the trade link");
+    let mut config = config;
+    config.changed_folder_hint = Some(vec![target]);
+    let started = std::time::Instant::now();
+    world.pipeline_result = Some(run_pipeline(&config).expect("pipeline run"));
+    world.last_pipeline_elapsed = Some(started.elapsed());
+    let linked = std::fs::read_to_string(&ledger)
+        .unwrap_or_else(|e| panic!("read {}: {e}", ledger.display()));
+    for side in ["equity:trading:sell", "equity:trading:buy"] {
+        assert!(
+            linked.contains(side),
+            "the link did not route a leg to {side}:\n{linked}"
+        );
+    }
+}
+
+#[when(expr = "I link the two transactions in {string} as a trade")]
+fn i_link_the_two_transactions(world: &mut LedgerWorld, folder: String) {
+    link_folder_as_trade(world, &folder);
+}
+
+#[then(expr = "the pipeline should complete in under {int} second")]
+fn the_pipeline_completes_within(world: &mut LedgerWorld, seconds: u64) {
+    let elapsed = world
+        .last_pipeline_elapsed
+        .expect("link the transactions first");
+    assert!(
+        elapsed < std::time::Duration::from_secs(seconds),
+        "the rebuild took {elapsed:?}"
+    );
+}
+
+/// A CLI binary with no vault of its own: empty app settings, and nothing
+/// from the environment the suite runs in.
+fn sandboxed_cli(binary: &str) -> std::process::Command {
+    let app_data = new_temp_dir("emuacc-cli-app-data");
+    std::fs::create_dir_all(&app_data).expect("create app data dir");
+    let mut cmd = std::process::Command::new(binary);
+    cmd.env("EMUACC_APP_DATA_DIR", app_data)
+        .env_remove("EMUACC_SOURCES_DIR")
+        .env_remove("EMUACC_GENERATED_DIR");
+    cmd
+}
+
+/// Run `emuacc-regenerate` over the world's sources into a fresh directory.
+/// Returns that directory and the binary's stderr.
+fn regenerate_via_cli(world: &LedgerWorld) -> (PathBuf, String) {
+    let config = make_pipeline_config(world);
+    let out = new_temp_dir("emuacc-cli-generated");
+    std::fs::create_dir_all(&out).expect("create CLI generated dir");
+    let vault_config = config.generated_dir.join("config.json");
+    if vault_config.exists() {
+        std::fs::copy(&vault_config, out.join("config.json")).expect("copy vault config.json");
+    }
+    let output = sandboxed_cli(env!("CARGO_BIN_EXE_emuacc-regenerate"))
+        .arg("--sources-dir")
+        .arg(&config.sources_dir)
+        .arg("--generated-dir")
+        .arg(&out)
+        .args(["--now", config.now_yyyymm.as_str()])
+        .output()
+        .expect("spawn emuacc-regenerate");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "emuacc-regenerate failed:\n{stderr}"
+    );
+    (out, stderr)
+}
+
+/// A folder with a transform and these CSV rows (`date,description,amount`).
+fn write_bank_folder(world: &LedgerWorld, folder: &str, rows: &[&str]) {
+    let sources = world
+        .sources_dir
+        .as_ref()
+        .expect("sources_dir should be set");
+    let dir = sources.join(folder);
+    std::fs::create_dir_all(&dir).expect("create folder");
+    std::fs::write(
+        dir.join("2025-01.csv"),
+        format!("Date,Description,Amount\n{}\n", rows.join("\n")),
+    )
+    .expect("write CSV");
+    write_transform(sources, &format!("{folder}/_transform.rhai"), "");
+}
+
+fn write_savings_and_checking(world: &LedgerWorld) {
+    write_bank_folder(world, "alex/assets/savings", &["2025-01-15,Interest,12.50"]);
+    write_bank_folder(world, "alex/assets/checking", &["2025-01-20,Salary,3000"]);
+}
+
+fn run_the_pipeline_once(world: &mut LedgerWorld) {
+    let result = run_pipeline(&make_pipeline_config(world)).expect("pipeline run");
+    world.pipeline_result = Some(result);
+}
+
+#[given("a generated set with transactions")]
+fn a_generated_set_with_transactions(world: &mut LedgerWorld) {
+    setup_clean_dirs(world);
+    write_savings_and_checking(world);
+    run_the_pipeline_once(world);
+}
+
+#[when(expr = "I query {string} via the CLI")]
+fn i_query_via_the_cli(world: &mut LedgerWorld, search: String) {
+    let set_dir = world
+        .generated_dir
+        .as_ref()
+        .expect("generated_dir")
+        .join("alex");
+    let output = sandboxed_cli(env!("CARGO_BIN_EXE_emuacc-query"))
+        .arg(&set_dir)
+        .arg(&search)
+        .args(["--format", "json"])
+        .output()
+        .expect("spawn emuacc-query");
+    assert!(
+        output.status.success(),
+        "emuacc-query failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = serde_json::from_slice(&output.stdout).expect("emuacc-query prints JSON");
+    world.cli_query = Some(report);
+}
+
+/// What `query_search` calls, with the options of the app's unsorted first
+/// page. The scenario checks the command does make this call.
+#[when(expr = "I query {string} via the UI command")]
+fn i_query_via_the_ui_command(world: &mut LedgerWorld, search: String) {
+    let set_dir = world
+        .generated_dir
+        .as_ref()
+        .expect("generated_dir")
+        .join("alex");
+    let result = scoped_query(
+        &set_dir,
+        ScopedQueryOptions {
+            search: &search,
+            ..Default::default()
+        },
+    )
+    .expect("scoped_query");
+    world.ui_query = Some(serde_json::to_value(result).expect("a query result as JSON"));
+}
+
+#[then("both results should contain the same transactions")]
+fn both_results_same_transactions(world: &mut LedgerWorld) {
+    let cli = world.cli_query.as_ref().expect("query via the CLI first");
+    let ui = world.ui_query.as_ref().expect("query via the UI first");
+    assert_eq!(cli["transactions"], ui["transactions"]);
+}
+
+#[then("both results should have the same total count")]
+fn both_results_same_count(world: &mut LedgerWorld) {
+    let cli = world.cli_query.as_ref().expect("query via the CLI first");
+    let ui = world.ui_query.as_ref().expect("query via the UI first");
+    assert_eq!(cli["transaction_count"], ui["transaction_count"]);
+    // The set holds two rows, so one match shows the search really ran.
+    assert_eq!(cli["transaction_count"].as_u64(), Some(1), "{cli}");
+}
+
+#[given("a sources directory with CSVs")]
+fn a_sources_directory_with_csvs(world: &mut LedgerWorld) {
+    setup_clean_dirs(world);
+    write_savings_and_checking(world);
+    // A base currency, so the reports are part of what the builds compare.
+    let generated = world.generated_dir.as_ref().expect("generated_dir");
+    std::fs::write(generated.join("config.json"), r#"{"base_currency": "AUD"}"#)
+        .expect("write vault config.json");
+}
+
+#[when("I run emuacc-regenerate via CLI")]
+fn i_run_emuacc_regenerate(world: &mut LedgerWorld) {
+    let (dir, _) = regenerate_via_cli(world);
+    world.cli_generated_dir = Some(dir);
+}
+
+#[when("I run rebuild_pipeline via the UI command")]
+async fn i_run_rebuild_pipeline(world: &mut LedgerWorld) {
+    i_run_the_pipeline_as_frontend(world).await;
+}
+
+#[then("the generated output files should be identical")]
+async fn generated_output_files_identical(world: &mut LedgerWorld) {
+    let cli = world.cli_generated_dir.as_ref().expect("run the CLI first");
+    let ui = world.generated_dir.as_ref().expect("generated_dir");
+    world.generated_tree_snapshot = Some(snapshot_generated_tree(cli));
+    world.generated_tree_other = Some(snapshot_generated_tree(ui));
+    every_generated_file_byte_identical(world).await;
+}
+
+#[given("a generated set with two linkable transactions")]
+fn a_generated_set_with_two_linkable_transactions(world: &mut LedgerWorld) {
+    setup_clean_dirs(world);
+    write_bank_folder(
+        world,
+        LINKABLE_FOLDER,
+        &["2025-01-15,BUY ETH,-100", "2025-01-15,SELL BTC,100"],
+    );
+    run_the_pipeline_once(world);
+}
+
+#[when("I link them via the UI")]
+fn i_link_them_via_the_ui(world: &mut LedgerWorld) {
+    link_folder_as_trade(world, LINKABLE_FOLDER);
+}
+
+#[then("the _rules.json should be readable by the CLI pipeline")]
+fn rules_readable_by_the_cli(world: &mut LedgerWorld) {
+    let (dir, stderr) = regenerate_via_cli(world);
+    // A rules file that cannot be parsed is a warning and an empty file, not a
+    // failed run.
+    assert!(!stderr.contains("Cannot parse"), "{stderr}");
+    world.cli_generated_dir = Some(dir);
+}
+
+#[then("running emuacc-regenerate should produce the same linked output")]
+fn regenerate_produces_the_same_linked_output(world: &mut LedgerWorld) {
+    let ledger_under = |root: &Path| {
+        let path = root.join(LINKABLE_FOLDER).join("ledger.transactions");
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    };
+    let cli = ledger_under(world.cli_generated_dir.as_ref().expect("run the CLI first"));
+    let ui = ledger_under(world.generated_dir.as_ref().expect("generated_dir"));
+    assert_eq!(cli, ui);
+}
+
+/// A command's source in main.rs runs from its `fn` to the `}` rustfmt puts at
+/// the start of a line, so this reads the command and nothing after it.
+#[then(expr = "the {string} command calls {string}")]
+fn the_command_calls(world: &mut LedgerWorld, command: String, function: String) {
+    let (_, main_rs) = world
+        .app_sources
+        .iter()
+        .find(|(path, _)| path.ends_with("src/main.rs"))
+        .expect("src/main.rs among the app's sources");
+    let start = main_rs
+        .find(&format!("fn {command}("))
+        .unwrap_or_else(|| panic!("no command {command} in main.rs"));
+    let end = main_rs[start..]
+        .find("\n}\n")
+        .unwrap_or_else(|| panic!("{command} never closes"));
+    assert!(
+        main_rs[start..start + end].contains(&format!("{function}(")),
+        "{command} does not call {function}, so the scenario no longer tests what the app runs"
     );
 }

@@ -72,3 +72,11 @@ Feature: Rule changes auto-rebuild and reach the UI
     When I run the pipeline
     And I run plugin "rule-writer"
     Then transactions with narration "imported" should have payee "Plugin-Set"
+
+  # A run with a hint records no sources fingerprint, so the watcher's next run
+  # cannot take the early exit. A scoped run is also over before the watcher's
+  # 500 ms debounce ends, so the command's guard has already dropped. Only the
+  # mark stops the watcher repeating the rebuild and the UI rendering it again.
+  Scenario: A command that passes a hint keeps the file watcher from repeating its rebuild
+    Given the app's Rust sources
+    Then every Tauri command that passes a changed-folder hint marks its rebuild for the file watcher

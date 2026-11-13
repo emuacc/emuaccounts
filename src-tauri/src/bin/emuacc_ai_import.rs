@@ -24,7 +24,7 @@ use emuaccounts::processing_pipeline::{
     folder_to_account_name, process_imports, validate_folder_name, PipelineConfig,
 };
 use emuaccounts::report_templates::{generate_all_reports, ALL_FORMATS};
-use emuaccounts::root_config::{self, platform_app_data_dir, RootConfig};
+use emuaccounts::root_config::{CliVault, RootConfig};
 
 const NAME: &str = "emuacc-ai-import";
 
@@ -130,18 +130,6 @@ fn parse_args() -> Result<Args, u8> {
     })
 }
 
-fn resolve_dirs(args: &Args, root_cfg: &RootConfig, app_dir: &Path) -> (PathBuf, PathBuf) {
-    let sources_dir = args.sources_dir.clone().unwrap_or_else(|| {
-        let env_override = std::env::var("EMUACC_SOURCES_DIR").ok();
-        root_config::resolve_sources(env_override.as_deref(), root_cfg, app_dir)
-    });
-    let generated_dir = args.generated_dir.clone().unwrap_or_else(|| {
-        let env_override = std::env::var("EMUACC_GENERATED_DIR").ok();
-        root_config::resolve_generated(env_override.as_deref(), root_cfg, app_dir)
-    });
-    (sources_dir, generated_dir)
-}
-
 fn step(s: &str) {
     eprintln!("{NAME}: {s}");
 }
@@ -165,9 +153,10 @@ fn main() -> ExitCode {
 }
 
 fn run(args: Args) -> Result<(), String> {
-    let app_dir = platform_app_data_dir();
-    let root_cfg = root_config::load_root_config(&app_dir);
-    let (sources_dir, generated_dir) = resolve_dirs(&args, &root_cfg, &app_dir);
+    let vault = CliVault::load();
+    let root_cfg = vault.config;
+    let sources_dir = args.sources_dir.unwrap_or(vault.sources_dir);
+    let generated_dir = args.generated_dir.unwrap_or(vault.generated_dir);
 
     // Fail fast on an unconfigured AI: the error names Global Settings.
     let client = AiClient::from_root_config(&root_cfg).map_err(|e| e.to_string())?;

@@ -7,32 +7,17 @@ use emuaccounts::generated_store::{load_openings, scoped_query, ScopedQueryOptio
 use emuaccounts::ledger_parser::{CommodityAmount, PriceGraph};
 use emuaccounts::processing_pipeline::folder_to_account_name;
 use emuaccounts::query::{self, MinValueFilter, SortField, SortOrder};
-use emuaccounts::root_config::{self, platform_app_data_dir};
+use emuaccounts::root_config::CliVault;
 
-fn resolve_generated_dir() -> PathBuf {
-    let env_override = std::env::var("EMUACC_GENERATED_DIR").ok();
-    let app_dir = platform_app_data_dir();
-    let config = root_config::load_root_config(&app_dir);
-    root_config::resolve_generated(env_override.as_deref(), &config, &app_dir)
-}
-
-/// Resolve the directory containing `_prices/` for `--min-value-usd`.
-/// Precedence: explicit flag > `EMUACC_SOURCES_DIR` env > root_config.
-fn resolve_sources_dir(prices_dir_flag: Option<&str>) -> PathBuf {
-    if let Some(p) = prices_dir_flag {
-        return PathBuf::from(p);
-    }
-    let env_override = std::env::var("EMUACC_SOURCES_DIR").ok();
-    let app_dir = platform_app_data_dir();
-    let config = root_config::load_root_config(&app_dir);
-    root_config::resolve_sources(env_override.as_deref(), &config, &app_dir)
-}
-
+/// The directory containing `_prices/` for `--min-value-usd`: `--prices-dir`
+/// when given, else the vault's sources dir.
 fn build_min_value_filter(
     threshold: f64,
     prices_dir_flag: Option<&str>,
 ) -> Result<MinValueFilter, String> {
-    let sources = resolve_sources_dir(prices_dir_flag);
+    let sources = prices_dir_flag
+        .map(PathBuf::from)
+        .unwrap_or_else(|| CliVault::load().sources_dir);
     if !sources.join("_prices").is_dir() {
         return Err(format!(
             "--min-value-usd requires a `_prices/` directory; \
@@ -80,7 +65,7 @@ fn resolve_scope(dir: &Path) -> QueryScope {
         .find(|a| a.join("pipeline-metadata.json").is_file())
         .map(Path::to_path_buf)
         .or_else(|| {
-            let configured = resolve_generated_dir();
+            let configured = CliVault::load().generated_dir;
             let configured = configured.canonicalize().unwrap_or(configured);
             dir.starts_with(&configured).then_some(configured)
         });
@@ -266,7 +251,7 @@ fn main() {
         i += 1;
     }
 
-    let base_dir = base_dir.unwrap_or_else(resolve_generated_dir);
+    let base_dir = base_dir.unwrap_or_else(|| CliVault::load().generated_dir);
     if !base_dir.is_dir() {
         eprintln!("Directory not found: {}", base_dir.display());
         std::process::exit(1);

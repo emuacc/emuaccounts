@@ -14,7 +14,9 @@ use std::path::Path;
 //     sanitiser no longer rewrites ':' to '_', so cached output must be rebuilt.
 // v7: manual.transactions ids hash content + occurrence instead of file position;
 //     cached folder ledgers inline the old ids and must be rebuilt.
-pub const MATCHER_VERSION: &str = "v7";
+// v8: a folder's summary.json folds in the openings its accounts.transactions
+//     declares; cached summaries are transaction-only and must be rewritten.
+pub const MATCHER_VERSION: &str = "v8";
 
 const RULES_FILENAME: &str = "_rules.json";
 const LABELS_FILENAME: &str = "_labels.json";
@@ -442,6 +444,14 @@ impl RulesFile {
     /// the pre-pass; legacy transform rules in `_rules.json` are skipped here.
     /// Matches against both raw and display values for payee and commodity.
     pub fn find_match_prioritized(&self, fields: &MatchFields) -> Option<&Rule> {
+        Self::find_match_in(&self.prioritized(), fields)
+    }
+
+    /// The categorisation rules in the order [`find_match_prioritized`]
+    /// tries them. Build it once for a batch of transactions
+    /// ([`find_match_in`]): sorting the rules for every row is what made a
+    /// rules pass over a folder cost more than its transform.
+    pub fn prioritized(&self) -> Vec<&Rule> {
         let mut indexed: Vec<(usize, &Rule)> = self
             .rules
             .iter()
@@ -449,10 +459,12 @@ impl RulesFile {
             .filter(|(_, r)| !r.is_transform())
             .collect();
         indexed.sort_by_key(|(idx, r)| (r.specificity_tier(), r.meta_anchor_rank(), *idx));
-        indexed
-            .into_iter()
-            .find(|(_, r)| rule_matches(r, fields))
-            .map(|(_, r)| r)
+        indexed.into_iter().map(|(_, r)| r).collect()
+    }
+
+    /// The first rule of `order` (from [`prioritized`]) that matches.
+    pub fn find_match_in<'a>(order: &[&'a Rule], fields: &MatchFields) -> Option<&'a Rule> {
+        order.iter().copied().find(|r| rule_matches(r, fields))
     }
 }
 
@@ -478,10 +490,13 @@ fn rule_matches(rule: &Rule, fields: &MatchFields) -> bool {
             fields.narration,
             fields.meta,
         ];
-        all_fields
-            .iter()
-            .flatten()
-            .any(|f| wildcard_match(&rule.pattern, f))
+        // A bank row's payee and narration are usually the same memo: match
+        // a text once, however many fields carry it.
+        all_fields.iter().enumerate().any(|(i, field)| {
+            field.is_some_and(|f| {
+                !all_fields[..i].contains(&Some(f)) && wildcard_match(&rule.pattern, f)
+            })
+        })
     };
     pattern_matched
         && rule_amount_matches(rule, fields)
@@ -800,55 +815,72 @@ pub fn wildcard_match(pattern: &str, text: &str) -> bool {
 }
 
 fn wildcard_match_single(pattern: &str, text: &str) -> bool {
-    let p = pattern.to_lowercase();
-    let t = text.to_lowercase();
-
-    if !p.contains('*') {
-        return p == t;
+    // A pattern is tried against several fields of every row, so this runs
+    // millions of times over a vault. ASCII — nearly every bank narration and
+    // pattern — is compared case-insensitively in place; anything else is
+    // lowercased once, after which the same byte-wise glob applies.
+    if pattern.is_ascii() && text.is_ascii() {
+        return glob_match_ci(pattern.as_bytes(), text.as_bytes());
     }
+    glob_match_ci(pattern.to_lowercase().as_bytes(), text.to_lowercase().as_bytes())
+}
 
-    let parts: Vec<&str> = p.split('*').collect();
-
-    if parts.len() == 2 {
-        let prefix = parts[0];
-        let suffix = parts[1];
-        if prefix.is_empty() && suffix.is_empty() {
-            return true; // pattern is just "*"
-        }
-        if prefix.is_empty() {
-            return t.ends_with(suffix);
-        }
-        if suffix.is_empty() {
-            return t.starts_with(prefix);
-        }
-        return t.starts_with(prefix)
-            && t.ends_with(suffix)
-            && t.len() >= prefix.len() + suffix.len();
+/// `*`-glob match of `text` against `pattern`, comparing bytes without regard
+/// to ASCII case and without allocating: the text must start with what comes
+/// before the first `*`, end with what comes after the last, and hold the
+/// parts between them in order.
+fn glob_match_ci(pattern: &[u8], text: &[u8]) -> bool {
+    let Some(first_star) = pattern.iter().position(|b| *b == b'*') else {
+        return eq_ci(pattern, text);
+    };
+    let last_star = pattern
+        .iter()
+        .rposition(|b| *b == b'*')
+        .expect("a star was found");
+    let prefix = &pattern[..first_star];
+    let suffix = &pattern[last_star + 1..];
+    if text.len() < prefix.len() + suffix.len()
+        || !starts_with_ci(text, prefix)
+        || !ends_with_ci(text, suffix)
+    {
+        return false;
     }
-
-    // General case: all parts must appear in order
-    let mut remaining = t.as_str();
-    for (i, part) in parts.iter().enumerate() {
+    let mut remaining = &text[prefix.len()..text.len() - suffix.len()];
+    // With one star there is nothing between the first and the last.
+    let middle = if last_star > first_star {
+        &pattern[first_star + 1..last_star]
+    } else {
+        &[][..]
+    };
+    for part in middle.split(|b| *b == b'*') {
         if part.is_empty() {
             continue;
         }
-        if i == 0 {
-            if !remaining.starts_with(part) {
-                return false;
-            }
-            remaining = &remaining[part.len()..];
-        } else if i == parts.len() - 1 {
-            if !remaining.ends_with(part) {
-                return false;
-            }
-        } else {
-            match remaining.find(part) {
-                Some(pos) => remaining = &remaining[pos + part.len()..],
-                None => return false,
-            }
+        match find_ci(remaining, part) {
+            Some(pos) => remaining = &remaining[pos + part.len()..],
+            None => return false,
         }
     }
     true
+}
+
+fn eq_ci(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
+}
+
+fn starts_with_ci(text: &[u8], prefix: &[u8]) -> bool {
+    text.len() >= prefix.len() && eq_ci(&text[..prefix.len()], prefix)
+}
+
+fn ends_with_ci(text: &[u8], suffix: &[u8]) -> bool {
+    text.len() >= suffix.len() && eq_ci(&text[text.len() - suffix.len()..], suffix)
+}
+
+fn find_ci(text: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    text.windows(needle.len()).position(|window| eq_ci(window, needle))
 }
 
 /// One-shot migration result for a single `_rules.json`.

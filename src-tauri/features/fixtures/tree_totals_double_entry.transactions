@@ -1,0 +1,28 @@
+; Double entry per commodity: the trade passes through equity:trading, so
+; every commodity nets to zero across the whole ledger (AUD and ETH both sum
+; to 0). Each account still holds a balance of its own, and the unrestricted
+; tree totals must value that balance.
+;
+; SCAM has no price: it contributes nothing to the wallet's value.
+
+2025-07-15 * "Employer" "Salary" ; txn:tt-1
+    assets:cash:bank:cba          1000.00 AUD
+    income:salary                -1000.00 AUD
+
+2025-08-01 * "Wallet" "Buy ETH" ; txn:tt-2
+    assets:crypto:wallet             2.00 ETH
+    equity:trading:buy              -2.00 ETH
+    equity:trading:buy             600.00 AUD
+    assets:cash:bank:cba          -600.00 AUD
+
+2025-08-02 * "Wallet" "Wrap ETH" ; txn:tt-3
+    assets:crypto:wrap               0.50 ETH
+    assets:crypto:wallet            -0.50 ETH
+
+2025-08-03 * "Cafe" "Coffee" ; txn:tt-4
+    expenses:food                    5.00 AUD
+    assets:cash:bank:cba            -5.00 AUD
+
+2025-08-04 * "Airdrop" "Unpriced token" ; txn:tt-5
+    assets:crypto:wallet            10.00 SCAM
+    income:airdrop                 -10.00 SCAM

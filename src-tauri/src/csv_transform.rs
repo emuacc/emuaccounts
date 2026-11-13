@@ -1,7 +1,7 @@
 use crate::build_cache::string_hash;
 use crate::ledger_parser::{is_valid_commodity, Posting, Transaction};
 use crate::rules::{wildcard_match, LabelsFile, MatchFields, RulesFile};
-use crate::{parse_date_to_iso, FALLBACK_ASSET_ACCOUNT, FALLBACK_EXPENSE_ACCOUNT};
+use crate::{parse_date_to_iso, FALLBACK_ASSET_ACCOUNT, FALLBACK_EXPENSE_ACCOUNT, SELF_TRANSFER_ACCOUNT};
 use rhai::{Engine, Scope, AST};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -15,7 +15,11 @@ pub struct TransformChain {
     pub hash: String,
     pub labels: LabelsFile,
     pub rules: RulesFile,
-    pub combined_hash: String,
+    /// What the raw rows depend on besides the file's content: the script
+    /// and the matcher version. The labels and rules are not part of it —
+    /// they are applied over the cached raw rows, so a rule change never
+    /// re-runs the script.
+    pub raw_hash: String,
 }
 
 /// Resolve the effective transform for a CSV file by walking up the
@@ -37,20 +41,13 @@ pub fn resolve_transform(csv_path: &Path, sources_dir: &Path) -> Result<Transfor
     // Closer (more specific) entries come first for priority.
     let mut all_labels = Vec::new();
     let mut all_rules = Vec::new();
-    let mut hash_parts = Vec::new();
     {
         let mut walk = parent_canonical.as_path();
         loop {
             let folder_labels = LabelsFile::load(walk);
-            if !folder_labels.labels.is_empty() {
-                hash_parts.push(folder_labels.hash());
-                all_labels.extend(folder_labels.labels);
-            }
+            all_labels.extend(folder_labels.labels);
             let folder_rules = RulesFile::load(walk);
-            if !folder_rules.rules.is_empty() {
-                hash_parts.push(folder_rules.hash());
-                all_rules.extend(folder_rules.rules);
-            }
+            all_rules.extend(folder_rules.rules);
             if walk == sources_canonical {
                 break;
             }
@@ -62,11 +59,6 @@ pub fn resolve_transform(csv_path: &Path, sources_dir: &Path) -> Result<Transfor
     }
     let merged_labels = LabelsFile { labels: all_labels };
     let merged_rules = RulesFile { rules: all_rules };
-    let merged_hash = if hash_parts.is_empty() {
-        string_hash(&format!("{}{}", merged_labels.hash(), merged_rules.hash()))
-    } else {
-        string_hash(&hash_parts.join(":"))
-    };
 
     let mut current = parent_canonical.as_path();
     loop {
@@ -75,16 +67,13 @@ pub fn resolve_transform(csv_path: &Path, sources_dir: &Path) -> Result<Transfor
             let script = fs::read_to_string(&candidate)
                 .map_err(|e| format!("failed to read {}: {e}", candidate.display()))?;
             let hash = string_hash(&script);
-            let combined_hash = string_hash(&format!(
-                "{hash}{merged_hash}:m={}",
-                crate::rules::MATCHER_VERSION
-            ));
+            let raw_hash = string_hash(&format!("{hash}:m={}", crate::rules::MATCHER_VERSION));
             return Ok(TransformChain {
                 script,
                 hash,
                 labels: merged_labels,
                 rules: merged_rules,
-                combined_hash,
+                raw_hash,
             });
         }
 
@@ -230,6 +219,22 @@ pub fn transform_csv_with_default(
     chain: &TransformChain,
     default_expense_account: &str,
 ) -> Result<Vec<Transaction>, String> {
+    let mut transactions =
+        transform_csv_raw(csv_path, sources_dir, &chain.script, default_expense_account)?;
+    apply_labels_and_rules_to_all(&mut transactions, &chain.labels, &chain.rules);
+    Ok(transactions)
+}
+
+/// The rows of a CSV as the script emits them, before any label or rule:
+/// what the build cache stores, keyed on the file's content and
+/// [`TransformChain::raw_hash`]. Per-leg ids are stamped here so a
+/// `leg:`-anchored rule can target a single leg later.
+pub fn transform_csv_raw(
+    csv_path: &Path,
+    sources_dir: &Path,
+    script: &str,
+    default_expense_account: &str,
+) -> Result<Vec<Transaction>, String> {
     let relative_path = csv_path
         .strip_prefix(sources_dir)
         .map_err(|_| {
@@ -259,7 +264,7 @@ pub fn transform_csv_with_default(
 
     let engine = new_transform_engine();
     let ast: AST = engine
-        .compile(&chain.script)
+        .compile(script)
         .map_err(|e| format!("failed to compile Rhai transform: {e}"))?;
 
     let mut transactions = Vec::new();
@@ -314,10 +319,6 @@ pub fn transform_csv_with_default(
     // rules run, so a `leg:`-anchored rule can target a single leg.
     stamp_leg_ids(&mut transactions);
 
-    for txn in &mut transactions {
-        apply_labels_and_rules(txn, &chain.labels, &chain.rules);
-    }
-
     Ok(transactions)
 }
 
@@ -347,6 +348,29 @@ pub fn apply_labels_and_rules_with_accounts(
     txn: &mut Transaction,
     labels: &LabelsFile,
     rules: &RulesFile,
+    declared_accounts: &[String],
+) {
+    apply_with_order(txn, labels, rules, &rules.prioritized(), declared_accounts);
+}
+
+/// [`apply_labels_and_rules`] over a batch: the rules are put in priority
+/// order once, not once per row.
+pub fn apply_labels_and_rules_to_all(
+    txns: &mut [Transaction],
+    labels: &LabelsFile,
+    rules: &RulesFile,
+) {
+    let order = rules.prioritized();
+    for txn in txns {
+        apply_with_order(txn, labels, rules, &order, &[]);
+    }
+}
+
+fn apply_with_order(
+    txn: &mut Transaction,
+    labels: &LabelsFile,
+    rules: &RulesFile,
+    order: &[&crate::rules::Rule],
     declared_accounts: &[String],
 ) {
     // txn.payee and txn.amount_commodity are IMMUTABLE source data.
@@ -416,7 +440,7 @@ pub fn apply_labels_and_rules_with_accounts(
         amount: Some(txn.amount),
         fee: txn.fee,
     };
-    if let Some(rule) = rules.find_match_prioritized(&fields) {
+    if let Some(rule) = RulesFile::find_match_in(order, &fields) {
         if let Some(ref payee) = rule.payee {
             txn.display_payee = Some(payee.clone());
         }
@@ -466,7 +490,7 @@ pub fn apply_labels_and_rules_with_accounts(
             }
             if haystack.contains(&identifier.to_lowercase()) {
                 txn.display_payee = Some("Self Transfer".to_string());
-                txn.postings[1].account = "assets:transfer".to_string();
+                txn.postings[1].account = SELF_TRANSFER_ACCOUNT.to_string();
                 return;
             }
         }
@@ -898,7 +922,7 @@ mod tests {
             hash: "h".to_string(),
             labels: LabelsFile::default(),
             rules: RulesFile::default(),
-            combined_hash: "c".to_string(),
+            raw_hash: "c".to_string(),
         };
 
         let mut txns = transform_csv(&csv_path, &dir, &chain).unwrap();
@@ -959,7 +983,7 @@ mod tests {
             hash: "h".to_string(),
             labels: LabelsFile::default(),
             rules: RulesFile::default(),
-            combined_hash: "c".to_string(),
+            raw_hash: "c".to_string(),
         };
         let txns = transform_csv(&csv_path, &dir, &chain).unwrap();
         let _ = fs::remove_dir_all(&dir);
@@ -1035,7 +1059,7 @@ mod tests {
             hash: "h".to_string(),
             labels: LabelsFile::default(),
             rules: RulesFile::default(),
-            combined_hash: "c".to_string(),
+            raw_hash: "c".to_string(),
         };
         let txns = transform_csv(&csv_path, &dir, &chain).unwrap();
         let _ = fs::remove_dir_all(&dir);
@@ -1118,7 +1142,7 @@ mod tests {
             hash: "h".to_string(),
             labels: LabelsFile::default(),
             rules: RulesFile::default(),
-            combined_hash: "c".to_string(),
+            raw_hash: "c".to_string(),
         };
         let txns = transform_csv(&csv_path, &dir, &chain).unwrap();
         let _ = fs::remove_dir_all(&dir);
@@ -1212,7 +1236,7 @@ txn
             hash: "h".to_string(),
             labels: LabelsFile::default(),
             rules: RulesFile::default(),
-            combined_hash: "c".to_string(),
+            raw_hash: "c".to_string(),
         };
         let txns = transform_csv(&csv_path, &dir, &chain).unwrap();
         let _ = fs::remove_dir_all(&dir);

@@ -867,6 +867,22 @@ pub fn account_balances_from_map(
         .collect()
 }
 
+/// Add `sign` × every total in `balances` into an `account → commodity →
+/// amount` map (`-1.0` takes them away). Each account gets an entry, even one
+/// with no totals.
+pub fn add_account_balances(
+    by_account: &mut BTreeMap<String, BTreeMap<String, f64>>,
+    balances: &[AccountBalance],
+    sign: f64,
+) {
+    for balance in balances {
+        let by_commodity = by_account.entry(balance.account.clone()).or_default();
+        for t in &balance.totals {
+            *by_commodity.entry(t.commodity.clone()).or_insert(0.0) += sign * t.amount;
+        }
+    }
+}
+
 /// Length of the `QUOTED` token at the start of `text` (`"…"` with `\"` and
 /// `\\` escapes, never spanning a line), or `None` when the quote is never
 /// closed and the `"` is just a character, as the lexer sees it.
@@ -1267,35 +1283,77 @@ pub fn parse_prices_csv(contents: &str) -> PricesParseResult {
     }
 }
 
-/// Look up the closest price for a commodity at a given datetime.
-/// Finds the last directive with datetime <= target, or the earliest as fallback.
+/// A price directive keyed by its normalised datetime.
+type DatedQuote = (String, PriceDirective);
+
+/// Key prices by normalised datetime and sort them by datetime, then quote
+/// currency, so the quotes sharing a datetime sit together in one order
+/// whatever order the P lines were read in.
+fn sort_quotes(prices: Vec<PriceDirective>) -> Vec<DatedQuote> {
+    let mut sorted: Vec<DatedQuote> = prices
+        .into_iter()
+        .map(|p| (normalize_datetime_for_compare(&p.datetime), p))
+        .collect();
+    sorted.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.quote_commodity.cmp(&b.1.quote_commodity))
+    });
+    sorted
+}
+
+/// Index of the last of `sorted` at or before the normalised `target`;
+/// `None` when every quote is later.
+fn last_at_or_before(sorted: &[DatedQuote], target: &str) -> Option<usize> {
+    sorted
+        .partition_point(|(k, _)| k.as_str() <= target)
+        .checked_sub(1)
+}
+
+/// The quotes of `sorted` at the datetime of `sorted[i]`: one per currency
+/// the commodity was quoted in then.
+fn same_datetime(sorted: &[DatedQuote], i: usize) -> &[DatedQuote] {
+    let key = sorted[i].0.as_str();
+    let start = sorted[..i].partition_point(|(k, _)| k.as_str() < key);
+    let end = i + sorted[i..].partition_point(|(k, _)| k.as_str() == key);
+    &sorted[start..end]
+}
+
+/// The quote in `quote` among one datetime's quotes.
+fn in_quote<'a>(quotes: &'a [DatedQuote], quote: &str) -> Option<&'a PriceDirective> {
+    quotes
+        .iter()
+        .map(|(_, p)| p)
+        .find(|p| p.quote_commodity == quote)
+}
+
+/// Of one datetime's quotes, the one in `quote`, else the first by quote
+/// currency.
+fn prefer_quote<'a>(quotes: &'a [DatedQuote], quote: &str) -> Option<&'a PriceDirective> {
+    in_quote(quotes, quote).or_else(|| quotes.first().map(|(_, p)| p))
+}
+
+/// Look up the price of a commodity at a given datetime from its
+/// `_prices` file: the quotes at the last datetime at or before the target
+/// (the earliest when the target is before them all), and of those the one in
+/// `quote`, else the first by quote currency. The result says which currency
+/// it is quoted in.
 pub fn lookup_price(
     sources_dir: &Path,
     commodity: &str,
     target_datetime: &str,
+    quote: &str,
 ) -> Option<PriceLookupResult> {
     let price_file = sources_dir
         .join("_prices")
         .join(format!("{}.txt", price_file_stem(commodity)));
     let contents = std::fs::read_to_string(&price_file).ok()?;
-    let result = parse_prices(&contents);
-    if result.prices.is_empty() {
+    let sorted = sort_quotes(parse_prices(&contents).prices);
+    if sorted.is_empty() {
         return None;
     }
-
-    let mut sorted = result.prices;
-    sorted.sort_by(|a, b| a.datetime.cmp(&b.datetime));
-
-    // Find last directive with datetime <= target
-    let mut best: Option<&PriceDirective> = None;
-    for p in &sorted {
-        if p.datetime.as_str() <= target_datetime {
-            best = Some(p);
-        }
-    }
-
-    // If target is before all prices, return earliest as fallback
-    let chosen = best.unwrap_or(&sorted[0]);
+    let target = normalize_datetime_for_compare(target_datetime);
+    let i = last_at_or_before(&sorted, &target).unwrap_or(0);
+    let chosen = prefer_quote(same_datetime(&sorted, i), quote)?;
 
     Some(PriceLookupResult {
         price_amount: chosen.price_amount,
@@ -1308,22 +1366,22 @@ pub fn lookup_price(
 /// Graph-based price converter that loads all price files once and supports
 /// multi-step conversion (e.g. ETH→USD→AUD).
 pub struct PriceGraph {
-    /// commodity → list of (normalized-datetime-key, directive), sorted by key.
-    /// Pre-normalising at construction means `lookup` does one normalise of the
-    /// target and a binary search — no per-comparison allocation.
-    prices: HashMap<String, Vec<(String, PriceDirective)>>,
+    /// commodity → its quotes from `sort_quotes`. Pre-normalising at
+    /// construction means a lookup does one normalise of the target and a
+    /// binary search — no per-comparison allocation.
+    prices: HashMap<String, Vec<DatedQuote>>,
 }
 
 impl PriceGraph {
     fn build(entries: Vec<PriceDirective>) -> Self {
-        let mut prices: HashMap<String, Vec<(String, PriceDirective)>> = HashMap::new();
+        let mut by_commodity: HashMap<String, Vec<PriceDirective>> = HashMap::new();
         for p in entries {
-            let key = normalize_datetime_for_compare(&p.datetime);
-            prices.entry(p.commodity.clone()).or_default().push((key, p));
+            by_commodity.entry(p.commodity.clone()).or_default().push(p);
         }
-        for list in prices.values_mut() {
-            list.sort_by(|a, b| a.0.cmp(&b.0));
-        }
+        let prices = by_commodity
+            .into_iter()
+            .map(|(commodity, list)| (commodity, sort_quotes(list)))
+            .collect();
         PriceGraph { prices }
     }
 
@@ -1350,61 +1408,60 @@ impl PriceGraph {
         Self::build(entries)
     }
 
-    /// Look up the nearest-prior price for a commodity at a given datetime.
+    /// The quotes of `commodity` at its nearest datetime at or before
+    /// `cutoff` (`None`: its latest datetime), one per currency it was quoted
+    /// in then. Empty when it has no quote by `cutoff`.
+    fn quotes_at(&self, commodity: &str, cutoff: Option<&str>) -> &[DatedQuote] {
+        let Some(sorted) = self.prices.get(commodity) else {
+            return &[];
+        };
+        let i = match cutoff {
+            Some(t) => last_at_or_before(sorted, &normalize_datetime_for_compare(t)),
+            None => sorted.len().checked_sub(1),
+        };
+        match i {
+            Some(i) => same_datetime(sorted, i),
+            None => &[],
+        }
+    }
+
+    /// Look up the nearest-prior price for a commodity at a given datetime,
+    /// in `quote` when the commodity was quoted in several currencies then
+    /// (else the first by quote currency).
     ///
     /// Returns `None` when no entry exists at or before `target_datetime`.
     /// (The previous behaviour silently fell back to the earliest entry,
     /// which fabricated wildly wrong prices when timestamp formats didn't
     /// match — e.g. ISO `T...Z` entries vs space-separated txn datetimes.)
-    pub fn lookup(&self, commodity: &str, target_datetime: &str) -> Option<&PriceDirective> {
-        let sorted = self.prices.get(commodity)?;
-        if sorted.is_empty() {
-            return None;
-        }
-        let target_norm = normalize_datetime_for_compare(target_datetime);
-        // partition_point returns the first index where key > target_norm;
-        // the entry just before it is the nearest-prior price.
-        let idx = sorted.partition_point(|(k, _)| k.as_str() <= target_norm.as_str());
-        if idx == 0 {
-            None
-        } else {
-            Some(&sorted[idx - 1].1)
-        }
+    pub fn lookup(
+        &self,
+        commodity: &str,
+        target_datetime: &str,
+        quote: &str,
+    ) -> Option<&PriceDirective> {
+        prefer_quote(self.quotes_at(commodity, Some(target_datetime)), quote)
     }
 
-    /// Most recent price for a commodity (last entry in the date-sorted vec).
-    pub fn latest(&self, commodity: &str) -> Option<&PriceDirective> {
-        self.prices.get(commodity)?.last().map(|(_, p)| p)
-    }
-
-    /// Convert using the most recent prices (latest direct + latest one-hop).
-    /// Mirrors `convert_to_base` semantics but without a date cutoff.
+    /// `convert_to_base` at each commodity's latest datetime instead of a
+    /// date cutoff.
     pub fn convert_to_base_latest(
         &self,
         commodity: &str,
         amount: f64,
         base_currency: &str,
     ) -> Option<f64> {
-        if commodity == base_currency {
-            return Some(amount);
-        }
-        let p = self.latest(commodity)?;
-        if p.quote_commodity == base_currency {
-            return Some(amount * p.price_amount);
-        }
-        let p2 = self.latest(&p.quote_commodity)?;
-        if p2.quote_commodity == base_currency {
-            return Some(amount * p.price_amount * p2.price_amount);
-        }
-        None
+        self.convert(commodity, amount, None, base_currency)
     }
 
-    /// Convert an amount from `commodity` to `base_currency` at `datetime`.
+    /// Convert an amount from `commodity` to `base_currency` at `datetime`,
+    /// from the commodity's quotes at its nearest datetime at or before it.
     ///
     /// Supports:
     /// 1. Identity (commodity == base)
-    /// 2. Direct: commodity→base
-    /// 3. One-hop: commodity→intermediate→base
+    /// 2. Direct: commodity→base, when that datetime has a base quote
+    /// 3. One-hop: commodity→intermediate→base otherwise, through the first
+    ///    of that datetime's quote currencies whose own nearest quote is in
+    ///    the base currency
     pub fn convert_to_base(
         &self,
         commodity: &str,
@@ -1412,27 +1469,27 @@ impl PriceGraph {
         datetime: &str,
         base_currency: &str,
     ) -> Option<f64> {
-        // Identity
+        self.convert(commodity, amount, Some(datetime), base_currency)
+    }
+
+    fn convert(
+        &self,
+        commodity: &str,
+        amount: f64,
+        cutoff: Option<&str>,
+        base_currency: &str,
+    ) -> Option<f64> {
         if commodity == base_currency {
             return Some(amount);
         }
-
-        // Direct: commodity→base
-        if let Some(p) = self.lookup(commodity, datetime) {
-            if p.quote_commodity == base_currency {
-                return Some(amount * p.price_amount);
-            }
-
-            // One-hop: commodity→intermediate→base
-            let intermediate = &p.quote_commodity;
-            if let Some(p2) = self.lookup(intermediate, datetime) {
-                if p2.quote_commodity == base_currency {
-                    return Some(amount * p.price_amount * p2.price_amount);
-                }
-            }
+        let quotes = self.quotes_at(commodity, cutoff);
+        if let Some(p) = in_quote(quotes, base_currency) {
+            return Some(amount * p.price_amount);
         }
-
-        None
+        quotes.iter().find_map(|(_, p)| {
+            let p2 = in_quote(self.quotes_at(&p.quote_commodity, cutoff), base_currency)?;
+            Some(amount * p.price_amount * p2.price_amount)
+        })
     }
 }
 
@@ -1775,33 +1832,29 @@ mod tests {
     }
 
     #[test]
-    fn price_graph_latest_returns_last_chronological_entry() {
+    fn convert_to_base_latest_takes_the_direct_quote_at_the_latest_datetime() {
+        let quote = |datetime: &str, commodity: &str, amount: f64, currency: &str| PriceDirective {
+            datetime: datetime.into(),
+            commodity: commodity.into(),
+            price_amount: amount,
+            price_amount_text: amount.to_string(),
+            quote_commodity: currency.into(),
+        };
+        // 2026-01-01 is quoted in AUD and USD, the USD line last; via USD it
+        // would be 2 × 6.50 × 1.50 = 19.50 AUD.
         let graph = PriceGraph::from_entries(vec![
-            PriceDirective {
-                datetime: "2024-06-01".into(),
-                commodity: "HNT".into(),
-                price_amount: 4.00,
-                price_amount_text: "4.00".into(),
-                quote_commodity: "USD".into(),
-            },
-            PriceDirective {
-                datetime: "2026-01-01".into(),
-                commodity: "HNT".into(),
-                price_amount: 6.50,
-                price_amount_text: "6.50".into(),
-                quote_commodity: "USD".into(),
-            },
-            PriceDirective {
-                datetime: "2025-03-01".into(),
-                commodity: "HNT".into(),
-                price_amount: 5.25,
-                price_amount_text: "5.25".into(),
-                quote_commodity: "USD".into(),
-            },
+            quote("2024-06-01", "HNT", 4.00, "USD"),
+            quote("2026-01-01", "HNT", 10.00, "AUD"),
+            quote("2026-01-01", "HNT", 6.50, "USD"),
+            quote("2025-03-01", "HNT", 5.25, "USD"),
+            quote("2026-01-01", "USD", 1.50, "AUD"),
         ]);
-        let latest = graph.latest("HNT").expect("HNT should be present");
-        assert_eq!(latest.datetime, "2026-01-01");
-        assert!((latest.price_amount - 6.50).abs() < f64::EPSILON);
-        assert!(graph.latest("UNKNOWN").is_none());
+        let aud = graph.convert_to_base_latest("HNT", 2.0, "AUD").unwrap();
+        assert!((aud - 20.00).abs() < 1e-9, "got {aud}");
+        let usd = graph.convert_to_base_latest("HNT", 2.0, "USD").unwrap();
+        assert!((usd - 13.00).abs() < 1e-9, "got {usd}");
+        assert!(graph
+            .convert_to_base_latest("UNKNOWN", 2.0, "AUD")
+            .is_none());
     }
 }

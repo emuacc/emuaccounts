@@ -8,8 +8,9 @@
 // local DOM" requirement — if a future refactor goes back to wholesale
 // innerHTML replacement these will fail loudly.
 
-import { describe, it, expect, beforeEach } from "vitest";
-import { morphInPlace } from "./dom-update";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { debouncedRender, morphInPlace, playRowFlashes, preserveFocus } from "./dom-update";
+import { type SearchPill, attachSmartSearch, renderSmartSearch } from "./smart-search";
 
 function setup(html: string): HTMLElement {
   document.body.innerHTML = `<div id="root">${html}</div>`;
@@ -204,11 +205,10 @@ describe("morphInPlace — non-intrusive DOM updates", () => {
     // renders as multiple <tr>s, all carrying the SAME data-txn-row-id
     // (the meta's txn id, not the posting). getNodeKey returns
     // `txn:${txnRowId}` for both, which collides in morphdom's keyed
-    // map. After the user deletes one of the legs (the click handler
-    // does tr.remove() on the clicked leg only, then pendingDeletes
-    // adds the txn id, then the next render filters BOTH legs out for
-    // a moment), morphdom's diff has to handle the surviving sibling
-    // gracefully when subsequent renders bring legs back.
+    // map. When one leg leaves the DOM before a render (an optimistic
+    // "remove" edit drops a txn's rows, a later render brings legs
+    // back), morphdom's diff has to handle the surviving sibling
+    // gracefully.
     //
     // Symptom: clicking another row shows a "hidden" row appearing —
     // the surviving sibling that morphdom didn't track right.
@@ -222,7 +222,7 @@ describe("morphInPlace — non-intrusive DOM updates", () => {
     const leg2Before = root.querySelector('[data-expand-key="txn:swap|leg2"]');
     const otherBefore = root.querySelector('[data-expand-key="txn:other|x"]');
 
-    // The click handler removes leg1 directly via tr.remove().
+    // leg1 leaves the DOM ahead of the render.
     leg2Before!.previousElementSibling!.remove();
 
     // The next render's HTML still contains the surviving leg2 plus
@@ -242,8 +242,8 @@ describe("morphInPlace — non-intrusive DOM updates", () => {
   });
 
   it("multi-leg swap rows: a render that re-adds a deleted leg restores the right row", () => {
-    // After the optimistic delete, .finally clears pendingDeletes and
-    // a subsequent render brings the unwanted-deleted siblings back.
+    // After an optimistic delete is withdrawn (the rebuild did not
+    // apply it), a subsequent render brings the removed siblings back.
     // morphdom must put the new row in the right position next to
     // the surviving sibling and not orphan or duplicate it.
     const root = setup(`
@@ -273,8 +273,8 @@ describe("morphInPlace — non-intrusive DOM updates", () => {
   it("detail row sticks with its owning row when earlier rows disappear", () => {
     // Live-app reproduction: rowA is expanded (so DOM has [rowA,
     // detail-A, rowB, detail-B]). The user deletes rowA via the X
-    // button: tr.remove() and detail.remove() drop both, then
-    // pendingDeletes makes the next render exclude rowA. New HTML is
+    // button: the pending "remove" edit makes the next render exclude
+    // rowA and its detail row. New HTML is
     // [rowB, detail-B]. morphdom must NOT leave detail-A's slot
     // "stuck" between rows so detail-B drifts to the wrong row.
     //
@@ -415,5 +415,237 @@ describe("morphInPlace — non-intrusive DOM updates", () => {
 
     expect(root.querySelector(".cell-edit-input")).toBeNull();
     expect(root.querySelector("td")?.textContent).toBe("SPAM");
+  });
+});
+
+describe("playRowFlashes", () => {
+  function table(): HTMLElement {
+    return setup(`<table><tbody>
+      <tr data-expand-key="leg:a"><td>a1</td><td>a2</td></tr>
+      <tr data-expand-key="txn:b|2026|1|n"><td>b1</td></tr>
+      <tr data-expand-key="leg:c"><td>c1</td></tr>
+    </tbody></table>`);
+  }
+
+  function stubAnimate(root: HTMLElement): Map<string, Keyframe[][]> {
+    const calls = new Map<string, Keyframe[][]>();
+    root.querySelectorAll("td").forEach((td) => {
+      (td as unknown as { animate: unknown }).animate = (frames: Keyframe[]) => {
+        const list = calls.get(td.textContent ?? "") ?? [];
+        list.push(frames);
+        calls.set(td.textContent ?? "", list);
+        return {} as Animation;
+      };
+    });
+    return calls;
+  }
+
+  it("animates every cell of a changed row and of a reverted row, in their own colours", () => {
+    const root = table();
+    const calls = stubAnimate(root);
+    playRowFlashes(root, { changed: new Set(["leg:a"]), reverted: new Set(["txn:b|2026|1|n"]) });
+    expect([...calls.keys()].sort()).toEqual(["a1", "a2", "b1"]);
+    expect(String(calls.get("a1")![0][0].boxShadow)).toContain("59, 130, 246");
+    expect(String(calls.get("b1")![0][0].boxShadow)).toContain("245, 158, 11");
+  });
+
+  it("ends every flash fully transparent and leaves the markup alone", () => {
+    const root = table();
+    const calls = stubAnimate(root);
+    const before = root.innerHTML;
+    playRowFlashes(root, { changed: new Set(["leg:c"]), reverted: new Set() });
+    expect(String(calls.get("c1")![0][1].boxShadow)).toMatch(/, 0\)$/);
+    expect(root.innerHTML).toBe(before);
+  });
+
+  it("skips keys with no rendered row and tolerates no Web Animations support", () => {
+    const root = table();
+    expect(() => playRowFlashes(root, { changed: new Set(["leg:gone", "leg:a"]), reverted: new Set() })).not.toThrow();
+    expect(() => playRowFlashes(root, undefined)).not.toThrow();
+  });
+});
+
+describe("preserveFocus — a render never moves the user's caret", () => {
+  beforeEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  function focusField(root: HTMLElement, start: number, end = start, direction: "forward" | "backward" = "forward") {
+    const input = root.querySelector<HTMLInputElement>("#q")!;
+    input.focus();
+    input.setSelectionRange(start, end, direction);
+    return input;
+  }
+
+  it("leaves a field morphInPlace kept, with the caret the user has now", () => {
+    const root = setup(`<input id="q" value="office" />`);
+    const input = focusField(root, 6);
+    input.setSelectionRange(2, 2); // moved after the work was scheduled
+
+    preserveFocus(() => morphInPlace(root, `<div id="root"><input id="q" value="of" /></div>`));
+
+    expect(root.querySelector("#q")).toBe(input);
+    expect([input.value, input.selectionStart, input.selectionEnd]).toEqual(["office", 2, 2]);
+    expect(document.activeElement).toBe(input);
+  });
+
+  it("gives a field the update replaced the focus and the selection back", () => {
+    const root = setup(`<input id="q" value="office" />`);
+    focusField(root, 2, 4, "backward");
+
+    preserveFocus(() => {
+      root.innerHTML = `<input id="q" value="office" />`;
+    });
+
+    const next = root.querySelector<HTMLInputElement>("#q")!;
+    expect(document.activeElement).toBe(next);
+    expect([next.selectionStart, next.selectionEnd, next.selectionDirection]).toEqual([2, 4, "backward"]);
+  });
+
+  it("clamps the selection to the replaced field's value", () => {
+    const root = setup(`<input id="q" value="office" />`);
+    focusField(root, 6);
+
+    preserveFocus(() => {
+      root.innerHTML = `<input id="q" value="off" />`;
+    });
+
+    const next = root.querySelector<HTMLInputElement>("#q")!;
+    expect([next.selectionStart, next.selectionEnd]).toEqual([3, 3]);
+  });
+
+  it("keeps a focus the update moved on purpose", () => {
+    const root = setup(`<input id="q" value="office" />`);
+    focusField(root, 6);
+
+    preserveFocus(() => {
+      root.innerHTML = `<input id="q" value="office" /><input id="other" />`;
+      root.querySelector<HTMLInputElement>("#other")!.focus();
+    });
+
+    expect(document.activeElement?.id).toBe("other");
+  });
+
+  it("just runs the update when no text field has the focus", () => {
+    const root = setup(`<button id="b">go</button>`);
+    root.querySelector<HTMLButtonElement>("#b")!.focus();
+    const update = vi.fn();
+
+    preserveFocus(update);
+
+    expect(update).toHaveBeenCalledOnce();
+    expect(document.activeElement?.id).toBe("b");
+  });
+});
+
+describe("debouncedRender — typing faster than the debounce plus the search (TASK-150)", () => {
+  const DEBOUNCE_MS = 300;
+  const SEARCH_MS = 800;
+  const KEY_GAP_MS = 400; // longer than the debounce, shorter than the debounce plus the search
+  const CONFIG = { keywords: ["payee"] };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    document.body.innerHTML = "";
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** The accounts search the way main.ts wires it: every render morphs the
+   *  page from `state` and re-attaches the smart search bar, and each change
+   *  schedules the search (SEARCH_MS in the backend), then a render. */
+  function mountSearchPage() {
+    const state = { pills: [] as SearchPill[], text: "", results: "", searches: 0 };
+    const scheduleSearch = debouncedRender(DEBOUNCE_MS);
+    document.body.innerHTML = `<div id="app"></div>`;
+    const app = document.getElementById("app")!;
+    let detach = () => {};
+    function render() {
+      morphInPlace(
+        app,
+        `<div id="app">${renderSmartSearch("search", state.pills, state.text, CONFIG)}` +
+          `<p id="results">${state.results}</p><input id="other" /></div>`,
+      );
+      detach();
+      detach = attachSmartSearch("search", state.pills, CONFIG, (change) => {
+        state.pills = change.pills;
+        state.text = change.text;
+        scheduleSearch(async () => {
+          const query = state.text;
+          state.searches += 1;
+          await new Promise((resolve) => setTimeout(resolve, SEARCH_MS));
+          state.results = `results for ${query}`;
+        }, render);
+      });
+    }
+    render();
+    const input = document.getElementById("searchInput") as HTMLInputElement;
+    input.focus();
+    return { state, input, results: () => document.getElementById("results")!.textContent };
+  }
+
+  /** Type one character at the caret of the focused field, as the browser does. */
+  function typeKey(ch: string): void {
+    const field = document.activeElement as HTMLInputElement;
+    field.setRangeText(ch, field.selectionStart ?? 0, field.selectionEnd ?? 0, "end");
+    field.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+
+  async function typeFast(text: string): Promise<void> {
+    for (const [i, ch] of [...text].entries()) {
+      if (i > 0) await vi.advanceTimersByTimeAsync(KEY_GAP_MS);
+      typeKey(ch);
+    }
+  }
+
+  it("keeps every character in order and the caret where the user is typing", async () => {
+    const { state, input, results } = mountSearchPage();
+
+    await typeFast("office");
+
+    expect(state.results).not.toBe(""); // searches landed while the user typed
+    expect([input.value, input.selectionStart, input.selectionEnd]).toEqual(["office", 6, 6]);
+
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS + SEARCH_MS);
+
+    expect(results()).toBe("results for office");
+    expect(document.activeElement).toBe(input);
+    expect([input.value, input.selectionStart, input.selectionEnd]).toEqual(["office", 6, 6]);
+  });
+
+  it("keeps a caret move the user makes while a search is running", async () => {
+    const { input, results } = mountSearchPage();
+
+    await typeFast("office");
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS); // the last key's search is now running
+    input.setSelectionRange(2, 2);
+    await vi.advanceTimersByTimeAsync(SEARCH_MS);
+
+    expect(results()).toBe("results for office");
+    expect([input.value, input.selectionStart, input.selectionEnd]).toEqual(["office", 2, 2]);
+  });
+
+  it("leaves the focus where the user moved it while a search was running", async () => {
+    const { results } = mountSearchPage();
+
+    await typeFast("office");
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+    document.getElementById("other")!.focus();
+    await vi.advanceTimersByTimeAsync(SEARCH_MS);
+
+    expect(results()).toBe("results for office");
+    expect(document.activeElement?.id).toBe("other");
+  });
+
+  it("runs one search for a burst of keys inside the debounce", async () => {
+    const { state, input, results } = mountSearchPage();
+
+    for (const ch of "office") typeKey(ch);
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS + SEARCH_MS);
+
+    expect(state.searches).toBe(1);
+    expect(results()).toBe("results for office");
+    expect([input.value, input.selectionStart]).toEqual(["office", 6]);
   });
 });

@@ -1,6 +1,8 @@
 /** Transaction aggregation — groups same-date+venue+commodity transactions for display. */
 
-import type { Posting, Transaction, TradeLink } from "./types";
+import type { Transaction } from "./types";
+import { matchesPrefix } from "./meta";
+import { flowAmount } from "./transaction-legs";
 
 export type TxGroup = {
   key: string;
@@ -9,6 +11,8 @@ export type TxGroup = {
   commodity: string;
   narration: string;
   transactions: Transaction[];
+  /** Totals of the rows' in-scope legs as flows for the selected account
+   *  (see `flowAmount`): `totalIn` and `totalOut` are magnitudes. */
   netAmount: number;
   totalIn: number;
   totalOut: number;
@@ -18,10 +22,6 @@ export type TxRowItem =
   | { kind: "single"; transaction: Transaction }
   | { kind: "group-header"; group: TxGroup }
   | { kind: "group-detail"; transaction: Transaction; group: TxGroup };
-
-function matchesPrefix(acct: string, prefix: string): boolean {
-  return acct === prefix || acct.startsWith(prefix + ":");
-}
 
 export function getTxnId(t: Transaction): string {
   return (t.meta ?? "").split(",").map((p) => p.trim()).find((p) => p.startsWith("txn:")) ?? "";
@@ -147,7 +147,7 @@ export function paginateWithGroups(
           let totalIn = 0;
           let totalOut = 0;
           for (const gt of txns) {
-            const amt = postingAmount(gt, selectedAccount);
+            const amt = flowAmount(postingAmount(gt, selectedAccount), selectedAccount);
             if (amt >= 0) totalIn += amt;
             else totalOut += Math.abs(amt);
           }

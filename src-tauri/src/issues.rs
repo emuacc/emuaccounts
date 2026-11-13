@@ -18,6 +18,7 @@ use crate::ledger_parser::{AccountBalance, Diagnostic, ParseResult, PriceGraph, 
 use crate::processing_pipeline::{
     detect_account_gaps, AccountFolders, AccountGap, PipelineMetadata,
 };
+use crate::reports::AccountAllowlist;
 
 // ── Public types (serde camelCase to match the existing TS Issue type) ──
 
@@ -83,17 +84,19 @@ pub enum Category {
     PipelineWarnings,
     AccountGaps,
     UnverifiedBalances,
+    UnbalancedClearing,
     TradeSuggestions,
     Unpriced,
 }
 
 impl Category {
-    pub const ALL: [Category; 7] = [
+    pub const ALL: [Category; 8] = [
         Category::ParseErrors,
         Category::Uncategorised,
         Category::PipelineWarnings,
         Category::AccountGaps,
         Category::UnverifiedBalances,
+        Category::UnbalancedClearing,
         Category::TradeSuggestions,
         Category::Unpriced,
     ];
@@ -105,6 +108,7 @@ impl Category {
             Category::PipelineWarnings => "--pipeline-warnings",
             Category::AccountGaps => "--gaps",
             Category::UnverifiedBalances => "--unverified",
+            Category::UnbalancedClearing => "--unbalanced-clearing",
             Category::TradeSuggestions => "--trade-suggestions",
             Category::Unpriced => "--unpriced",
         }
@@ -339,16 +343,24 @@ pub fn collect_account_gaps(gaps: &[AccountGap], for_account: Option<&str>) -> V
         .collect()
 }
 
+/// An `assets:*` account with no declared opening: its balance is whatever
+/// the imported rows add up to. Clearing accounts are not holdings, so they
+/// never need an opening.
+fn is_unverified(account: &str, opening: &HashSet<&str>, clearing: &AccountAllowlist) -> bool {
+    account.starts_with("assets:") && !opening.contains(account) && !clearing.allows(account)
+}
+
 pub fn collect_unverified_balances(
     balances: &[AccountBalance],
     accounts_with_opening: &[String],
+    clearing: &AccountAllowlist,
     for_account: Option<&str>,
 ) -> Option<IssueGroup> {
     let opening: HashSet<&str> = accounts_with_opening.iter().map(|s| s.as_str()).collect();
     let unverified: Vec<&str> = balances
         .iter()
         .map(|b| b.account.as_str())
-        .filter(|a| a.starts_with("assets:") && !opening.contains(a))
+        .filter(|a| is_unverified(a, &opening, clearing))
         .filter(|a| for_account.is_none_or(|f| *a == f))
         .collect();
     if unverified.is_empty() {
@@ -367,6 +379,121 @@ pub fn collect_unverified_balances(
                 )
             })
             .collect(),
+        filter_kind: None,
+        reveal_path: None,
+        account: None,
+    })
+}
+
+/// A posting amount exactly as written, as a count of `10^-decimals` units:
+/// `-1,234.50` → `(-123450, 2)`. `None` for text outside the amount grammar
+/// or past what i128 holds.
+fn written_units(amount_text: &str) -> Option<(i128, u32)> {
+    let text = amount_text.replace(',', "");
+    let (negative, unsigned) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(&text)),
+    };
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    if whole.is_empty() || !whole.chars().chain(fraction.chars()).all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let units: i128 = format!("{whole}{fraction}").parse().ok()?;
+    let decimals = u32::try_from(fraction.len()).ok()?;
+    Some((if negative { -units } else { units }, decimals))
+}
+
+/// `units` at `decimals` as a decimal string: `(-123450, 2)` → `-1234.50`.
+fn format_units(units: i128, decimals: u32) -> String {
+    let sign = if units < 0 { "-" } else { "" };
+    let digits = units.unsigned_abs().to_string();
+    let decimals = decimals as usize;
+    if decimals == 0 {
+        return format!("{sign}{digits}");
+    }
+    let padded = format!("{digits:0>width$}", width = decimals + 1);
+    let (whole, fraction) = padded.split_at(padded.len() - decimals);
+    format!("{sign}{whole}.{fraction}")
+}
+
+/// The running sum of one clearing account's postings in one commodity, kept
+/// exactly at the most decimals written so far.
+#[derive(Default)]
+struct Leftover {
+    units: i128,
+    decimals: u32,
+    /// Set once a posting can't be summed exactly (past i128): the pair is
+    /// then judged on the parsed amounts instead.
+    inexact: bool,
+    approximate: f64,
+}
+
+impl Leftover {
+    fn add(&mut self, amount_text: &str, amount: f64) {
+        self.approximate += amount;
+        let exact = written_units(amount_text).and_then(|(units, decimals)| {
+            let scale = decimals.max(self.decimals);
+            let sum = self.units.checked_mul(10i128.checked_pow(scale - self.decimals)?)?;
+            let units = units.checked_mul(10i128.checked_pow(scale - decimals)?)?;
+            Some((sum.checked_add(units)?, scale))
+        });
+        match exact {
+            Some((units, decimals)) => (self.units, self.decimals) = (units, decimals),
+            None => self.inexact = true,
+        }
+    }
+
+    /// The amount left over at the precision it was written in, or `None`
+    /// when that is zero.
+    fn left_over(&self) -> Option<String> {
+        if self.inexact {
+            let decimals = self.decimals as usize;
+            let text = format!("{:.decimals$}", self.approximate);
+            return text.trim_start_matches('-').bytes().any(|b| b.is_ascii_digit() && b != b'0').then_some(text);
+        }
+        (self.units != 0).then(|| format_units(self.units, self.decimals))
+    }
+}
+
+/// Clearing accounts whose postings don't net to zero: one issue per account
+/// and commodity, with the amount left over. Pass the whole vault's
+/// transactions, because a transfer between two sets goes through the
+/// clearing account in both. The sum is taken exactly over the amounts as
+/// written, so a leftover is reported at the most decimals written in that
+/// account's postings in that commodity, and a zero is exactly zero.
+pub fn collect_unbalanced_clearing(
+    transactions: &[Transaction],
+    clearing: &AccountAllowlist,
+    for_account: Option<&str>,
+) -> Option<IssueGroup> {
+    let mut leftovers: BTreeMap<(&str, &str), Leftover> = BTreeMap::new();
+    for p in transactions.iter().flat_map(|t| &t.postings) {
+        if !clearing.allows(&p.account) || for_account.is_some_and(|a| a != p.account) {
+            continue;
+        }
+        leftovers
+            .entry((&p.account, &p.commodity))
+            .or_default()
+            .add(&p.amount_text, p.amount);
+    }
+    let issues: Vec<Issue> = leftovers
+        .into_iter()
+        .filter_map(|((account, commodity), leftover)| {
+            let amount = leftover.left_over()?;
+            Some(Issue::plain(
+                IssueSeverity::Warning,
+                "Unbalanced clearing account",
+                format!("{account} — {amount} {commodity} left over"),
+            ))
+        })
+        .collect();
+    if issues.is_empty() {
+        return None;
+    }
+    Some(IssueGroup {
+        label: "Unbalanced clearing account".into(),
+        severity: IssueSeverity::Warning,
+        issues,
         filter_kind: None,
         reveal_path: None,
         account: None,
@@ -504,11 +631,12 @@ fn count_account_gaps(gaps: &[AccountGap], counts: &mut BTreeMap<String, usize>)
 fn count_unverified(
     balances: &[AccountBalance],
     accounts_with_opening: &[String],
+    clearing: &AccountAllowlist,
     counts: &mut BTreeMap<String, usize>,
 ) {
     let opening: HashSet<&str> = accounts_with_opening.iter().map(|s| s.as_str()).collect();
     for b in balances {
-        if b.account.starts_with("assets:") && !opening.contains(b.account.as_str()) {
+        if is_unverified(&b.account, &opening, clearing) {
             bump(counts, &b.account);
         }
     }
@@ -519,7 +647,7 @@ fn count_unverified(
 /// Bump when issue-collection logic changes — it participates in the persisted
 /// issues-cache key (generated/.cache/issues.json), so stale artifacts from
 /// older collection logic are invalidated. Same pattern as MATCHER_VERSION.
-pub const COLLECT_VERSION: u32 = 1;
+pub const COLLECT_VERSION: u32 = 2;
 
 /// Aggregated result: the issue groups the UI shows plus per-account badge counts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -565,6 +693,10 @@ pub fn collect_all(
     let account_folders = PipelineMetadata::load(generated_dir)
         .map(|m| m.account_folders)
         .unwrap_or_default();
+    let clearing = AccountAllowlist::new(
+        HashSet::new(),
+        &crate::display_config::vault_clearing_accounts(generated_dir)?,
+    );
 
     if filter.wants(Category::PipelineWarnings) {
         groups.extend(collect_pipeline_warnings(
@@ -576,7 +708,21 @@ pub fn collect_all(
         count_pipeline_warnings(&warnings_file.warnings, &mut account_counts);
     }
 
-    let graph = if filter.wants(Category::Unpriced) {
+    // Vault-wide: the whole vault's ledger, every set at once. Not the sum of
+    // the per-set loads below, which only visit sets with a ledger or config
+    // file at their root.
+    if filter.wants(Category::UnbalancedClearing) {
+        let vault = load_active_ledger(generated_dir)
+            .map_err(|e| format!("load_active_ledger({}): {e}", generated_dir.display()))?;
+        push(
+            &mut groups,
+            collect_unbalanced_clearing(&vault.transactions, &clearing, filter.account.as_deref()),
+        );
+    }
+
+    // Every file under sources/_prices is parsed here (27 MB on a large
+    // vault): once, for every set and category that prices.
+    let graph = if filter.wants(Category::Unpriced) || filter.wants(Category::TradeSuggestions) {
         Some(PriceGraph::load(sources_dir))
     } else {
         None
@@ -610,10 +756,16 @@ pub fn collect_all(
                 collect_unverified_balances(
                     &parse.balances,
                     &parse.accounts_with_opening,
+                    &clearing,
                     filter.account.as_deref(),
                 ),
             );
-            count_unverified(&parse.balances, &parse.accounts_with_opening, &mut account_counts);
+            count_unverified(
+                &parse.balances,
+                &parse.accounts_with_opening,
+                &clearing,
+                &mut account_counts,
+            );
         }
         if filter.wants(Category::AccountGaps) {
             let gaps = detect_account_gaps(set_dir).unwrap_or_default();
@@ -630,11 +782,10 @@ pub fn collect_all(
             push(&mut groups, collect_unpriced(&parse.transactions, graph, base));
         }
         if let Some(existing) = existing_links.as_deref() {
-            let price_graph_for_trades = PriceGraph::load(sources_dir);
             let suggestions = suggest_trade_links(
                 &parse.transactions,
                 existing,
-                base.as_ref().map(|_| &price_graph_for_trades),
+                base.as_ref().and(graph.as_ref()),
                 base.as_deref(),
             );
             push(&mut groups, collect_trade_suggestions(&suggestions));
@@ -767,7 +918,8 @@ mod tests {
                 totals: vec![],
             },
         ];
-        let g = collect_unverified_balances(&balances, &[], None).expect("group");
+        let g = collect_unverified_balances(&balances, &[], &AccountAllowlist::default(), None)
+            .expect("group");
         assert_eq!(g.issues.len(), 1);
         assert!(g.issues[0].message.contains("assets:bank"));
     }
@@ -778,8 +930,50 @@ mod tests {
             account: "assets:bank".into(),
             totals: vec![],
         }];
-        let g = collect_unverified_balances(&balances, &["assets:bank".into()], None);
+        let g = collect_unverified_balances(
+            &balances,
+            &["assets:bank".into()],
+            &AccountAllowlist::default(),
+            None,
+        );
         assert!(g.is_none());
+    }
+
+    #[test]
+    fn unverified_balance_skips_clearing_sub_accounts() {
+        let balances = vec![AccountBalance {
+            account: "assets:transfer:cash".into(),
+            totals: vec![],
+        }];
+        let clearing = AccountAllowlist::new(HashSet::new(), &["assets:transfer".into()]);
+        assert!(collect_unverified_balances(&balances, &[], &clearing, None).is_none());
+    }
+
+    #[test]
+    fn written_units_reads_the_amount_exactly() {
+        assert_eq!(written_units("-1,234.50"), Some((-123450, 2)));
+        assert_eq!(written_units("+7"), Some((7, 0)));
+        assert_eq!(written_units("0.00500000"), Some((500000, 8)));
+        assert_eq!(written_units("1e5"), None);
+        assert_eq!(written_units(&"9".repeat(40)), None);
+    }
+
+    #[test]
+    fn format_units_pads_the_fraction() {
+        assert_eq!(format_units(-123450, 2), "-1234.50");
+        assert_eq!(format_units(1, 18), "0.000000000000000001");
+        assert_eq!(format_units(42, 0), "42");
+    }
+
+    #[test]
+    fn a_leftover_past_i128_is_judged_on_the_parsed_amounts() {
+        let huge = format!("{}.5", "9".repeat(40));
+        let mut leftover = Leftover::default();
+        leftover.add(&huge, 1e40);
+        leftover.add(&format!("-{huge}"), -1e40);
+        assert_eq!(leftover.left_over(), None);
+        leftover.add("2.5", 2.5);
+        assert_eq!(leftover.left_over().as_deref(), Some("2.5"));
     }
 
     #[test]

@@ -7,13 +7,13 @@ const { By } = require("selenium-webdriver");
 When(
   "I tag the first transaction row with marker {string}",
   async function (marker) {
-    // Add a custom data attribute via the DevTools-equivalent script
-    // execution. If morphdom preserves the row's identity across the
-    // next render, this attribute will still be present afterward.
+    // A property on the DOM node, not an attribute: morphdom removes attributes
+    // the new HTML doesn't have, so a background render would strip one from a
+    // node it kept. A property is gone only if the node itself was replaced.
     await this.driver.executeScript(`
       const row = document.querySelector('[data-testid="txn-row"]');
       if (!row) throw new Error("no txn row to tag");
-      row.setAttribute("data-architectural-marker", arguments[0]);
+      row.e2eMarker = arguments[0];
     `, marker);
   },
 );
@@ -45,7 +45,7 @@ Then(
   async function (expected) {
     const actual = await this.driver.executeScript(`
       const row = document.querySelector('[data-testid="txn-row"]');
-      return row ? row.getAttribute("data-architectural-marker") : null;
+      return row?.e2eMarker ?? null;
     `);
     assert.equal(
       actual,

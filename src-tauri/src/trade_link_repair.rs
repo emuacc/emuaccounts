@@ -16,7 +16,7 @@ use std::path::Path;
 
 use crate::ledger_parser::{parse_transactions, Transaction};
 use crate::rules::{build_trade_link_rules, Rule, RulesFile};
-use crate::trade_links::TradeLink;
+use crate::trade_links::{self, trade_link_id, TradeLink};
 
 fn extract_meta_anchor(meta: &Option<String>, prefix: &str) -> Option<String> {
     meta.as_ref().and_then(|m| {
@@ -283,6 +283,45 @@ pub fn plan_trade_link_rules(
         default_folder.to_string(),
         build_trade_link_rules(link_id, sell_txn_id, buy_txn_id),
     )
+}
+
+/// Link two transactions as a trade: record the pair in the vault's trade
+/// links and write the rules that categorise each side. Returns the folder
+/// holding the rules, which is the one to rebuild.
+pub fn write_trade_link(
+    sources_dir: &Path,
+    generated_dir: &Path,
+    txn_id_a: &str,
+    txn_id_b: &str,
+    account_folder: &str,
+    is_a_sell: bool,
+) -> Result<String, String> {
+    trade_links::save(sources_dir, &[(txn_id_a, txn_id_b)])?;
+    let id = trade_link_id(txn_id_a, txn_id_b);
+
+    // For an on-chain swap (both legs share a txn id) the rule must be
+    // leg-anchored and co-located in the leaf folder that owns the legs, or a
+    // pre-existing per-leg categorisation would outrank it;
+    // plan_trade_link_rules resolves that from the built ledgers.
+    let by_folder = load_per_folder_ledgers(generated_dir, sources_dir);
+    let (sell_txn, buy_txn) = if is_a_sell {
+        (txn_id_a, txn_id_b)
+    } else {
+        (txn_id_b, txn_id_a)
+    };
+    let (target_folder, link_rules) =
+        plan_trade_link_rules(&id, sell_txn, buy_txn, account_folder, &by_folder);
+    let folder = sources_dir.join(&target_folder);
+    let mut rules = RulesFile::try_load(&folder)?;
+    let rule_count_before = rules.rules.len();
+    rules.insert_rules(link_rules);
+    rules.save(&folder)?;
+    eprintln!(
+        "[trade-link] wrote {rule_count_before} -> {} rules to {}",
+        rules.rules.len(),
+        folder.join("_rules.json").display()
+    );
+    Ok(target_folder)
 }
 
 #[cfg(test)]

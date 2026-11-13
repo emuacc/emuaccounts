@@ -78,7 +78,9 @@ function main() {
     process.exit(0);
   }
 
-  const res = spawnSync("npx", ["cucumber-js"], { stdio: "inherit", shell: true });
+  // One command string: Windows needs the shell for npx.cmd, and the shell has
+  // to see the --tags expression quoted.
+  const res = spawnSync('npx cucumber-js --tags "not @wip and not @appium"', { stdio: "inherit", shell: true });
   process.exit(res.status ?? 1);
 }
 

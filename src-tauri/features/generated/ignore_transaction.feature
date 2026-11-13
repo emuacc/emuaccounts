@@ -59,6 +59,28 @@ Feature: Hide and delete transactions
     And the noted txn ids of the remaining manual transactions should be unchanged
     And exactly 1 transaction with payee "Third" should post to "ignore:hidden"
 
+  Scenario: Unhiding a hidden transaction returns it to its account
+    Given a clean sources directory with a CSV and transform
+    And a "manual.transactions" file with transactions:
+      | Date       | Payee  | Narration |
+      | 2025-01-10 | Keep   | stays     |
+      | 2025-01-11 | Hidden | goes back |
+    When I run the pipeline
+    And I hide the manual transaction with payee "Hidden"
+    And I run the pipeline
+    Then exactly 1 transaction with payee "Hidden" should post to "ignore:hidden"
+    When I unhide the transaction with payee "Hidden"
+    And I run the pipeline
+    Then exactly 0 transactions with payee "Hidden" should post to "ignore:hidden"
+    And the active ledger should include payee "Hidden"
+    And the rules file "bank/_rules.json" should contain 0 rules
+
+  Scenario: Unhiding a transaction that was never hidden fails
+    Given a clean sources directory with a CSV and transform
+    When I run the pipeline
+    And I try to unhide txn id "txn:never-hidden"
+    Then the operation should fail with "not hidden"
+
   Scenario: Identical manual transactions get distinct ids and can be hidden one at a time
     Given a clean sources directory with a CSV and transform
     And a "manual.transactions" file with transactions:

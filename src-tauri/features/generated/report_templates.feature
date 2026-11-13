@@ -51,6 +51,33 @@ Feature: Report template rendering
     When I run the pipeline
     Then the generated reports directory should contain "cgt-2026.md"
 
+  # Nothing regenerates the report files after a table edit. A set's reports
+  # are stamped with what they were computed from; the app reads a cached
+  # report only while the stamp is current and computes it live otherwise,
+  # so an edit shows in the Reports view at once.
+  Scenario: A rebuilt ledger makes the cached reports stale until they are regenerated
+    Given a clean sources directory with a file "alex/exchange/manual.transactions":
+      """
+      2025-01-15 * "Exchange" "Buy ETH"
+          assets:exchange:eth 1 ETH {{ 1000.00 AUD }}
+          equity:trading:buy -1000.00 AUD
+
+      2025-08-20 * "Exchange" "Sell ETH"
+          assets:exchange:eth -1 ETH @@ 2000.00 AUD
+          equity:trading:sell 2000.00 AUD
+      """
+    And the vault config.json contains:
+      """
+      {"base_currency": "AUD"}
+      """
+    When I run the pipeline
+    Then the cached CGT report for FY "2026" is current
+    When a "manual.transactions" file is added to "alex/bank" with payee "OfflineAdd"
+    And I run the pipeline without regenerating reports
+    Then the cached CGT report for FY "2026" is stale
+    When the reports are regenerated
+    Then the cached CGT report for FY "2026" is current
+
   # Each cgt-YYYY report carries only its own year's warnings; the whole
   # list is written once, so one new warning touches two files, not two
   # per financial year.

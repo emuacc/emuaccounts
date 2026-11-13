@@ -18,6 +18,9 @@ export interface AccountSuggestionSources {
   transactions?: { postings: { account: string }[] }[];
   /** Every account across the whole vault (load_account_tree("")). */
   allAccounts?: string[];
+  /** Accounts a mutation in flight is writing, offered before its refresh
+   *  adds them to `allAccounts`. */
+  pendingAccounts?: string[];
 }
 
 export function collectAccountSuggestions(src: AccountSuggestionSources): string[] {
@@ -30,5 +33,11 @@ export function collectAccountSuggestions(src: AccountSuggestionSources): string
     for (const p of t.postings) accounts.add(p.account);
   }
   for (const a of src.allAccounts ?? []) accounts.add(a);
+  for (const a of src.pendingAccounts ?? []) accounts.add(a);
   return [...accounts].sort();
+}
+
+/** The vault-wide pool plus the pending accounts it doesn't hold yet. */
+export function knownAccounts(allAccounts: string[], pending: readonly string[]): string[] {
+  return pending.length === 0 ? allAccounts : [...new Set([...allAccounts, ...pending])];
 }

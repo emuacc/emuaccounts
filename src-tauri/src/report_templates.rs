@@ -352,7 +352,9 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
         .map_err(|e| format!("failed to write {}: {e}", path.display()))
 }
 
-/// Generate reports for all account sets after a pipeline rebuild.
+/// Generate reports for all account sets after a pipeline rebuild, and stamp
+/// each set's reports directory with what they were computed from, so the
+/// cached JSON is trusted only while that is unchanged ([`cached_report`]).
 pub fn generate_all_reports(
     sources_dir: &Path,
     generated_dir: &Path,
@@ -366,24 +368,81 @@ pub fn generate_all_reports(
     // Reports are part of generated/: a price-only refresh rewrites them
     // without a pipeline run, so they record their producing build too.
     crate::generator::stamp(generated_dir)?;
-    if account_sets.is_empty() {
+    let set_dirs: Vec<PathBuf> = if account_sets.is_empty() {
         // Root directory (no multi-entity)
-        regenerate_reports_for_set(generated_dir, generated_dir, sources_dir, formats, primaries.as_ref())?;
+        vec![generated_dir.to_path_buf()]
     } else {
-        for set_name in account_sets {
-            let set_dir = generated_dir.join(set_name);
-            if set_dir.exists() {
-                regenerate_reports_for_set(
-                    generated_dir,
-                    &set_dir,
-                    sources_dir,
-                    formats,
-                    primaries.as_ref(),
-                )?;
-            }
-        }
+        account_sets
+            .iter()
+            .map(|set_name| generated_dir.join(set_name))
+            .filter(|set_dir| set_dir.exists())
+            .collect()
+    };
+    for set_dir in &set_dirs {
+        regenerate_reports_for_set(generated_dir, set_dir, sources_dir, formats, primaries.as_ref())?;
+        let fingerprint = reports_fingerprint(generated_dir, set_dir, sources_dir, extra_prefixes)?;
+        std::fs::write(reports_stamp_path(set_dir), fingerprint)
+            .map_err(|e| format!("failed to stamp {}: {e}", reports_dir(set_dir).display()))?;
     }
     Ok(())
+}
+
+/// Where a set's reports record what they were computed from.
+fn reports_stamp_path(set_dir: &Path) -> PathBuf {
+    reports_dir(set_dir).join(".stamp")
+}
+
+/// Everything a set's reports are computed from, by content: the set's
+/// generated ledgers (by the hash the cache manifest recorded for each), the
+/// price files, the set's and the vault's config (base currency, tax config,
+/// hidden and clearing accounts) and the extra primary-account prefixes. A
+/// rebuild that rewrites a ledger in the set, a price update or a settings
+/// change moves it; a rebuild that touches another set does not.
+pub fn reports_fingerprint(
+    generated_dir: &Path,
+    set_dir: &Path,
+    sources_dir: &Path,
+    extra_prefixes: &[String],
+) -> Result<String, String> {
+    let manifest = crate::build_cache::load_cache_filtered(generated_dir, Some(&HashSet::new()));
+    let set_prefix = set_dir
+        .strip_prefix(generated_dir)
+        .map(|rel| rel.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ledgers: std::collections::BTreeMap<String, String> = manifest
+        .output_hashes
+        .into_iter()
+        .filter(|(rel, _)| set_prefix.is_empty() || rel.starts_with(&format!("{set_prefix}/")))
+        .collect();
+    let file = |path: PathBuf| crate::build_cache::file_hash(&path).unwrap_or_default();
+    Ok(crate::derived_cache::value_hash(&(
+        ledgers,
+        crate::build_cache::dir_fingerprint(&sources_dir.join("_prices"))?,
+        file(set_dir.join("config.json")),
+        file(generated_dir.join("config.json")),
+        extra_prefixes,
+    )))
+}
+
+/// A set's cached report at `path`, if its reports were generated from what
+/// the set holds now; None when they are missing or stale, and the caller
+/// computes the report live. Nothing regenerates the files after a table
+/// edit: every rewritten ledger used to cost a full run over every set and
+/// format (21 s in release on a large vault) that the view rarely read.
+pub fn cached_report<T: serde::de::DeserializeOwned>(
+    generated_dir: &Path,
+    set_dir: &Path,
+    sources_dir: &Path,
+    extra_prefixes: &[String],
+    path: &Path,
+) -> Option<T> {
+    let stamp = std::fs::read_to_string(reports_stamp_path(set_dir)).ok()?;
+    let current = reports_fingerprint(generated_dir, set_dir, sources_dir, extra_prefixes).ok()?;
+    if stamp != current {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<T>(&text).ok()
 }
 
 /// List available report years for a given report type in a reports directory.

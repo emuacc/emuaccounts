@@ -1,6 +1,7 @@
 // Render helper functions extracted for testability.
 // These are pure functions that take state and return HTML strings.
 
+import { knownAccounts } from "./account-suggestions";
 import { shortAccountPath } from "./account-utils";
 import { formatMoney, formatMoneyWhole } from "./format";
 import { defaultTerms, overridesOf, term, termTitle, type Term, type TermOverride } from "./terminology";
@@ -19,6 +20,7 @@ import type {
   LossHarvestReport,
   PerformanceReport,
   TaxConfig,
+  Transaction,
 } from "./types";
 
 const CURRENCY_DECIMALS = 2;
@@ -67,7 +69,53 @@ export function escapeText(text: string): string {
     .replace(/'/g, "&#039;");
 }
 
-const MONTH_ABBR = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+/** A transaction row's expanded detail. Each editor seeds from a cell of the row,
+ *  so `editors` names the ones this row has the cell for: a trade has no category
+ *  cell and a swap row has neither. */
+export function renderTxnDetailRow(
+  t: Transaction,
+  txnId: string,
+  expandKey: string,
+  accountFolder: string,
+  explorerUrl: string | undefined,
+  colSpan: number,
+  editors: { rule: boolean; party: boolean },
+): string {
+  const rawId = txnId.startsWith("txn:") ? txnId.slice(4) : txnId;
+  const txnLink = explorerUrl && rawId
+    ? `<a class="txDetail__link" data-open-explorer="${escapeText(explorerUrl.replace("{txn_id}", rawId))}">${escapeText(rawId)}</a>`
+    : `<span class="txDetail__hash">${escapeText(rawId || "—")}</span>`;
+
+  const postingsHtml = t.postings
+    .map(
+      (p) =>
+        `<div class="txDetail__posting"><span class="txDetail__postingAccount">${escapeText(p.account)}</span> <span class="txDetail__postingAmount">${escapeText(String(p.amount))} ${escapeText(p.commodity)}</span></div>`,
+    )
+    .join("");
+
+  const ruleBtn = editors.rule
+    ? `<button class="btn btn--small txDetail__ruleBtn" data-edit-rule-from-detail="${escapeText(expandKey)}">Edit Rule</button>`
+    : "";
+  const partyBtn = editors.party
+    ? `<button class="btn btn--small txDetail__partyBtn" data-edit-party-from-detail="${escapeText(expandKey)}">Edit Party</button>`
+    : "";
+  const actionsHtml = ruleBtn || partyBtn ? `<div class="txDetail__actions">${ruleBtn}${partyBtn}</div>` : "";
+
+  return `<tr class="txRow__detail" data-txn-detail-for="${escapeText(expandKey)}">
+    <td colspan="${colSpan}">
+      <div class="txDetail">
+        <div class="txDetail__row"><span class="txDetail__label">Txn ID</span>${txnLink}</div>
+        <div class="txDetail__row"><span class="txDetail__label">Payee</span><span>${escapeText(t.payee ?? "—")}</span></div>
+        <div class="txDetail__row"><span class="txDetail__label">Meta</span><span>${escapeText(t.meta ?? "—")}</span></div>
+        <div class="txDetail__row"><span class="txDetail__label">Source</span><span>${escapeText(accountFolder || "—")}</span></div>
+        <div class="txDetail__row txDetail__row--postings"><span class="txDetail__label">Postings</span><div>${postingsHtml}</div></div>
+        ${actionsHtml}
+      </div>
+    </td>
+  </tr>`;
+}
+
+const MONTH_ABBR =["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 
 export function fyLabel(fy: string, taxConfig?: TaxConfig): string {
   const endMonth = taxConfig?.financial_year_end_month ?? 6;
@@ -114,6 +162,12 @@ export type ReportState = {
   globalSettingsOpen?: boolean;
   globalSettingsDraft?: string[];
   extraPrimaryAccountPrefixes?: string[];
+  // "Show all holdings" (app-wide) and the vault's clearing accounts, with
+  // their working copies while the modal is open.
+  showAllHoldings?: boolean;
+  showAllHoldingsDraft?: boolean;
+  clearingAccounts?: string[];
+  clearingAccountsDraft?: string[];
   // AI provider working copy while the Global Settings modal is open.
   aiSettingsDraft?: {
     apiUrl: string;
@@ -123,6 +177,7 @@ export type ReportState = {
     userName?: string;
   };
   allAccounts?: string[];
+  pendingAccounts?: string[];
   // Display terminology (Global Settings → Terminology): the resolved terms
   // from the backend, and the editor's working copy while the modal is open.
   terms?: Term[];
@@ -1009,16 +1064,55 @@ export function renderDocImportModal(draft: DocImportDraft | undefined, busy: bo
   `;
 }
 
-/// Global Settings modal. Currently holds the "Accounts included in balance"
-/// editor (extra primary-account prefixes). Designed as the shared shell for
-/// app-wide settings — other global settings (currency, decimals, data folder)
-/// can be added as further `settingsSection`s.
+/// An editable account list in Global Settings: one row per entry with a remove
+/// button carrying `removeAttr`, then an input (suggesting from the shared
+/// `globalPrefixOptions` datalist) and its Add button.
+function renderAccountListEditor(editor: {
+  items: string[];
+  removeAttr: string;
+  listTestId: string;
+  emptyText: string;
+  inputId: string;
+  inputTestId: string;
+  inputLabel: string;
+  placeholder: string;
+  addId: string;
+}): string {
+  const rows = editor.items.length
+    ? editor.items
+        .map(
+          (p) => `
+          <li class="prefixList__row">
+            <span class="prefixList__name">${escapeText(p)}</span>
+            <button class="prefixList__remove" type="button" ${editor.removeAttr}="${escapeText(p)}" aria-label="Remove ${escapeText(p)}">✕</button>
+          </li>`,
+        )
+        .join("")
+    : `<li class="prefixList__empty">${editor.emptyText}</li>`;
+  return `
+            <ul class="prefixList" data-testid="${editor.listTestId}">${rows}</ul>
+            <div class="settingsSection__row">
+              <label class="formField formField--grow">
+                <span class="formField__label">${editor.inputLabel}</span>
+                <input id="${editor.inputId}" data-testid="${editor.inputTestId}" class="formField__input" list="globalPrefixOptions" placeholder="${editor.placeholder}" />
+              </label>
+              <button id="${editor.addId}" class="btn btn--secondary" type="button">Add</button>
+            </div>`;
+}
+
+/// Global Settings modal: the "Accounts included in balance" editor (extra
+/// primary-account prefixes), "Show all holdings", the vault's clearing
+/// accounts, the AI assistant and terminology. The shared shell for settings —
+/// others can be added as further `settingsSection`s.
 export function renderGlobalSettingsModal(state: ReportState): string {
   if (!state.globalSettingsOpen) return "";
-  // The draft is the working copy while the modal is open; fall back to the
-  // persisted list so the modal still renders if opened without seeding.
+  // The drafts are the working copies while the modal is open; fall back to
+  // the persisted values so the modal still renders if opened without seeding.
   const prefixes = state.globalSettingsDraft ?? state.extraPrimaryAccountPrefixes ?? [];
-  const options = (state.allAccounts ?? []).filter((a) => a.startsWith("assets:"));
+  const clearing = state.clearingAccountsDraft ?? state.clearingAccounts ?? [];
+  const showAllHoldings = state.showAllHoldingsDraft ?? state.showAllHoldings ?? false;
+  const options = knownAccounts(state.allAccounts ?? [], state.pendingAccounts ?? [])
+    .filter((a) => a.startsWith("assets:"));
   const ai = state.aiSettingsDraft ?? { apiUrl: "", apiKey: "", model: "" };
   const aiEffort = ai.reasoningEffort ?? "";
   const aiEffortOptions = ["", "low", "medium", "high"]
@@ -1027,17 +1121,6 @@ export function renderGlobalSettingsModal(state: ReportState): string {
         `<option value="${v}"${v === aiEffort ? " selected" : ""}>${v === "" ? "Model default" : v[0].toUpperCase() + v.slice(1)}</option>`,
     )
     .join("");
-  const rows = prefixes.length
-    ? prefixes
-        .map(
-          (p) => `
-          <li class="prefixList__row">
-            <span class="prefixList__name">${escapeText(p)}</span>
-            <button class="prefixList__remove" type="button" data-prefix-remove="${escapeText(p)}" aria-label="Remove ${escapeText(p)}">✕</button>
-          </li>`,
-        )
-        .join("")
-    : `<li class="prefixList__empty">Only source-folder accounts (wallets, exchanges, banks) count toward balances.</li>`;
   return `
     <div class="modalOverlay" role="dialog" aria-modal="true">
       <div class="modal modal--wide">
@@ -1046,17 +1129,43 @@ export function renderGlobalSettingsModal(state: ReportState): string {
           <div class="settingsSection">
             <h3 class="settingsSection__heading">Accounts included in balance</h3>
             <p class="settingsSection__hint">Source-folder accounts (wallets, exchanges, banks) always count. Add nominal account prefixes here — e.g. <code>assets:staking</code> — to also count them in the Balances, Performance and Tax Savings reports. Each entry includes its sub-accounts.</p>
-            <ul class="prefixList" data-testid="primary-prefix-list">${rows}</ul>
-            <div class="settingsSection__row">
-              <label class="formField formField--grow">
-                <span class="formField__label">Add account prefix</span>
-                <input id="globalPrefixInput" data-testid="primary-prefix-input" class="formField__input" list="globalPrefixOptions" placeholder="assets:staking" />
-              </label>
-              <button id="globalPrefixAdd" class="btn btn--secondary" type="button">Add</button>
-            </div>
+            ${renderAccountListEditor({
+              items: prefixes,
+              removeAttr: "data-prefix-remove",
+              listTestId: "primary-prefix-list",
+              emptyText: "Only source-folder accounts (wallets, exchanges, banks) count toward balances.",
+              inputId: "globalPrefixInput",
+              inputTestId: "primary-prefix-input",
+              inputLabel: "Add account prefix",
+              placeholder: "assets:staking",
+              addId: "globalPrefixAdd",
+            })}
             <datalist id="globalPrefixOptions">
               ${options.map((a) => `<option value="${escapeText(a)}"></option>`).join("")}
             </datalist>
+          </div>
+          <div class="settingsSection">
+            <h3 class="settingsSection__heading">Accounts pane</h3>
+            <label class="settingsSection__check">
+              <input id="showAllHoldingsInput" data-testid="show-all-holdings" type="checkbox"${showAllHoldings ? " checked" : ""} />
+              <span>Show all holdings</span>
+            </label>
+            <p class="settingsSection__hint">Also list the holdings that have no source folder of their own — staking, lending, a card only rules post to — in their groups. Display only: one outside “Accounts included in balance” shows its own value, muted, and counts toward no total.</p>
+          </div>
+          <div class="settingsSection">
+            <h3 class="settingsSection__heading">Clearing accounts</h3>
+            <p class="settingsSection__hint">Pass-through accounts that money only moves through, so they should net to zero — e.g. <code>assets:transfer</code>. They appear in neither sidebar pane, and one that doesn't net to zero across the vault is listed under Issues. Each entry includes its sub-accounts. Saved with this data folder.</p>
+            ${renderAccountListEditor({
+              items: clearing,
+              removeAttr: "data-clearing-remove",
+              listTestId: "clearing-account-list",
+              emptyText: "None declared — <code>assets:transfer</code> is used.",
+              inputId: "clearingAccountInput",
+              inputTestId: "clearing-account-input",
+              inputLabel: "Add clearing account",
+              placeholder: "assets:crypto:bridge",
+              addId: "clearingAccountAdd",
+            })}
           </div>
           <div class="settingsSection">
             <h3 class="settingsSection__heading">AI assistant</h3>

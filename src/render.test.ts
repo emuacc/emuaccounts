@@ -14,6 +14,7 @@ import {
   renderRebuildStrip,
   renderSortHeader,
   renderNavButtons,
+  renderTxnDetailRow,
   withFadeInClass,
   escapeText,
   fyLabel,
@@ -29,6 +30,7 @@ import type {
   LossHarvestReport,
   PerformanceReport,
   TaxConfig,
+  Transaction,
 } from "./types";
 import {
   resolveAccountFolder,
@@ -40,6 +42,28 @@ describe("escapeText", () => {
     expect(escapeText('<script>"hello"</script>')).toBe(
       "&lt;script&gt;&quot;hello&quot;&lt;/script&gt;"
     );
+  });
+});
+
+describe("renderTxnDetailRow", () => {
+  const txn = { payee: "Bakery", meta: "txn:1", postings: [] } as unknown as Transaction;
+  const detail = (editors: { rule: boolean; party: boolean }) =>
+    renderTxnDetailRow(txn, "txn:1", "key", "assets/bank", undefined, 6, editors);
+
+  it("offers both editors on a row with both cells", () => {
+    const html = detail({ rule: true, party: true });
+    expect(html).toContain('data-edit-rule-from-detail="key"');
+    expect(html).toContain('data-edit-party-from-detail="key"');
+  });
+
+  it("leaves out Edit Rule on a row with no category cell", () => {
+    const html = detail({ rule: false, party: true });
+    expect(html).not.toContain("data-edit-rule-from-detail");
+    expect(html).toContain('data-edit-party-from-detail="key"');
+  });
+
+  it("leaves out the actions on a row with neither cell", () => {
+    expect(detail({ rule: false, party: false })).not.toContain("txDetail__actions");
   });
 });
 
@@ -629,6 +653,39 @@ describe("renderGlobalSettingsModal", () => {
     expect(html).toContain("Only source-folder accounts");
     expect(html).toContain('value="assets:crypto:wallet:eth"');
     expect(html).not.toContain('value="income:dividends"');
+  });
+
+  it("renders Show all holdings unchecked by default and checked from the draft", () => {
+    const off = renderGlobalSettingsModal({ sidebarView: "accounts", globalSettingsOpen: true });
+    expect(off).toContain("Show all holdings");
+    expect(off).toMatch(/data-testid="show-all-holdings" type="checkbox" \/>/);
+    const on = renderGlobalSettingsModal({
+      sidebarView: "accounts",
+      globalSettingsOpen: true,
+      showAllHoldings: false,
+      showAllHoldingsDraft: true,
+    });
+    expect(on).toMatch(/data-testid="show-all-holdings" type="checkbox" checked \/>/);
+  });
+
+  it("renders the clearing accounts editor from the draft, or the list in force", () => {
+    const persisted = renderGlobalSettingsModal({
+      sidebarView: "accounts",
+      globalSettingsOpen: true,
+      clearingAccounts: ["assets:transfer", "assets:crypto:bridge"],
+    });
+    expect(persisted).toContain("Clearing accounts");
+    expect(persisted).toContain('data-testid="clearing-account-list"');
+    expect(persisted).toContain('data-clearing-remove="assets:crypto:bridge"');
+    expect(persisted).toContain('data-testid="clearing-account-input"');
+    const draft = renderGlobalSettingsModal({
+      sidebarView: "accounts",
+      globalSettingsOpen: true,
+      clearingAccounts: ["assets:transfer"],
+      clearingAccountsDraft: [],
+    });
+    expect(draft).not.toContain("data-clearing-remove=");
+    expect(draft).toContain("None declared");
   });
 
   it("renders the AI assistant section with the draft values", () => {

@@ -8,9 +8,9 @@ That's a good question and initially I didn't set out to build one. After trying
 
 Download the latest release from the [Releases](../../releases) tab and follow the [install steps](USER_GUIDE.md#install) for macOS, Windows or Linux. What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
-One continuous take of the three main flows, re-recorded for every release: choose a data folder, add an account, import a CSV, add a transaction, see the ledger file.
+One continuous take of the three main flows, re-recorded for every release: choose a data folder, add an account, import a CSV, add a transaction, see them by category, see the ledger file.
 
-![Getting started: choose a data folder, add an account, import a CSV, add a transaction, see the ledger file](docs/demos/getting-started.gif)
+![Getting started: choose a data folder, add an account, import a CSV, add a transaction, see them by category, see the ledger file](docs/demos/getting-started.gif)
 
 The same take as a full-resolution video: [MP4](docs/demos/getting-started.mp4) or [WebM](docs/demos/getting-started.webm).
 

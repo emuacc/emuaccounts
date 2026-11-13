@@ -178,6 +178,24 @@ describe("paginateWithGroups", () => {
     }
   });
 
+  it("totals an income group as flows: income earned is in, a loss out", () => {
+    // Income legs are credits, so interest earned is booked negative.
+    const sorted = [
+      txn({ postings: [posting("assets:ex", 10, "USDT"), posting("income:staking", -10, "USDT")] }),
+      txn({ postings: [posting("assets:ex", 20, "USDT"), posting("income:staking", -20, "USDT")] }),
+      txn({ postings: [posting("assets:ex", -5, "USDT"), posting("income:staking", 5, "USDT")] }),
+    ];
+
+    const { items } = paginateWithGroups(sorted, "income", noTradeLinks, noExpanded, 100);
+
+    expect(items[0].kind).toBe("group-header");
+    if (items[0].kind === "group-header") {
+      expect(items[0].group.totalIn).toBe(30);
+      expect(items[0].group.totalOut).toBe(5);
+      expect(items[0].group.netAmount).toBe(25);
+    }
+  });
+
   it("does not group transactions with different narrations", () => {
     // Same date, venue, commodity but different narrations — should NOT be grouped together
     const sorted = [

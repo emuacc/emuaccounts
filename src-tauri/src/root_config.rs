@@ -17,6 +17,11 @@ pub struct RootConfig {
     /// When true, the app runs the daily price-backfill plugins on startup.
     #[serde(default)]
     pub update_prices_on_startup: bool,
+    /// When true, the Accounts pane also lists holdings with no source folder
+    /// of their own (staking, lending, a card only rules post to). Display
+    /// only: what counts toward balances stays `extra_primary_account_prefixes`.
+    #[serde(default)]
+    pub show_all_holdings: bool,
     /// Extra account-name prefixes unioned into the primary-accounts allowlist
     /// used by the Balances / Performance / Tax-Savings reports. Lets nominal
     /// accounts (e.g. `assets:staking`, `assets:lending`) and sub-accounts of
@@ -61,6 +66,7 @@ impl Default for RootConfig {
             default_expense_account: default_expense_account(),
             classify_prompt_path: None,
             update_prices_on_startup: false,
+            show_all_holdings: false,
             extra_primary_account_prefixes: Vec::new(),
             ai_api_url: String::new(),
             ai_api_key: String::new(),
@@ -203,6 +209,44 @@ pub fn resolve_generated(
         return PathBuf::from(root).join("generated");
     }
     app_data_dir.join("generated")
+}
+
+/// The app config and the vault a non-Tauri caller (every `emuacc-*` CLI,
+/// the web server) works on. The one place they resolve the vault, so they
+/// all agree with the app: `EMUACC_SOURCES_DIR` / `EMUACC_GENERATED_DIR`
+/// win, else the config's `current_root`, else the app-data fallback.
+#[derive(Debug, Clone)]
+pub struct CliVault {
+    pub config: RootConfig,
+    pub sources_dir: PathBuf,
+    pub generated_dir: PathBuf,
+}
+
+impl CliVault {
+    /// Resolve from the platform app-data dir (see [`platform_app_data_dir`]).
+    pub fn load() -> Self {
+        Self::from_app_data_dir(&platform_app_data_dir())
+    }
+
+    /// Resolve from the `config.json` in `app_data_dir`.
+    pub fn from_app_data_dir(app_data_dir: &Path) -> Self {
+        let config = load_root_config(app_data_dir);
+        let sources_dir = resolve_sources(
+            std::env::var("EMUACC_SOURCES_DIR").ok().as_deref(),
+            &config,
+            app_data_dir,
+        );
+        let generated_dir = resolve_generated(
+            std::env::var("EMUACC_GENERATED_DIR").ok().as_deref(),
+            &config,
+            app_data_dir,
+        );
+        Self {
+            config,
+            sources_dir,
+            generated_dir,
+        }
+    }
 }
 
 /// Strict variant for the GUI app: env var > config root, no app-data
